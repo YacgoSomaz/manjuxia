@@ -18,7 +18,7 @@ Get-ChildItem -LiteralPath $root -Recurse -File -Force | ForEach-Object {
   if ($blockedNames -contains $_.Name.ToLowerInvariant()) {
     $violations.Add("blocked name: $relative")
   }
-  if ($relative -match "(^|[\\/])(data|logs?|temp|tmp|test-artifacts|src|prompts?|docs?)([\\/]|$)") {
+  if ($relative -match "(^|[\\/])(data|logs?|temp|tmp|test-artifacts|src|prompts?|docs?|backend)([\\/]|$)") {
     $violations.Add("runtime directory: $relative")
   }
 }

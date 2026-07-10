@@ -10,6 +10,14 @@ from utils.timezone import now_beijing_str
 logger = logging.getLogger(__name__)
 
 
+def _embedded_templates():
+    try:
+        from services.wanshan_prompt_seed_embedded import TEMPLATES
+    except Exception:
+        return None
+    return TEMPLATES if isinstance(TEMPLATES, list) else None
+
+
 def _seed_file_path() -> str:
     backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(backend_dir, "data", "wanshan_prompt_seed.json")
@@ -21,13 +29,15 @@ async def seed_prompt_templates() -> int:
     This is local-only. It intentionally avoids the original cloud template
     sync path so 万山 can start without license state or outbound requests.
     """
-    path = _seed_file_path()
-    if not os.path.exists(path):
-        logger.warning("[wanshan_prompt_seed] seed file missing: %s", path)
-        return 0
+    templates = _embedded_templates()
+    if templates is None:
+        path = _seed_file_path()
+        if not os.path.exists(path):
+            logger.warning("[wanshan_prompt_seed] seed file missing: %s", path)
+            return 0
 
-    with open(path, "r", encoding="utf-8") as f:
-        templates = json.load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            templates = json.load(f)
 
     db = await get_db()
     changed = 0
@@ -78,4 +88,3 @@ async def seed_prompt_templates() -> int:
         return changed
     finally:
         await db.close()
-

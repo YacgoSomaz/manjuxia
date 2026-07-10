@@ -6,7 +6,10 @@ param(
   [string]$LicensePublicKey = "",
   [string]$ProductCode = "wanshan",
   [string]$IntegrityPublicKey = "",
-  [string]$OutputRoot = "packaging/release"
+  [string]$OutputRoot = "packaging/release",
+  [switch]$SkipBackendCompile,
+  [switch]$SkipLauncherBuild,
+  [switch]$SkipInstallerCheck
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,7 +26,9 @@ function Require-Command([string]$Name, [string]$Hint = $Name) {
 Require-Command "python"
 Require-Command "node"
 Require-Command "git-lfs"
-Require-Command "iscc" "Inno Setup ISCC.exe"
+if (-not $SkipInstallerCheck) {
+  Require-Command "iscc" "Inno Setup ISCC.exe"
+}
 if ($Commercial -and [string]::IsNullOrWhiteSpace($LicenseServerUrl)) {
   throw "Commercial build requires -LicenseServerUrl"
 }
@@ -54,6 +59,12 @@ $releaseConfig = [ordered]@{
 }
 $releaseConfig | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage "release_config.json") -Encoding UTF8
 
-Write-Warning "The source-to-binary compile steps are intentionally explicit: add the reviewed Nuitka/PyInstaller specs before producing a commercial installer."
+if (-not $SkipBackendCompile) {
+  & (Join-Path $PSScriptRoot "Compile-Backend.ps1") -ReleaseDir $stage
+}
+if (-not $SkipLauncherBuild) {
+  & (Join-Path $PSScriptRoot "Build-Launcher.ps1") -ReleaseDir $stage
+}
+
 Write-Output "release staging directory prepared: $stage"
-Write-Output "next: compile backend modules, build launcher, run Generate-IntegrityManifest.py, run Scan-Release.ps1, then call Inno Setup."
+Write-Output "next: copy packaged Electron frontend, run Generate-IntegrityManifest.py, run Scan-Release.ps1, then call Inno Setup."

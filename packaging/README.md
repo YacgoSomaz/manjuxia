@@ -8,13 +8,15 @@ Electron `asar` 只是归档格式，不是加密。正式包不能包含 `src/`
 
 - `config/release.example.json`: 本地构建参数示例
 - `build/build_release.ps1`: 构建入口和参数校验
+- `build/Compile-Backend.ps1`: 用 Nuitka 将后端业务代码编译为独立二进制目录
+- `build/Build-Launcher.ps1`: 用 PyInstaller 生成只负责启动后端二进制的启动器
 - `build/Generate-IntegrityManifest.py`: 生成发布文件 SHA-256 清单
 - `build/Scan-Release.ps1`: 检查发布目录是否混入源码、数据库、Cookie、日志或临时文件
 - `release/`: 本地构建产物，使用 Git LFS 管理，不提交到普通源码历史
 
 ## 当前边界
 
-当前项目仍是 Electron + Python 源码运行结构，Nuitka 模块布局和 PyInstaller launcher spec 尚未接入最终构建；Inno Setup 已提供基础覆盖安装清理脚本。因此构建入口不会假装已经产出安全的商业安装包，必须完成编译产物复制、签名清单和安装后扫描后才能发布。
+当前构建入口已接入后端 Nuitka 编译和 PyInstaller 启动器构建。构建时会在临时源码副本中生成提示词模板嵌入模块，正式发布目录不落地 `backend/data/wanshan_prompt_seed.json`。Electron 前端打包、签名清单生成、发布扫描和 Inno Setup 安装包仍必须在完整发布流程中执行后才能对外分发。
 
 授权客户端已按当前授权服务器协议接入，协议边界包括：
 

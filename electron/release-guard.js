@@ -28,8 +28,9 @@ function walkFiles(root) {
 }
 
 function verifyPackagedRelease(root) {
-  const manifestPath = path.join(root, "integrity_manifest.json");
-  const signaturePath = path.join(root, "integrity_manifest.sig");
+  const releaseRoot = path.resolve(root);
+  const manifestPath = path.join(releaseRoot, "integrity_manifest.json");
+  const signaturePath = path.join(releaseRoot, "integrity_manifest.sig");
   if (!fs.existsSync(manifestPath)) {
     return { ok: false, reason: "integrity_manifest.json missing" };
   }
@@ -49,7 +50,7 @@ function verifyPackagedRelease(root) {
 
   let releaseConfig;
   try {
-    releaseConfig = JSON.parse(fs.readFileSync(path.join(root, "release_config.json"), "utf8"));
+    releaseConfig = JSON.parse(fs.readFileSync(path.join(releaseRoot, "release_config.json"), "utf8"));
     const signature = decodeBase64Url(fs.readFileSync(signaturePath, "utf8").trim());
     const verified = crypto.verify(null, fs.readFileSync(manifestPath), publicKeyFromRaw(releaseConfig.integrity_public_key), signature);
     if (!verified) return { ok: false, reason: "integrity manifest signature mismatch" };
@@ -57,7 +58,7 @@ function verifyPackagedRelease(root) {
     return { ok: false, reason: `invalid integrity manifest signature: ${error.message}` };
   }
 
-  const files = walkFiles(root);
+  const files = walkFiles(releaseRoot);
   const payloadFiles = files.filter((file) => {
     const name = path.basename(file);
     return name !== "integrity_manifest.json" && name !== "integrity_manifest.sig";
@@ -67,24 +68,24 @@ function verifyPackagedRelease(root) {
     return { ok: false, reason: "integrity metadata must not be listed as payload" };
   }
   for (const file of payloadFiles) {
-    const relative = path.relative(root, file).split(path.sep).join("/");
+    const relative = path.relative(releaseRoot, file).split(path.sep).join("/");
     if (!listedFiles.has(relative)) return { ok: false, reason: `unregistered release file: ${relative}` };
   }
   for (const relative of listedFiles) {
-    const target = path.resolve(root, relative);
-    if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
+    const target = path.resolve(releaseRoot, relative);
+    if (target !== releaseRoot && !target.startsWith(`${releaseRoot}${path.sep}`)) {
       return { ok: false, reason: `manifest path escaped release root: ${relative}` };
     }
   }
   const sourceLeak = files.find((file) => path.extname(file).toLowerCase() === ".py");
-  if (sourceLeak) return { ok: false, reason: `Python source leaked: ${path.relative(root, sourceLeak)}` };
+  if (sourceLeak) return { ok: false, reason: `Python source leaked: ${path.relative(releaseRoot, sourceLeak)}` };
   if (!files.some((file) => path.extname(file).toLowerCase() === ".pyd")) {
     return { ok: false, reason: "compiled Python module (.pyd) missing" };
   }
 
   for (const [relative, expected] of Object.entries(manifest.files)) {
-    const target = path.resolve(root, relative);
-    if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
+    const target = path.resolve(releaseRoot, relative);
+    if (target !== releaseRoot && !target.startsWith(`${releaseRoot}${path.sep}`)) {
       return { ok: false, reason: `manifest path escaped release root: ${relative}` };
     }
     if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {

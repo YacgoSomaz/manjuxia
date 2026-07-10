@@ -89,6 +89,9 @@ class LicenseClient {
 
   async activate(cardKey) {
     try {
+      if (!this.dataPath || !this.safeStorage || !this.safeStorage.isEncryptionAvailable()) {
+        throw Object.assign(new Error("系统安全存储不可用，无法保存授权"), { code: "storage" });
+      }
       const data = await this._request("/v1/activate", { card_key: String(cardKey || "").trim(), device_hash: this.deviceHash, app_version: this.appVersion, product_code: this.productCode });
       const checked = this._validate(data.license);
       if (!checked.ok) throw new Error(`授权凭证校验失败: ${checked.reason}`);

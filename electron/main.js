@@ -132,8 +132,22 @@ async function waitForBackend() {
 
 function startBackend() {
   const backendMain = path.join(rootDir(), "backend", "main.py");
-  if (!fs.existsSync(backendMain)) {
-    console.warn("[wanshan] backend/main.py not found:", backendMain);
+  const backendDist = path.join(rootDir(), "backend-dist");
+  const packagedLauncher = path.join(backendDist, "backend-launcher.exe");
+  const packagedBackend = path.join(backendDist, "backend-server.exe");
+  let command = process.env.WANSHAN_PYTHON || "python";
+  let args = [backendMain];
+  let cwd = path.dirname(backendMain);
+  if (app.isPackaged && fs.existsSync(packagedLauncher)) {
+    command = packagedLauncher;
+    args = [];
+    cwd = backendDist;
+  } else if (app.isPackaged && fs.existsSync(packagedBackend)) {
+    command = packagedBackend;
+    args = [];
+    cwd = backendDist;
+  } else if (!fs.existsSync(backendMain)) {
+    console.warn("[wanshan] backend entrypoint not found:", backendMain);
     return;
   }
 
@@ -145,9 +159,8 @@ function startBackend() {
     // Ignore stale runtime files.
   }
 
-  const python = process.env.WANSHAN_PYTHON || "python";
-  backendProcess = childProcess.spawn(python, [backendMain], {
-    cwd: path.dirname(backendMain),
+  backendProcess = childProcess.spawn(command, args, {
+    cwd,
     env: {
       ...process.env,
       WANSHAN_APP_NAME: APP_NAME,
@@ -432,7 +445,7 @@ app.whenReady().then(async () => {
   }
   initializeLicenseClient();
   if (app.isPackaged) {
-    const releaseCheck = verifyPackagedRelease(rootDir());
+    const releaseCheck = verifyPackagedRelease(path.dirname(rootDir()));
     if (!releaseCheck.ok) {
       dialog.showErrorBox("万山启动失败", `安装包完整性校验失败：${releaseCheck.reason}`);
       app.quit();

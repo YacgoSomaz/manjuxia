@@ -4,20 +4,24 @@
 #ifndef ReleaseDir
   #define ReleaseDir "packaging/release/万山-0.1.0"
 #endif
+#ifndef InstallerOutputDir
+  #define InstallerOutputDir "packaging/release"
+#endif
 
 [Setup]
-AppId={{9C55C55B-6C51-4E20-9BA0-WSHANSOFT0001}
+AppId={{9C55C55B-6C51-4E20-9BA0-57A150F00001}
 AppName=万山
 AppVersion={#MyAppVersion}
 DefaultDirName={autopf}\万山
 DefaultGroupName=万山
-OutputDir=packaging\release
+OutputDir={#InstallerOutputDir}
 OutputBaseFilename=万山Setup_{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64
 Uninstallable=yes
+UninstallFilesDir={commonappdata}\万山\uninstall
 
 [InstallDelete]
 Type: filesandordirs; Name: "{app}\src"

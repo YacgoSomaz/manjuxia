@@ -25,6 +25,14 @@ function fakeStorage() {
   };
 }
 
+function unavailableStorage() {
+  return {
+    isEncryptionAvailable: () => false,
+    encryptString: (value) => Buffer.from(value, "utf8"),
+    decryptString: (value) => Buffer.from(value).toString("utf8")
+  };
+}
+
 test("verifies a signed license document and rejects tampering", () => {
   const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
   const rawPublic = publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("base64url");
@@ -60,4 +68,26 @@ test("activates through the existing API and stores encrypted state", async () =
   assert.equal(JSON.parse(calls[0].options.body).card_key, "LRX-TEST");
   assert.equal(fs.existsSync(path.join(tempDir, "license.dat")), true);
   assert.equal((await client.verify()).ok, true);
+});
+
+test("does not consume a card when encrypted local storage is unavailable", async () => {
+  const { publicKey } = crypto.generateKeyPairSync("ed25519");
+  const rawPublic = publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("base64url");
+  let called = false;
+  const client = new LicenseClient({
+    baseUrl: "https://license.example",
+    publicKey: rawPublic,
+    productCode: "wanshan",
+    deviceHash: "device-1",
+    appVersion: "1.0.0",
+    dataPath: path.join(os.tmpdir(), "unused-license.dat"),
+    safeStorage: unavailableStorage(),
+    fetchImpl: async () => {
+      called = true;
+      throw new Error("should not be called");
+    }
+  });
+  const result = await client.activate("LRX-TEST");
+  assert.equal(result.success, false);
+  assert.equal(called, false);
 });
