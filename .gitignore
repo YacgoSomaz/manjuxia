@@ -1,0 +1,34 @@
+# Dependencies and generated Python files
+node_modules/
+**/__pycache__/
+*.py[cod]
+
+# Local runtime state, credentials and databases
+.env
+.env.*
+!.env.example
+backend/data/*.db
+backend/data/*.db-*
+backend/data/*.log
+backend/data/*.port
+backend/data/backend.session
+backend/data/audios/
+backend/data/frames/
+backend/data/images/
+backend/data/videos/
+backend/data/subtitle_removed/
+
+# Local extraction/runtime dumps
+backend/data/*_runtime_dump.txt
+backend/data/tpl_*.txt
+
+# Local test output and captured media
+test-artifacts/
+tests/artifacts/
+*.pyc
+
+# Editor and OS files
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

@@ -1,0 +1,15 @@
+{
+  "name": "wanshan",
+  "version": "0.1.0",
+  "description": "万山 - local-first AI video story studio",
+  "main": "electron/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "check": "node scripts/check-project.cjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "electron": "^43.1.0"
+  }
+}
