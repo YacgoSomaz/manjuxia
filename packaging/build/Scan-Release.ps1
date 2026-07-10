@@ -6,8 +6,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path -LiteralPath $ReleaseDir).Path
-$blockedExtensions = @(".py", ".pyc", ".pyo", ".log", ".db", ".sqlite", ".sqlite3", ".cookie")
-$blockedNames = @("backend.session", "cookies", "cookie", "release.local.json")
+$blockedExtensions = @(".py", ".pyc", ".pyo", ".log", ".db", ".sqlite", ".sqlite3", ".cookie", ".env", ".map", ".md", ".tmp", ".bak")
+$blockedNames = @("backend.session", "cookies", "cookie", "release.local.json", "readme", "readme.md", ".env")
 $violations = [System.Collections.Generic.List[string]]::new()
 
 Get-ChildItem -LiteralPath $root -Recurse -File -Force | ForEach-Object {
@@ -18,7 +18,7 @@ Get-ChildItem -LiteralPath $root -Recurse -File -Force | ForEach-Object {
   if ($blockedNames -contains $_.Name.ToLowerInvariant()) {
     $violations.Add("blocked name: $relative")
   }
-  if ($relative -match "(^|[\\/])(data|logs?|temp|tmp|test-artifacts)([\\/]|$)") {
+  if ($relative -match "(^|[\\/])(data|logs?|temp|tmp|test-artifacts|src|prompts?|docs?)([\\/]|$)") {
     $violations.Add("runtime directory: $relative")
   }
 }

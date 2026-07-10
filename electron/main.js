@@ -175,6 +175,28 @@ function stopBackend() {
   backendProcess = null;
 }
 
+function hasBlockedLaunchArgument() {
+  const blocked = [
+    /^--inspect(?:$|=|-)/i,
+    /^--remote-debugging-(?:port|address)(?:$|=)/i,
+    /^--disable-web-security$/i,
+    /^--allow-running-insecure-content$/i,
+    /^--no-sandbox$/i
+  ];
+  return process.argv.slice(1).find((argument) => blocked.some((pattern) => pattern.test(argument))) || "";
+}
+
+function closePackagedDevTools(window) {
+  if (!app.isPackaged) return;
+  window.webContents.on("devtools-opened", () => window.webContents.closeDevTools());
+  window.webContents.on("before-input-event", (event, input) => {
+    const key = String(input.key || "").toLowerCase();
+    if (input.type === "keyDown" && (key === "f12" || (input.control && input.shift && key === "i"))) {
+      event.preventDefault();
+    }
+  });
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1400,
@@ -187,9 +209,12 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      devTools: !app.isPackaged,
+      webSecurity: true
     }
   });
+  closePackagedDevTools(mainWindow);
 
   mainWindow.loadFile(path.join(rootDir(), "frontend", "index.html"));
   mainWindow.once("ready-to-show", () => mainWindow && mainWindow.show());
@@ -246,9 +271,12 @@ function openJimengWindow() {
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      devTools: false,
+      webSecurity: true
     }
   });
+  closePackagedDevTools(jimengWindow);
   jimengWindow.loadURL("https://jimeng.jianying.com");
   jimengWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (isTrustedExternalUrl(url)) shell.openExternal(url);
@@ -394,6 +422,14 @@ ipcMain.handle("license:logout", async () => {
 
 app.whenReady().then(async () => {
   app.setName(APP_NAME);
+  if (app.isPackaged) {
+    const blockedArgument = hasBlockedLaunchArgument();
+    if (blockedArgument) {
+      dialog.showErrorBox("万山启动失败", `检测到被禁止的启动参数：${blockedArgument}`);
+      app.quit();
+      return;
+    }
+  }
   initializeLicenseClient();
   if (app.isPackaged) {
     const releaseCheck = verifyPackagedRelease(rootDir());

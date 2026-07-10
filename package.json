@@ -7,7 +7,9 @@
   "scripts": {
     "start": "electron .",
     "check": "node scripts/check-project.cjs",
-    "test:license": "node --test tests/license-client.test.js"
+    "test:license": "node --test tests/license-client.test.js",
+    "test:release": "node --test tests/release-guard.test.js",
+    "test:security": "node --test tests/license-client.test.js tests/release-guard.test.js"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",

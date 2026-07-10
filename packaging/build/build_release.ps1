@@ -5,6 +5,7 @@ param(
   [string]$LicenseServerUrl = "",
   [string]$LicensePublicKey = "",
   [string]$ProductCode = "wanshan",
+  [string]$IntegrityPublicKey = "",
   [string]$OutputRoot = "packaging/release"
 )
 
@@ -29,6 +30,9 @@ if ($Commercial -and [string]::IsNullOrWhiteSpace($LicenseServerUrl)) {
 if ($Commercial -and [string]::IsNullOrWhiteSpace($LicensePublicKey)) {
   throw "Commercial build requires -LicensePublicKey"
 }
+if ($Commercial -and [string]::IsNullOrWhiteSpace($IntegrityPublicKey)) {
+  throw "Commercial build requires -IntegrityPublicKey"
+}
 if ($ProductCode -notmatch '^[A-Za-z0-9_.-]+$') {
   throw "ProductCode must contain only ASCII letters, numbers, dot, underscore, or hyphen"
 }
@@ -45,6 +49,7 @@ $releaseConfig = [ordered]@{
   product_code = $ProductCode
   license_server_url = $LicenseServerUrl
   license_public_key = $LicensePublicKey
+  integrity_public_key = $IntegrityPublicKey
   integrity_manifest = "integrity_manifest.json"
 }
 $releaseConfig | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage "release_config.json") -Encoding UTF8
