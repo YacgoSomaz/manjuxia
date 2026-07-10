@@ -95,7 +95,14 @@ class LicenseClient {
       const data = await this._request("/v1/activate", { card_key: String(cardKey || "").trim(), device_hash: this.deviceHash, app_version: this.appVersion, product_code: this.productCode });
       const checked = this._validate(data.license);
       if (!checked.ok) throw new Error(`授权凭证校验失败: ${checked.reason}`);
-      this._writeState({ card_key: String(cardKey || "").trim(), activation_id: data.activation_id, refresh_token: data.refresh_token, license: data.license, last_verified_at: this.now() });
+      this._writeState({
+        card_key: String(cardKey || "").trim(),
+        activation_id: data.activation_id,
+        refresh_token: data.refresh_token,
+        license: data.license,
+        cloud_token: this._cloudTokenFromResponse(data),
+        last_verified_at: this.now()
+      });
       this.lastFailReason = "";
       return { success: true, ...this._infoFromState(this._readState()) };
     } catch (error) {
@@ -119,7 +126,8 @@ class LicenseClient {
       const refreshed = await this._request("/v1/refresh", { activation_id: state.activation_id, refresh_token: state.refresh_token, device_hash: this.deviceHash, app_version: this.appVersion, product_code: this.productCode });
       const checked = this._validate(refreshed.license);
       if (!checked.ok) throw new Error(`刷新凭证校验失败: ${checked.reason}`);
-      const next = { ...state, license: refreshed.license, activation_id: refreshed.activation_id || state.activation_id, refresh_token: refreshed.refresh_token || state.refresh_token, last_verified_at: this.now() };
+      const cloudToken = this._cloudTokenFromResponse(refreshed) || state.cloud_token || null;
+      const next = { ...state, license: refreshed.license, activation_id: refreshed.activation_id || state.activation_id, refresh_token: refreshed.refresh_token || state.refresh_token, cloud_token: cloudToken, last_verified_at: this.now() };
       this._writeState(next);
       this.lastFailReason = "";
       return { ok: true, ...checked };
@@ -135,6 +143,24 @@ class LicenseClient {
 
   getInfo() {
     return this._infoFromState(this._readState());
+  }
+
+  getCloudToken() {
+    const state = this._readState();
+    return state && state.cloud_token && state.cloud_token.accessToken ? state.cloud_token : null;
+  }
+
+  _cloudTokenFromResponse(data) {
+    const source = (data && (data.cloud_token || data.cloudToken || data)) || {};
+    const accessToken = source.accessToken || source.access_token || "";
+    if (!accessToken) return null;
+    return {
+      accessToken,
+      refreshToken: source.refreshToken || source.refresh_token || "",
+      expiresIn: source.expiresIn || source.expires_in || 7200,
+      userId: source.userId || source.user_id || null,
+      team: source.team || null
+    };
   }
 
   _infoFromState(state) {

@@ -16,6 +16,7 @@ const electronAPI = {
   getJimengUrl: () => ipcRenderer.invoke("jimeng-get-url"),
   navigateJimeng: (url) => ipcRenderer.invoke("jimeng-navigate", url),
   openLlmConfigEmbed: () => ipcRenderer.invoke("embed-config:open-llm-config"),
+  syncLlmConfigToken: () => ipcRenderer.invoke("embed-config:sync-llm-token"),
   safeStorage: {
     encrypt: (value) => ipcRenderer.invoke("safe-storage:encrypt", value),
     decrypt: (value) => ipcRenderer.invoke("safe-storage:decrypt", value)

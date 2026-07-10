@@ -13,6 +13,7 @@ const APP_NAME = "万山";
 
 let mainWindow = null;
 let jimengWindow = null;
+let qianshanConfigWindow = null;
 let backendProcess = null;
 let backendUrl = "http://127.0.0.1:8000";
 let licenseClient = null;
@@ -70,6 +71,30 @@ async function syncLicenseContext() {
     });
   } catch (_) {
     // The local app remains usable if its local backend is still starting.
+  }
+  const cloudToken = typeof licenseClient.getCloudToken === "function" ? licenseClient.getCloudToken() : null;
+  if (cloudToken && cloudToken.accessToken) {
+    await pushCloudTokenToBackend(cloudToken);
+  }
+}
+
+async function pushCloudTokenToBackend(token) {
+  if (!token || !token.accessToken || !backendUrl) return { success: false, message: "远端登录态为空" };
+  try {
+    const response = await fetch(`${backendUrl}/api/license/context/set-cloud-token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        accessToken: token.accessToken,
+        refreshToken: token.refreshToken || "",
+        expiresIn: Number(token.expiresIn || 7200),
+        userId: token.userId || null,
+        team: token.team || null
+      })
+    });
+    return await response.json().catch(() => ({ success: response.ok }));
+  } catch (error) {
+    return { success: false, message: error instanceof Error ? error.message : "同步远端登录态失败" };
   }
 }
 
@@ -164,6 +189,7 @@ function startBackend() {
     env: {
       ...process.env,
       WANSHAN_APP_NAME: APP_NAME,
+      WANSHAN_ENABLE_CLOUD: process.env.WANSHAN_ENABLE_CLOUD || "1",
       PYTHONUTF8: "1"
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -303,6 +329,79 @@ function openJimengWindow() {
   });
 }
 
+async function captureQianshanCloudToken() {
+  if (!qianshanConfigWindow || qianshanConfigWindow.isDestroyed()) {
+    return { success: false, message: "千山配置窗口未打开" };
+  }
+  const url = qianshanConfigWindow.webContents.getURL();
+  let host = "";
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch (_) {
+    return { success: false, message: "当前页面地址无效" };
+  }
+  if (!["qianshanai.cn", "www.qianshanai.cn"].includes(host)) {
+    return { success: false, message: "请先在千山配置窗口完成登录" };
+  }
+  const raw = await qianshanConfigWindow.webContents.executeJavaScript(`(() => {
+    const userRaw = localStorage.getItem("userInfo") || "{}";
+    let user = {};
+    try { user = JSON.parse(userRaw) || {}; } catch (_) {}
+    return JSON.stringify({
+      accessToken: localStorage.getItem("accessToken") || "",
+      refreshToken: localStorage.getItem("refreshToken") || "",
+      userId: user.id || user.userId || null,
+      team: user.team || null
+    });
+  })()`, true);
+  const token = JSON.parse(raw || "{}");
+  if (!token.accessToken) return { success: false, message: "未检测到千山登录态，请在窗口内登录后刷新" };
+  return pushCloudTokenToBackend({ ...token, expiresIn: 7200 });
+}
+
+function openQianshanConfigWindow() {
+  if (qianshanConfigWindow && !qianshanConfigWindow.isDestroyed()) {
+    qianshanConfigWindow.focus();
+    return { success: true, message: "千山远端模型配置窗口已打开" };
+  }
+  qianshanConfigWindow = new BrowserWindow({
+    width: 1180,
+    height: 820,
+    minWidth: 960,
+    minHeight: 640,
+    title: "千山远端模型配置",
+    backgroundColor: "#0b1020",
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      devTools: !app.isPackaged,
+      webSecurity: true
+    }
+  });
+  closePackagedDevTools(qianshanConfigWindow);
+  qianshanConfigWindow.loadURL("https://qianshanai.cn/user/llm-configs");
+  qianshanConfigWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (isTrustedExternalUrl(url)) shell.openExternal(url);
+    return { action: "deny" };
+  });
+  qianshanConfigWindow.webContents.on("will-navigate", (event, url) => {
+    try {
+      const host = new URL(url).hostname.toLowerCase();
+      if (!["qianshanai.cn", "www.qianshanai.cn"].includes(host)) event.preventDefault();
+    } catch (_) {
+      event.preventDefault();
+    }
+  });
+  qianshanConfigWindow.webContents.on("did-finish-load", () => {
+    captureQianshanCloudToken().catch(() => {});
+  });
+  qianshanConfigWindow.on("closed", () => {
+    qianshanConfigWindow = null;
+  });
+  return { success: true, message: "千山远端模型配置窗口已打开" };
+}
+
 ipcMain.handle("get-backend-url", () => backendUrl);
 ipcMain.handle("get-session-secret", () => readSessionSecret());
 ipcMain.handle("get-app-version", () => app.getVersion());
@@ -385,11 +484,8 @@ ipcMain.handle("jimeng-inject-script", async (_event, script) => {
   }
 });
 
-ipcMain.handle("embed-config:open-llm-config", () => ({
-  success: false,
-  code: "LOCAL_OFFLINE",
-  message: "万山本地离线版已禁用云端模型配置页"
-}));
+ipcMain.handle("embed-config:open-llm-config", () => openQianshanConfigWindow());
+ipcMain.handle("embed-config:sync-llm-token", () => captureQianshanCloudToken());
 
 ipcMain.handle("start-update-download", () => ({
   success: false,

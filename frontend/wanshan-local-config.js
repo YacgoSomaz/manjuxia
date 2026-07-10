@@ -18,6 +18,7 @@
     style.id = STYLE_ID;
     style.textContent = `
       .wlc-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:12px 0;padding:10px 12px;border:1px solid rgba(100,181,246,.22);border-radius:8px;background:rgba(100,181,246,.07)}
+      .wlc-bar-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
       .wlc-bar strong{color:#e8f7ff;font-size:14px}
       .wlc-bar span{color:rgba(220,240,255,.68);font-size:12px}
       .wlc-btn{border:1px solid rgba(100,181,246,.38);background:rgba(100,181,246,.14);color:#e8f7ff;border-radius:6px;padding:7px 12px;cursor:pointer;font-size:13px}
@@ -300,6 +301,20 @@
     }
   }
 
+  async function openRemoteConfig() {
+    const api = window.electronAPI || {};
+    if (!api.openLlmConfigEmbed) {
+      alert("当前客户端不支持远端模型配置窗口");
+      return;
+    }
+    try {
+      const result = await api.openLlmConfigEmbed();
+      if (result && result.success === false) alert(result.message || "打开远端模型配置失败");
+    } catch (error) {
+      alert("打开远端模型配置失败: " + (error.message || error));
+    }
+  }
+
   function ensureBar() {
     if (!location.hash.includes("/settings")) return;
     if (document.getElementById(BAR_ID)) return;
@@ -307,13 +322,17 @@
     const toolbar = document.querySelector(".qs-toolbar");
     const anchor = cloudBanner || toolbar;
     if (!anchor) return;
+    if (cloudBanner) cloudBanner.style.display = "none";
     addStyle();
     const bar = el("div", { id: BAR_ID, class: "wlc-bar" }, [
       el("div", {}, [
-        el("strong", { text: "万山本地模型配置" }),
-        el("span", { text: " 使用本机加密存储，不依赖千山个人中心。" }),
+        el("strong", { text: "万山模型配置" }),
+        el("span", { text: " 可使用千山远端配置，也可保留本机加密配置兜底。" }),
       ]),
-      el("button", { class: "wlc-btn primary", onclick: openModal, text: "管理本地配置" }),
+      el("div", { class: "wlc-bar-actions" }, [
+        el("button", { class: "wlc-btn", onclick: openRemoteConfig, text: "千山远端配置" }),
+        el("button", { class: "wlc-btn primary", onclick: openModal, text: "管理本地配置" }),
+      ]),
     ]);
     anchor.insertAdjacentElement("afterend", bar);
   }

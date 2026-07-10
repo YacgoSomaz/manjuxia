@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   getJimengUrl: async () => ({ success: false, url: null }),
   navigateJimeng: noop,
   openLlmConfigEmbed: noop,
+  syncLlmConfigToken: noop,
   onLicenseInvalid: () => {},
   safeStorage: {
     encrypt: async (value) => Buffer.from(String(value), "utf8").toString("base64"),

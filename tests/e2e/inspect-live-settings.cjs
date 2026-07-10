@@ -21,14 +21,14 @@ async function main() {
   try {
     const page = await app.firstWindow();
     await page.goto(`file://${path.join(projectDir, "frontend", "index.html").replace(/\\/g, "/")}#/settings`);
-    await page.getByText("模型 API 配置").waitFor({ state: "visible", timeout: 15000 });
+    await page.getByText("万山模型配置").waitFor({ state: "visible", timeout: 15000 });
     await page.screenshot({ path: path.join(projectDir, "test-artifacts", "live-settings.png"), fullPage: true });
     const bodyText = await page.locator("body").innerText();
-    if (!bodyText.includes("配置保存在本机")) {
-      throw new Error("设置页仍显示旧的云端配置文案");
+    if (!bodyText.includes("千山远端配置")) {
+      throw new Error("设置页缺少千山远端配置入口");
     }
-    if (bodyText.includes("配置已迁移到云端")) {
-      throw new Error("设置页不应再显示云端迁移文案");
+    if (!bodyText.includes("管理本地配置")) {
+      throw new Error("设置页缺少本地配置兜底入口");
     }
     console.log(bodyText.slice(0, 5000));
   } finally {

@@ -654,20 +654,20 @@ class LLMService:
             msg = str(e)
             if "登录已失效" in msg or "登录已" in msg:
                 logging.getLogger(__name__).warning(
-                    f"[LLMService.get_all] 云端登录失效 type={config_type}: {e}"
+                    f"[LLMService.get_all] 云端登录失效,回退本地配置 type={config_type}: {e}"
                 )
-                raise
+                return await LLMService._get_local_all(config_type)
             # 其它 RuntimeError(业务码非 200 等)继续吞
             logging.getLogger(__name__).warning(
-                f"[LLMService.get_all] 云端业务错 type={config_type}: {e}"
+                f"[LLMService.get_all] 云端业务错,回退本地配置 type={config_type}: {e}"
             )
-            return []
+            return await LLMService._get_local_all(config_type)
         except Exception as e:
             # 网络抖动 / JSON 解析错 / HTTP 4xx 5xx → 静默返空,不打扰用户
             logging.getLogger(__name__).warning(
-                f"[LLMService.get_all] 云端拉配置失败 type={config_type} ({type(e).__name__}): {e}"
+                f"[LLMService.get_all] 云端拉配置失败,回退本地配置 type={config_type} ({type(e).__name__}): {e}"
             )
-            return []
+            return await LLMService._get_local_all(config_type)
 
         # 云端 dict (camelCase) → 老业务字段 dict (snake_case)
         # 注意:get_all 是只读用途(配置页展示用),不需要明文 apiKey
@@ -675,9 +675,9 @@ class LLMService:
             return [_cloud_to_legacy_dict(it, with_api_key=False) for it in items]
         except Exception as e:
             logging.getLogger(__name__).warning(
-                f"[LLMService.get_all] 适配字段失败 ({type(e).__name__}): {e}"
+                f"[LLMService.get_all] 云端适配字段失败,回退本地配置 ({type(e).__name__}): {e}"
             )
-            return []
+            return await LLMService._get_local_all(config_type)
 
     @staticmethod
     async def get_by_id(config_id: int) -> Optional[Dict[str, Any]]:
@@ -702,8 +702,11 @@ class LLMService:
             return _cloud_to_legacy_dict(cfg, with_api_key=True)
         except Exception as e:
             logging.getLogger(__name__).warning(
-                f"[LLMService.get_by_id] 云端拉配置失败 id={config_id} ({type(e).__name__}): {e}"
+                f"[LLMService.get_by_id] 云端拉配置失败,尝试回退本地配置 id={config_id} ({type(e).__name__}): {e}"
             )
+            local = await LLMService._get_local_by_id(config_id)
+            if local:
+                return local
             raise RuntimeError(f"云端配置获取失败,请重启工具或检查网络: {e}")
 
 
