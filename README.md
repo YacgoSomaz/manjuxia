@@ -102,3 +102,5 @@ python -m unittest discover
 ```
 
 万山当前保留了原有前端的主要交互结构，并对后端鉴权、模板加载、模型调用、分镜解析和本地离线策略进行了整理，适合作为个人创作工具或 AI 影视生产工具的二次开发基础。
+
+商业版发布加固、完整性清单、发布目录扫描和 Git LFS 规则见 [`packaging/README.md`](packaging/README.md)。

@@ -1,10 +1,11 @@
-const { app, BrowserWindow, ipcMain, shell, safeStorage } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, shell, safeStorage } = require("electron");
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const { isTrustedExternalUrl, isTrustedJimengUrl } = require("./trusted-origins");
+const { verifyPackagedRelease } = require("./release-guard");
 
 const APP_NAME = "万山";
 
@@ -320,6 +321,14 @@ ipcMain.handle("shell:open-data-dir", () => shell.openPath(dataDir()));
 
 app.whenReady().then(async () => {
   app.setName(APP_NAME);
+  if (app.isPackaged) {
+    const releaseCheck = verifyPackagedRelease(rootDir());
+    if (!releaseCheck.ok) {
+      dialog.showErrorBox("万山启动失败", `安装包完整性校验失败：${releaseCheck.reason}`);
+      app.quit();
+      return;
+    }
+  }
   startBackend();
   await waitForBackend();
   createWindow();

@@ -27,6 +27,11 @@ test-artifacts/
 tests/artifacts/
 *.pyc
 
+# Release build output and local commercial settings
+packaging/release/
+packaging/config/release.local.json
+packaging/build/*.spec.local
+
 # Editor and OS files
 .idea/
 .vscode/

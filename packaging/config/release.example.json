@@ -1,0 +1,10 @@
+{
+  "app_name": "万山",
+  "version": "0.1.0",
+  "commercial": false,
+  "license_server_url": "",
+  "license_public_key": "",
+  "data_dir_name": "万山",
+  "integrity_manifest": "integrity_manifest.json",
+  "notes": "复制为 release.local.json 后填写本地构建参数；不要提交 release.local.json。"
+}
