@@ -2,6 +2,7 @@
   "app_name": "万山",
   "version": "0.1.0",
   "commercial": false,
+  "product_code": "wanshan",
   "license_server_url": "",
   "license_public_key": "",
   "data_dir_name": "万山",

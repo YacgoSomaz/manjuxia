@@ -6,7 +6,8 @@
   "private": true,
   "scripts": {
     "start": "electron .",
-    "check": "node scripts/check-project.cjs"
+    "check": "node scripts/check-project.cjs",
+    "test:license": "node --test tests/license-client.test.js"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",

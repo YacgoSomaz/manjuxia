@@ -1,11 +1,13 @@
 const { app, BrowserWindow, dialog, ipcMain, shell, safeStorage } = require("electron");
 const childProcess = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const { isTrustedExternalUrl, isTrustedJimengUrl } = require("./trusted-origins");
 const { verifyPackagedRelease } = require("./release-guard");
+const { LicenseClient } = require("./license-client");
 
 const APP_NAME = "万山";
 
@@ -13,6 +15,8 @@ let mainWindow = null;
 let jimengWindow = null;
 let backendProcess = null;
 let backendUrl = "http://127.0.0.1:8000";
+let licenseClient = null;
+let commercialBuild = false;
 
 function rootDir() {
   return app.isPackaged ? process.resourcesPath : path.resolve(__dirname, "..");
@@ -23,6 +27,50 @@ function dataDir() {
   if (override) return path.resolve(override);
   const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
   return path.join(appData, APP_NAME, "data");
+}
+
+function readReleaseConfig() {
+  const configPath = process.env.WANSHAN_RELEASE_CONFIG || path.join(rootDir(), "release_config.json");
+  try {
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    return { ...config, commercial: Boolean(config.commercial) };
+  } catch (_) {
+    return { commercial: process.env.WANSHAN_COMMERCIAL === "1" };
+  }
+}
+
+function getMachineId() {
+  const stableParts = [process.env.ComputerName || os.hostname(), process.platform, process.arch];
+  return crypto.createHash("sha256").update(stableParts.join("|"), "utf8").digest("hex");
+}
+
+function initializeLicenseClient() {
+  const config = readReleaseConfig();
+  commercialBuild = Boolean(config.commercial);
+  licenseClient = new LicenseClient({
+    baseUrl: config.license_server_url || process.env.WANSHAN_LICENSE_SERVER_URL || "",
+    publicKey: config.license_public_key || process.env.WANSHAN_LICENSE_PUBLIC_KEY || "",
+    productCode: config.product_code || process.env.WANSHAN_PRODUCT_CODE || "wanshan",
+    deviceHash: getMachineId(),
+    appVersion: app.getVersion(),
+    dataPath: path.join(dataDir(), "license.dat"),
+    safeStorage
+  });
+}
+
+async function syncLicenseContext() {
+  if (!commercialBuild || !licenseClient) return;
+  const info = licenseClient.getInfo();
+  if (!info || !backendUrl) return;
+  try {
+    await fetch(`${backendUrl}/api/license/context/set`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ license_key: info.license_key, machine_id: getMachineId(), source: "wanshan" })
+    });
+  } catch (_) {
+    // The local app remains usable if its local backend is still starting.
+  }
 }
 
 function backendPortFile() {
@@ -319,8 +367,34 @@ ipcMain.handle("backend:url", () => backendUrl);
 ipcMain.handle("backend:health", async () => ({ ok: await requestHealth(backendUrl), url: backendUrl }));
 ipcMain.handle("shell:open-data-dir", () => shell.openPath(dataDir()));
 
+ipcMain.handle("license:get-machine-id", () => getMachineId());
+ipcMain.handle("license:get-info", () => (commercialBuild && licenseClient ? licenseClient.getInfo() : null));
+ipcMain.handle("license:get-last-fail-reason", () => licenseClient?.lastFailReason || "");
+ipcMain.handle("license:activate", async (_event, cardKey) => {
+  if (!commercialBuild || !licenseClient) return { success: true, license_type: "permanent", expires_at: null };
+  const result = await licenseClient.activate(cardKey);
+  if (result.success) await syncLicenseContext();
+  return result;
+});
+ipcMain.handle("license:verify", async () => {
+  if (!commercialBuild || !licenseClient) return true;
+  const result = await licenseClient.verify();
+  if (result.ok) await syncLicenseContext();
+  return Boolean(result.ok);
+});
+ipcMain.handle("license:logout", async () => {
+  if (licenseClient) licenseClient.logout();
+  try {
+    await fetch(`${backendUrl}/api/license/context/clear`, { method: "POST" });
+  } catch (_) {
+    // The next backend start begins with an empty in-memory context.
+  }
+  return true;
+});
+
 app.whenReady().then(async () => {
   app.setName(APP_NAME);
+  initializeLicenseClient();
   if (app.isPackaged) {
     const releaseCheck = verifyPackagedRelease(rootDir());
     if (!releaseCheck.ok) {

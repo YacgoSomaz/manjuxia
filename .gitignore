@@ -37,3 +37,5 @@ packaging/build/*.spec.local
 .vscode/
 Thumbs.db
 .DS_Store
+
+server-src/

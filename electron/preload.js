@@ -20,6 +20,14 @@ const electronAPI = {
     encrypt: (value) => ipcRenderer.invoke("safe-storage:encrypt", value),
     decrypt: (value) => ipcRenderer.invoke("safe-storage:decrypt", value)
   },
+  license: {
+    getMachineId: () => ipcRenderer.invoke("license:get-machine-id"),
+    getInfo: () => ipcRenderer.invoke("license:get-info"),
+    activate: (cardKey) => ipcRenderer.invoke("license:activate", cardKey),
+    verify: () => ipcRenderer.invoke("license:verify"),
+    getLastFailReason: () => ipcRenderer.invoke("license:get-last-fail-reason"),
+    logout: () => ipcRenderer.invoke("license:logout")
+  },
   onLicenseInvalid: () => {},
   update: {
     onUpdateAvailable: (callback) => ipcRenderer.on("update-available", (_event, payload) => callback(payload)),

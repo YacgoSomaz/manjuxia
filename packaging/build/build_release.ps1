@@ -4,6 +4,7 @@ param(
   [switch]$Commercial,
   [string]$LicenseServerUrl = "",
   [string]$LicensePublicKey = "",
+  [string]$ProductCode = "wanshan",
   [string]$OutputRoot = "packaging/release"
 )
 
@@ -28,6 +29,9 @@ if ($Commercial -and [string]::IsNullOrWhiteSpace($LicenseServerUrl)) {
 if ($Commercial -and [string]::IsNullOrWhiteSpace($LicensePublicKey)) {
   throw "Commercial build requires -LicensePublicKey"
 }
+if ($ProductCode -notmatch '^[A-Za-z0-9_.-]+$') {
+  throw "ProductCode must contain only ASCII letters, numbers, dot, underscore, or hyphen"
+}
 
 if (Test-Path -LiteralPath $stage) {
   Remove-Item -LiteralPath $stage -Recurse -Force
@@ -38,6 +42,7 @@ $releaseConfig = [ordered]@{
   app_name = "万山"
   version = $Version
   commercial = [bool]$Commercial
+  product_code = $ProductCode
   license_server_url = $LicenseServerUrl
   license_public_key = $LicensePublicKey
   integrity_manifest = "integrity_manifest.json"
