@@ -19,9 +19,12 @@ OutputBaseFilename=万山Setup_{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=admin
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesInstallIn64BitMode=x64compatible
 Uninstallable=yes
 UninstallFilesDir={commonappdata}\万山\uninstall
+
+[Languages]
+Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 
 [InstallDelete]
 Type: filesandordirs; Name: "{app}\src"

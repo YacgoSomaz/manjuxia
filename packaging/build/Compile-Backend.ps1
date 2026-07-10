@@ -67,6 +67,14 @@ $dist = Get-ChildItem -LiteralPath $work -Directory -Filter "*.dist" | Select-Ob
 if (-not $dist) { throw "Nuitka output directory not found" }
 Copy-Item -Path (Join-Path $dist.FullName "*") -Destination $output -Recurse -Force
 
+$optionalRuntimeDirs = @("scipy", "scipy.libs", "pandas", "pandas.libs")
+foreach ($dirName in $optionalRuntimeDirs) {
+  $candidate = Join-Path $output $dirName
+  if (Test-Path -LiteralPath $candidate) {
+    Remove-Item -LiteralPath $candidate -Recurse -Force
+  }
+}
+
 if (-not (Test-Path -LiteralPath (Join-Path $output "backend-server.exe"))) {
   throw "compiled backend-server.exe missing"
 }
