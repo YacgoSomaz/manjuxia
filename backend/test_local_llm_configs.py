@@ -9,6 +9,8 @@ _DATA_DIR = tempfile.mkdtemp(prefix="wanshan-llm-test-")
 os.environ["WANSHAN_DATA_DIR"] = _DATA_DIR
 os.environ.pop("WANSHAN_ENABLE_CLOUD", None)
 
+import database.db as db_module
+db_module.DB_PATH = os.path.join(_DATA_DIR, "app.db")
 from database.db import init_db
 from database.db import get_db
 from models.llm_configs import LLMConfigCreate

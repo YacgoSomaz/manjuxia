@@ -1,0 +1,1243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>万山分镜实验台</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080d22;
+      --panel: #111936;
+      --panel-2: #172247;
+      --line: #2b3d74;
+      --text: #eef4ff;
+      --muted: #9aa9ca;
+      --cyan: #32d4e8;
+      --green: #73d681;
+      --orange: #ffb347;
+      --danger: #ff6c7a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+      background: linear-gradient(135deg, #080d22 0%, #0d1430 52%, #12162b 100%);
+      color: var(--text);
+    }
+    button, input, textarea, select { font: inherit; }
+    .shell {
+      display: grid;
+      grid-template-columns: minmax(340px, 470px) minmax(0, 1fr);
+      gap: 16px;
+      height: 100vh;
+      padding: 16px;
+    }
+    .panel {
+      border: 1px solid rgba(96, 130, 210, 0.35);
+      background: rgba(17, 25, 54, 0.92);
+      overflow: hidden;
+    }
+    .composer, .result {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      border-radius: 8px;
+    }
+    .head {
+      padding: 16px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(23, 34, 71, 0.72);
+    }
+    .title {
+      margin: 0 0 6px;
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+    .sub {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    .body {
+      padding: 14px;
+      overflow: auto;
+      min-height: 0;
+      flex: 1;
+    }
+    label {
+      display: block;
+      margin: 12px 0 7px;
+      color: #cad7ff;
+      font-size: 13px;
+    }
+    textarea, input, select {
+      width: 100%;
+      border: 1px solid var(--line);
+      background: #0c1330;
+      color: var(--text);
+      border-radius: 8px;
+      outline: none;
+    }
+    textarea {
+      min-height: 350px;
+      resize: vertical;
+      padding: 12px;
+      line-height: 1.65;
+    }
+    textarea.compact {
+      min-height: 92px;
+    }
+    input, select {
+      height: 38px;
+      padding: 0 10px;
+    }
+    textarea:focus, input:focus, select:focus {
+      border-color: var(--cyan);
+      box-shadow: 0 0 0 3px rgba(50, 212, 232, 0.12);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .grid.three {
+      grid-template-columns: 1.4fr 0.6fr 0.7fr;
+      align-items: end;
+    }
+    .row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    .row input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      flex: 0 0 auto;
+    }
+    .actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      padding: 14px;
+      border-top: 1px solid var(--line);
+      background: rgba(8, 13, 34, 0.72);
+    }
+    button {
+      border: 0;
+      border-radius: 8px;
+      min-height: 40px;
+      padding: 0 14px;
+      cursor: pointer;
+      color: #06101b;
+      background: linear-gradient(135deg, var(--cyan), #7cf0c7);
+      font-weight: 700;
+    }
+    button.secondary {
+      color: var(--text);
+      background: #202d58;
+      border: 1px solid var(--line);
+    }
+    button.small {
+      min-height: 38px;
+      width: 100%;
+      padding: 0 10px;
+    }
+    button:disabled {
+      cursor: wait;
+      opacity: 0.62;
+    }
+    .status {
+      margin-left: auto;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: right;
+      max-width: 260px;
+    }
+    .messages {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .msg {
+      border: 1px solid rgba(96, 130, 210, 0.28);
+      background: rgba(12, 19, 48, 0.78);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .msg-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: #dbe7ff;
+      font-weight: 700;
+      margin-bottom: 8px;
+      font-size: 13px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 0 8px;
+      border-radius: 999px;
+      color: #071421;
+      background: var(--green);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .pill.warn { background: var(--orange); }
+    .pill.bad { background: var(--danger); color: #22070b; }
+    .tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 8px 0 10px;
+    }
+    .tab {
+      min-height: 30px;
+      color: var(--text);
+      background: #202d58;
+      border: 1px solid var(--line);
+      font-weight: 600;
+      padding: 0 10px;
+    }
+    .tab.active {
+      color: #06101b;
+      background: var(--cyan);
+      border-color: transparent;
+    }
+    .template-hidden {
+      display: none;
+    }
+    .template-trigger {
+      width: 100%;
+      min-height: 38px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 0 12px;
+      color: #dbe7ff;
+      background: #0c1330;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      font-weight: 600;
+      text-align: left;
+    }
+    .template-trigger span {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .template-trigger::after {
+      content: "⌄";
+      color: #91a4d8;
+      font-size: 16px;
+      flex: 0 0 auto;
+    }
+    .template-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 50;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(3, 7, 20, 0.64);
+    }
+    .template-modal.open {
+      display: flex;
+    }
+    .template-dialog {
+      width: min(820px, 96vw);
+      max-height: min(780px, 92vh);
+      display: flex;
+      flex-direction: column;
+      border: 1px solid rgba(62, 220, 238, 0.42);
+      border-radius: 8px;
+      background: #0d1531;
+      box-shadow: 0 20px 70px rgba(0, 0, 0, 0.42);
+      overflow: hidden;
+    }
+    .template-dialog-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 16px;
+      background: rgba(16, 24, 54, 0.96);
+      border-bottom: 1px solid rgba(59, 77, 128, 0.7);
+      font-weight: 700;
+    }
+    .icon-button {
+      width: 30px;
+      min-height: 30px;
+      padding: 0;
+      color: #9fb1df;
+      background: transparent;
+      border: 0;
+      font-size: 22px;
+      font-weight: 400;
+    }
+    .template-dialog-body {
+      padding: 12px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .template-search {
+      margin-bottom: 10px;
+    }
+    .template-segment {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0;
+      border: 1px solid #27386e;
+      background: #0b1230;
+      margin-bottom: 12px;
+    }
+    .template-segment button {
+      min-height: 34px;
+      color: #c8d5ff;
+      border-radius: 0;
+      background: transparent;
+      border-right: 1px solid #27386e;
+      font-weight: 700;
+    }
+    .template-segment button:last-child {
+      border-right: 0;
+    }
+    .template-segment button.active {
+      color: #eef5ff;
+      background: #1e3a78;
+    }
+    .template-list {
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding-right: 4px;
+      max-height: 46vh;
+    }
+    .template-card {
+      position: relative;
+      display: block;
+      width: 100%;
+      min-height: 72px;
+      padding: 13px 46px 13px 14px;
+      color: #e7efff;
+      background: rgba(13, 22, 54, 0.95);
+      border: 1px solid #22396e;
+      border-radius: 8px;
+      text-align: left;
+    }
+    .template-card.selected {
+      border-color: #35d9ea;
+      box-shadow: inset 0 0 0 1px rgba(53, 217, 234, 0.72), 0 0 22px rgba(53, 217, 234, 0.16);
+      background: rgba(17, 49, 89, 0.86);
+    }
+    .template-card-title {
+      font-size: 14px;
+      font-weight: 800;
+      line-height: 1.45;
+      margin-bottom: 8px;
+    }
+    .template-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .template-tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 20px;
+      padding: 0 8px;
+      border-radius: 999px;
+      color: #bff5ff;
+      background: rgba(44, 96, 153, 0.78);
+      border: 1px solid rgba(88, 172, 224, 0.48);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .template-desc {
+      color: #c8d2ee;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .template-selected-desc {
+      margin-top: 12px;
+      padding: 12px 14px;
+      min-height: 82px;
+      border: 1px solid #22396e;
+      border-radius: 8px;
+      background: rgba(20, 31, 68, 0.78);
+    }
+    .template-selected-desc-title {
+      color: #e8f1ff;
+      font-size: 13px;
+      font-weight: 800;
+      margin-bottom: 8px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .template-selected-desc-body {
+      color: #c7d2ed;
+      font-size: 12px;
+      line-height: 1.6;
+      max-height: 138px;
+      overflow: auto;
+      white-space: pre-wrap;
+    }
+    .template-check {
+      position: absolute;
+      top: 13px;
+      right: 14px;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      color: #06212a;
+      background: #5ce7eb;
+      font-size: 17px;
+      font-weight: 900;
+    }
+    .template-card.selected .template-check {
+      display: flex;
+    }
+    .template-empty {
+      padding: 34px;
+      color: var(--muted);
+      text-align: center;
+      border: 1px dashed #314372;
+      border-radius: 8px;
+    }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.6;
+      color: #d9e6ff;
+      background: #080e24;
+      border: 1px solid #22305d;
+      border-radius: 8px;
+      padding: 12px;
+      max-height: 68vh;
+      overflow: auto;
+    }
+    .stream-output {
+      min-height: 360px;
+    }
+    .empty {
+      color: var(--muted);
+      text-align: center;
+      padding: 40px 16px;
+    }
+    @media (max-width: 900px) {
+      .shell {
+        grid-template-columns: 1fr;
+        height: auto;
+        min-height: 100vh;
+      }
+      textarea { min-height: 240px; }
+      .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="panel composer">
+      <div class="head">
+        <h1 class="title">万山分镜实验台</h1>
+        <div class="sub">默认直发千山分镜接口，不跑剧本转换模板；完整流程和 DeepSeek 直连只作为对照测试。</div>
+      </div>
+      <div class="body">
+        <label for="title">实验名称</label>
+        <input id="title" value="千山分镜直发观察" />
+
+        <label for="sourceText">文章 / 剧本</label>
+        <textarea id="sourceText" placeholder="粘贴文章、小说片段、或已经写好的剧本。"></textarea>
+
+        <div class="grid">
+          <div>
+            <label for="promptMode">调用模式</label>
+            <select id="promptMode">
+              <option value="qianshan_direct" selected>千山分镜直发：不转剧本</option>
+              <option value="qianshan">千山完整流程：小说转剧本后分镜</option>
+              <option value="think">DeepSeek Pro Think 直连：显示推理事件</option>
+              <option value="clean">DeepSeek 干净直连：只发送上方文本</option>
+              <option value="two_step">DeepSeek 双指令直连：上方文本 + 第二条指令</option>
+              <option value="storyboard">DeepSeek 分镜生成：使用模板包装</option>
+            </select>
+          </div>
+          <div>
+            <label for="llmConfig">模型配置 ID</label>
+            <select id="llmConfig"></select>
+          </div>
+          <div>
+            <label for="scriptTemplate">剧本模板 ID</label>
+            <input id="scriptTemplate" type="number" value="16" min="1" />
+          </div>
+          <div>
+            <label for="sceneIndex">生成第几个场景</label>
+            <input id="sceneIndex" type="number" value="0" min="0" />
+          </div>
+          <div>
+            <label for="templatePickerBtn">分镜模板</label>
+            <select id="storyboardTemplate" class="template-hidden"></select>
+            <button id="templatePickerBtn" class="template-trigger" type="button">
+              <span id="templatePickerText">正在读取分镜模板...</span>
+            </button>
+          </div>
+          <div>
+            <label for="styleTemplate">风格提示词（可选）</label>
+            <select id="styleTemplate"></select>
+          </div>
+          <div>
+            <label for="maxTokens">最大输出 Token</label>
+            <input id="maxTokens" type="number" value="30000" min="256" max="30000" />
+          </div>
+          <div>
+            <label for="temperature">温度</label>
+            <input id="temperature" type="number" value="0.7" min="0" max="2" step="0.1" />
+          </div>
+          <div>
+            <label for="modelOverride">DeepSeek 实际模型</label>
+            <select id="modelOverride">
+              <option value="deepseek-v4-pro">deepseek-v4-pro（Pro / Think）</option>
+              <option value="deepseek-v4-flash">deepseek-v4-flash（快速）</option>
+              <option value="deepseek-reasoner">deepseek-reasoner（旧兼容 Think）</option>
+              <option value="deepseek-chat">deepseek-chat（旧兼容非 Think）</option>
+              <option value="">使用配置里的模型名</option>
+            </select>
+          </div>
+          <div>
+            <label for="reasoningEffort">Thinking 强度</label>
+            <select id="reasoningEffort">
+              <option value="high">high</option>
+              <option value="max">max</option>
+            </select>
+          </div>
+        </div>
+
+        <label class="row" for="enableContext">
+          <input id="enableContext" type="checkbox" checked />
+          <span>开启上下文连续性</span>
+        </label>
+        <label class="row" for="thinkingMode">
+          <input id="thinkingMode" type="checkbox" checked />
+          <span>开启 DeepSeek thinking（仅 DeepSeek 直连生效）</span>
+        </label>
+
+        <div class="grid three">
+          <div>
+            <label for="batchTemplateIds">批量分镜模板 ID</label>
+            <input id="batchTemplateIds" value="32-62" placeholder="例如：32-62 或 23,24,25" />
+          </div>
+          <div>
+            <label for="batchConcurrency">并发数</label>
+            <input id="batchConcurrency" type="number" value="3" min="1" max="8" />
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <button id="batchRunBtn" class="secondary small">批量并发跑</button>
+          </div>
+        </div>
+
+        <div id="followupBox">
+          <label for="followupInstruction">第二条指令（仅双指令直连生效）</label>
+          <textarea id="followupInstruction" class="compact" placeholder="这里留空时不会追加第二条消息。"></textarea>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="runBtn">直发千山分镜</button>
+        <button id="sampleBtn" class="secondary">填入样例</button>
+        <div id="status" class="status">正在读取配置...</div>
+      </div>
+    </section>
+
+    <section class="panel result">
+      <div class="head">
+        <h2 class="title">实时输出</h2>
+        <div class="sub">这里展示千山后端流程事件、最终分镜输出和调用元数据。</div>
+      </div>
+      <div class="body">
+        <div id="messages" class="messages">
+          <div class="empty">还没有实验结果。</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="templateModal" class="template-modal" role="dialog" aria-modal="true" aria-labelledby="templateModalTitle">
+    <div class="template-dialog">
+      <div class="template-dialog-head">
+        <span id="templateModalTitle">配置分镜模板</span>
+        <button id="templateModalClose" class="icon-button" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="template-dialog-body">
+        <input id="templateSearch" class="template-search" placeholder="搜索模板名称 / 描述" />
+        <div class="template-segment">
+          <button id="templateTabShortDrama" class="active" type="button" data-flow="short_drama">短剧</button>
+          <button id="templateTabShortFilm" type="button" data-flow="short_film">短片</button>
+        </div>
+        <div id="templateList" class="template-list"></div>
+        <div id="templateDescBar" class="template-selected-desc"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const messages = $("messages");
+    const statusEl = $("status");
+    const runBtn = $("runBtn");
+    const batchRunBtn = $("batchRunBtn");
+    const sampleBtn = $("sampleBtn");
+    const stateStore = {
+      directConfigs: [],
+      qianshanConfigs: [],
+      templates: [],
+      styleTemplates: [],
+      qianshanStatus: null,
+      templateFlow: "short_drama",
+      templateSearch: "",
+    };
+
+    const sampleText = `【外 纽约航站楼前 日】
+老旧航站楼外，人流熙攘。一辆波音747客机在跑道上缓缓滑行，轮胎摩擦地面，扬起一阵热浪。二十岁的林锐推着行李箱走出到达口，他眯起眼，看向头顶灰蒙蒙的天空，嘴角扯出一抹自嘲的弧度。
+
+林锐（自嘲）：“这该死的破地方，老子费劲千辛万苦才离开，现在又回来了，还回到了二十年前。”
+
+他脑海里响起沙哑的提示音。
+
+神秘声音（内心OS）：“你好，猎魔人。你幸运地逃离了时间风暴的漩涡，刚刚走出巨型空间传送阵。”
+
+林锐回头看向机场大厅，又看向远处的跑道，眼神从茫然变成警惕。`;
+
+    function setBusy(isBusy) {
+      runBtn.disabled = isBusy;
+      batchRunBtn.disabled = isBusy;
+      sampleBtn.disabled = isBusy;
+      $("llmConfig").disabled = isBusy;
+      $("promptMode").disabled = isBusy;
+      $("batchTemplateIds").disabled = isBusy;
+      $("batchConcurrency").disabled = isBusy;
+      updateModeState(isBusy);
+      const mode = $("promptMode").value;
+      runBtn.textContent = isBusy ? "生成中..." : (
+        mode === "qianshan_direct" ? "直发千山分镜" : (mode === "qianshan" ? "调用千山完整流程" : "直连 DeepSeek 发送")
+      );
+    }
+
+    function updateModeState(forceBusy = false) {
+      const mode = $("promptMode").value;
+      const isQianshanDirect = mode === "qianshan_direct";
+      const isQianshanFull = mode === "qianshan";
+      const isQianshan = isQianshanDirect || isQianshanFull;
+      const isStoryboard = mode === "storyboard";
+      const isTwoStep = mode === "two_step";
+      const isThink = mode === "think";
+      const isDirectDeepSeek = !isQianshan;
+      if (isThink && !forceBusy) {
+        $("modelOverride").value = "deepseek-v4-pro";
+        $("thinkingMode").checked = true;
+      }
+      $("storyboardTemplate").disabled = forceBusy || !(isQianshan || isStoryboard);
+      $("templatePickerBtn").disabled = forceBusy || !(isQianshan || isStoryboard);
+      $("styleTemplate").disabled = forceBusy || !(isQianshan || isStoryboard);
+      $("scriptTemplate").disabled = forceBusy || !isQianshanFull;
+      $("sceneIndex").disabled = forceBusy || !isQianshanFull;
+      $("enableContext").disabled = forceBusy || !(isQianshan || isStoryboard);
+      $("maxTokens").disabled = forceBusy || isQianshan;
+      $("temperature").disabled = forceBusy || isQianshan || $("thinkingMode").checked;
+      $("modelOverride").disabled = forceBusy || !isDirectDeepSeek;
+      $("thinkingMode").disabled = forceBusy || !isDirectDeepSeek;
+      $("reasoningEffort").disabled = forceBusy || !isDirectDeepSeek || !$("thinkingMode").checked;
+      $("followupInstruction").disabled = forceBusy || !isTwoStep;
+      $("followupBox").style.opacity = isTwoStep ? "1" : "0.55";
+      if (!forceBusy) populateModelSelect();
+      runBtn.textContent = mode === "qianshan_direct" ? "直发千山分镜" : (mode === "qianshan" ? "调用千山完整流程" : "直连 DeepSeek 发送");
+    }
+
+    function populateModelSelect() {
+      const mode = $("promptMode").value;
+      const configs = mode === "qianshan" || mode === "qianshan_direct" ? stateStore.qianshanConfigs : stateStore.directConfigs;
+      const llmSelect = $("llmConfig");
+      llmSelect.innerHTML = configs.map((cfg) => {
+        const label = `${cfg.id} · ${cfg.name || cfg.model_name || cfg.provider_code || "未命名配置"}`;
+        return `<option value="${cfg.id}">${label}</option>`;
+      }).join("");
+      if (!configs.length && (mode === "qianshan" || mode === "qianshan_direct")) {
+        llmSelect.innerHTML = `<option value="5904">5904 · 千山默认配置</option>`;
+      }
+    }
+
+    function asArray(value) {
+      if (Array.isArray(value)) return value;
+      if (!value) return [];
+      if (typeof value === "string") {
+        try {
+          const parsed = JSON.parse(value);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch (err) {
+          return value ? [value] : [];
+        }
+      }
+      return [];
+    }
+
+    function templateFlow(tpl) {
+      const tags = asArray(tpl.tags).map(String);
+      return tags.includes("短片") || tags.includes("short_film") ? "short_film" : "short_drama";
+    }
+
+    function screenLabel(tpl) {
+      return String(tpl.screen_mode || "").toLowerCase() === "landscape" ? "横屏" : "竖屏";
+    }
+
+    function templateTags(tpl) {
+      const flow = templateFlow(tpl) === "short_film" ? "短片" : "短剧";
+      const genres = asArray(tpl.genres).map(String).filter(Boolean);
+      const keep = genres.filter((tag) => (
+        tag.includes("3D") || tag.includes("2D") || tag.includes("真人") || tag.includes("国漫") || tag.includes("海外")
+      ));
+      return [flow, screenLabel(tpl), ...keep].filter((tag, index, arr) => arr.indexOf(tag) === index).slice(0, 6);
+    }
+
+    function sortTemplatesLikeQianshan(templates) {
+      const displayOrder = [
+        23, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37,
+        38, 39, 40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 51,
+        62, 24, 25, 44,
+      ];
+      const rank = (item) => {
+        const index = displayOrder.indexOf(Number(item.id));
+        return index >= 0 ? index : 1000 + Number(item.admin_id || item.id || 0);
+      };
+      return [...templates].sort((a, b) => {
+        const aRank = rank(a);
+        const bRank = rank(b);
+        if (aRank !== bRank) return aRank - bRank;
+        const aAdmin = Number(a.admin_id || a.id || 0);
+        const bAdmin = Number(b.admin_id || b.id || 0);
+        if (aAdmin !== bAdmin) return aAdmin - bAdmin;
+        return Number(a.id || 0) - Number(b.id || 0);
+      });
+    }
+
+    function selectedTemplate() {
+      const id = Number($("storyboardTemplate").value || 0);
+      return stateStore.templates.find((tpl) => Number(tpl.id) === id) || null;
+    }
+
+    function updateTemplatePickerText() {
+      const tpl = selectedTemplate();
+      $("templatePickerText").textContent = tpl ? tpl.name : "请选择分镜模板";
+    }
+
+    function renderTemplateList() {
+      const list = $("templateList");
+      const desc = $("templateDescBar");
+      const selectedId = Number($("storyboardTemplate").value || 0);
+      const query = stateStore.templateSearch.trim().toLowerCase();
+      const items = sortTemplatesLikeQianshan(stateStore.templates)
+        .filter((tpl) => templateFlow(tpl) === stateStore.templateFlow)
+        .filter((tpl) => {
+          if (!query) return true;
+          return `${tpl.name || ""} ${tpl.description || ""} ${asArray(tpl.genres).join(" ")}`.toLowerCase().includes(query);
+        });
+      if (!items.length) {
+        list.innerHTML = `<div class="template-empty">没有匹配的模板</div>`;
+        desc.innerHTML = `<div class="template-selected-desc-body">请选择一个分镜模板查看描述</div>`;
+        return;
+      }
+      list.innerHTML = items.map((tpl) => {
+        const selected = Number(tpl.id) === selectedId;
+        const tags = templateTags(tpl).map((tag) => `<span class="template-tag">${escapeHtml(tag)}</span>`).join("");
+        return `
+          <button type="button" class="template-card ${selected ? "selected" : ""}" data-template-id="${tpl.id}">
+            <span class="template-check">✓</span>
+            <div class="template-card-title">${escapeHtml(tpl.name || `模板 ${tpl.id}`)}</div>
+            <div class="template-tags">${tags}</div>
+          </button>
+        `;
+      }).join("");
+      const selected = items.find((tpl) => Number(tpl.id) === selectedId) || selectedTemplate() || items[0];
+      desc.innerHTML = selected ? `
+        <div class="template-selected-desc-title">${escapeHtml(selected.name || `模板 ${selected.id}`)}</div>
+        <div class="template-selected-desc-body">${escapeHtml(selected.description || "该模板暂无描述")}</div>
+      ` : `<div class="template-selected-desc-body">请选择一个分镜模板查看描述</div>`;
+      list.querySelectorAll(".template-card").forEach((card) => {
+        card.addEventListener("click", () => {
+          $("storyboardTemplate").value = card.dataset.templateId;
+          updateTemplatePickerText();
+          renderTemplateList();
+        });
+      });
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function openTemplateModal() {
+      const tpl = selectedTemplate();
+      stateStore.templateFlow = tpl ? templateFlow(tpl) : "short_drama";
+      $("templateSearch").value = "";
+      stateStore.templateSearch = "";
+      updateTemplateFlowButtons();
+      $("templateModal").classList.add("open");
+      renderTemplateList();
+      $("templateSearch").focus();
+    }
+
+    function closeTemplateModal() {
+      $("templateModal").classList.remove("open");
+    }
+
+    function updateTemplateFlowButtons() {
+      $("templateTabShortDrama").classList.toggle("active", stateStore.templateFlow === "short_drama");
+      $("templateTabShortFilm").classList.toggle("active", stateStore.templateFlow === "short_film");
+    }
+
+    function removeEmpty() {
+      messages.querySelector(".empty")?.remove();
+    }
+
+    function addRunCard(title = "DeepSeek 分镜实验") {
+      removeEmpty();
+      const node = document.createElement("div");
+      node.className = "msg";
+      node.innerHTML = `
+        <div class="msg-title">
+          <span></span>
+          <span class="pill warn">运行中</span>
+        </div>
+        <div class="tabs">
+          <button class="tab active" data-tab="output">实时输出</button>
+          <button class="tab" data-tab="reasoning">推理过程</button>
+          <button class="tab" data-tab="prompt">完整输入Prompt</button>
+          <button class="tab" data-tab="meta">调用信息</button>
+          <button class="tab" data-tab="log">事件日志</button>
+          <button class="tab" data-tab="raw">原始事件流</button>
+        </div>
+        <div class="tab-content"></div>
+      `;
+      const badge = node.querySelector(".pill");
+      node.querySelector(".msg-title span").textContent = title;
+      const content = node.querySelector(".tab-content");
+      const state = {
+        activeTab: "output",
+        output: "",
+        reasoning: "",
+        prompt: "",
+        meta: {},
+        logs: [],
+        rawEvents: [],
+      };
+
+      function render() {
+        if (state.activeTab === "output") {
+          content.innerHTML = "<pre class='stream-output'></pre>";
+          content.querySelector("pre").textContent = state.output || "等待模型返回...";
+          return;
+        }
+        if (state.activeTab === "reasoning") {
+          content.innerHTML = "<pre class='stream-output'></pre>";
+          content.querySelector("pre").textContent = state.reasoning || "等待 reasoning_content；如果当前模型/后端不返回该字段，这里会为空。";
+          return;
+        }
+        if (state.activeTab === "prompt") {
+          content.innerHTML = "<pre></pre>";
+          content.querySelector("pre").textContent = state.prompt || "等待构建 Prompt...";
+          return;
+        }
+        if (state.activeTab === "meta") {
+          content.innerHTML = "<pre></pre>";
+          content.querySelector("pre").textContent = JSON.stringify(state.meta, null, 2);
+          return;
+        }
+        if (state.activeTab === "log") {
+          content.innerHTML = "<pre></pre>";
+          content.querySelector("pre").textContent = state.logs.join("\n");
+          return;
+        }
+        content.innerHTML = "<pre></pre>";
+        content.querySelector("pre").textContent = state.rawEvents.join("\n\n");
+      }
+
+      node.querySelectorAll(".tab").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          node.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
+          btn.classList.add("active");
+          state.activeTab = btn.dataset.tab;
+          render();
+        });
+      });
+
+      render();
+      messages.prepend(node);
+      return {
+        push(event) {
+          const time = new Date().toLocaleTimeString();
+          state.rawEvents.push(`[${time}] ${JSON.stringify(event, null, 2)}`);
+          if (event.message) state.logs.push(`[${time}] ${event.message}`);
+          if (event.type === "prompt") {
+            state.prompt = event.input_prompt || "";
+            state.meta.log_id = event.log_id;
+          }
+          if (event.type === "template") state.meta.template = event.template;
+          if (event.type === "style_template") state.meta.style_template = event.style_template;
+          if (event.type === "config") {
+            state.meta.llm_config = event.llm_config;
+            state.meta.model_override = event.model_override;
+            state.meta.thinking_enabled = event.thinking_enabled;
+            state.meta.reasoning_effort = event.reasoning_effort;
+          }
+          if (event.type === "request_params") state.meta.request_params = event.request_params;
+          if (event.type === "reasoning_delta") state.reasoning += event.content || "";
+          if (event.type === "delta") state.output += event.content || "";
+          if (event.type === "storyboard_progress") {
+            state.output = formatStoryboardSummary(event.storyboard_summary || []);
+          }
+          if (event.type === "final") {
+            const result = event.result || {};
+            if (result.storyboard_summary || result.ai_output) {
+              state.output = formatQianshanResult(result);
+              state.prompt = "千山后端观察模式：本页不额外构建 Prompt，只把文章/剧本提交给千山本地后端流程。";
+              state.meta = formatQianshanMeta(result);
+            } else {
+              state.output = result.output || state.output;
+              state.reasoning = result.reasoning_content || state.reasoning;
+              state.prompt = result.input_prompt || state.prompt;
+              state.meta = {
+                ...state.meta,
+                template: result.template,
+                llm_config: result.llm_config,
+                settings: result.settings,
+                usage: result.usage,
+                log_id: result.log_id,
+              };
+            }
+            badge.textContent = `完成 · ${state.output.length} 字`;
+            badge.classList.remove("warn");
+          }
+          if (event.type === "error") {
+            badge.textContent = "失败";
+            badge.classList.remove("warn");
+            badge.classList.add("bad");
+            state.logs.push(`[${time}] ${event.message || "生成失败"}`);
+          }
+          render();
+        }
+      };
+    }
+
+    function formatStoryboardSummary(rows) {
+      if (!rows.length) return "等待千山分镜落库...";
+      return rows.map((row, index) => {
+        return [
+          `#${index + 1} ${row.title_line || ""}`,
+          row.prompt || "",
+        ].filter(Boolean).join("\n");
+      }).join("\n\n---\n\n");
+    }
+
+    function formatQianshanResult(result) {
+      const aiOutput = result.ai_output || "";
+      const summary = formatStoryboardSummary(result.storyboard_summary || []);
+      if (aiOutput && summary) return `${aiOutput}\n\n================ 分镜落库摘要 ================\n\n${summary}`;
+      return aiOutput || summary || "千山没有返回可显示的分镜内容。";
+    }
+
+    function formatQianshanMeta(result) {
+      const aiLog = result.ai_log ? { ...result.ai_log } : null;
+      if (aiLog) delete aiLog.input_prompt;
+      return {
+        mode: "qianshan_backend",
+        base_url: result.base_url,
+        novel_id: result.novel?.id,
+        script_id: result.script_result?.script_id,
+        selected_scene: result.selected_scene,
+        templates: result.templates,
+        ai_log: aiLog,
+        storyboards_count: result.storyboards?.length || 0,
+      };
+    }
+
+    async function loadStatus() {
+      const res = await fetch("/api/qianshan-lab/direct-status");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "读取配置失败");
+      let qianshan = null;
+      try {
+        const qsRes = await fetch("/api/qianshan-lab/status");
+        qianshan = await qsRes.json();
+        if (!qsRes.ok) qianshan = null;
+      } catch (err) {
+        qianshan = null;
+      }
+
+      const configs = data.deepseek_configs?.length ? data.deepseek_configs : (data.llm_configs || []);
+      stateStore.directConfigs = configs;
+      stateStore.qianshanConfigs = Array.isArray(qianshan?.llm_configs) ? qianshan.llm_configs : [];
+      stateStore.qianshanStatus = qianshan;
+
+      const templateSelect = $("storyboardTemplate");
+      const styleSelect = $("styleTemplate");
+      const templates = sortTemplatesLikeQianshan(data.storyboard_templates || []);
+      stateStore.templates = templates;
+      templateSelect.innerHTML = templates.map((tpl) => {
+        const label = `${tpl.id} · ${tpl.name}`;
+        return `<option value="${tpl.id}">${label}</option>`;
+      }).join("");
+      const defaultTemplate =
+        templates.find((tpl) => templateFlow(tpl) === "short_drama")
+        || templates.find((tpl) => Number(tpl.id) === Number(data.defaults?.storyboard_template_id))
+        || templates[0];
+      if (defaultTemplate) templateSelect.value = defaultTemplate.id;
+      updateTemplatePickerText();
+      renderTemplateList();
+
+      const styleTemplates = sortTemplatesLikeQianshan(data.style_templates || []);
+      stateStore.styleTemplates = styleTemplates;
+      styleSelect.innerHTML = `<option value="">不使用风格提示词</option>` + styleTemplates.map((tpl) => {
+        const tags = templateTags(tpl).filter((tag) => tag !== "短剧" && tag !== "短片" && tag !== "竖屏");
+        const label = `${tpl.id} · ${tpl.name}${tags.length ? ` · ${tags.join(" / ")}` : ""}`;
+        return `<option value="${tpl.id}">${label}</option>`;
+      }).join("");
+      if (data.defaults?.style_template_id) styleSelect.value = data.defaults.style_template_id;
+
+      $("maxTokens").value = data.defaults?.max_tokens || 30000;
+      $("enableContext").checked = data.defaults?.enable_context !== false;
+      populateModelSelect();
+      statusEl.textContent = qianshan
+        ? `千山后端在线 ${qianshan.base_url}，读取 ${stateStore.qianshanConfigs.length} 个千山模型配置，${templates.length} 个分镜模板`
+        : `千山后端未连接；DeepSeek 对照配置 ${configs.length} 个，分镜模板 ${templates.length} 个`;
+    }
+
+    function buildRequest(overrides = {}) {
+      const mode = $("promptMode").value;
+      const text = $("sourceText").value.trim();
+      const storyboardTemplateId = Number(overrides.storyboardTemplateId || $("storyboardTemplate").value);
+      const styleTemplateValue = $("styleTemplate").value;
+      const styleTemplateId = styleTemplateValue ? Number(styleTemplateValue) : null;
+      const title = overrides.title || $("title").value.trim();
+      if (mode === "qianshan" || mode === "qianshan_direct") {
+        return {
+          url: "/api/qianshan-lab/storyboard-stream",
+          label: mode === "qianshan_direct" ? "千山分镜直发" : "千山完整流程",
+          body: {
+            article: text,
+            title,
+            script_template_id: Number($("scriptTemplate").value || 16),
+            storyboard_template_id: storyboardTemplateId,
+            style_template_id: styleTemplateId,
+            llm_config_id: Number($("llmConfig").value || 5904),
+            scene_index: Number($("sceneIndex").value || 0),
+            qianshan_mode: mode === "qianshan_direct" ? "direct_scene" : "full_pipeline",
+          },
+        };
+      }
+      return {
+        url: "/api/qianshan-lab/direct-storyboard-stream",
+        label: "DeepSeek",
+        body: {
+          text,
+          title,
+          llm_config_id: Number($("llmConfig").value),
+          storyboard_template_id: storyboardTemplateId,
+          style_template_id: styleTemplateId,
+          enable_context: $("enableContext").checked,
+          max_tokens: Number($("maxTokens").value || 30000),
+          temperature: Number($("temperature").value || 0.7),
+          prompt_mode: mode,
+          followup_instruction: $("followupInstruction").value,
+          model_override: $("modelOverride").value,
+          thinking_enabled: $("thinkingMode").checked,
+          reasoning_effort: $("reasoningEffort").value,
+        },
+      };
+    }
+
+    function parseTemplateIds(value) {
+      const ids = [];
+      const seen = new Set();
+      String(value || "").split(/[,，\s]+/).forEach((part) => {
+        if (!part) return;
+        const range = part.match(/^(\d+)\s*[-~至]\s*(\d+)$/);
+        if (range) {
+          const start = Number(range[1]);
+          const end = Number(range[2]);
+          const step = start <= end ? 1 : -1;
+          for (let id = start; step > 0 ? id <= end : id >= end; id += step) {
+            if (!seen.has(id)) {
+              seen.add(id);
+              ids.push(id);
+            }
+          }
+          return;
+        }
+        const id = Number(part);
+        if (Number.isInteger(id) && id > 0 && !seen.has(id)) {
+          seen.add(id);
+          ids.push(id);
+        }
+      });
+      return ids;
+    }
+
+    async function streamRequest(request, card) {
+      card.push({ type: "client_request", message: "浏览器已发起请求", request });
+      const res = await fetch(request.url, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(request.body),
+      });
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `${request.label}生成失败`);
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const event = JSON.parse(line);
+          card.push(event);
+          if (event.message) statusEl.textContent = event.message;
+          if (event.type === "error") throw new Error(event.message || `${request.label}生成失败`);
+          if (event.type === "final") statusEl.textContent = event.message || "完成";
+        }
+      }
+      if (buffer.trim()) {
+        const event = JSON.parse(buffer);
+        card.push(event);
+        if (event.type === "error") throw new Error(event.message || `${request.label}生成失败`);
+      }
+    }
+
+    async function run() {
+      const text = $("sourceText").value.trim();
+      if (text.length < 1) {
+        alert("先输入内容。");
+        return;
+      }
+      const request = buildRequest();
+      setBusy(true);
+      statusEl.textContent = `正在调用${request.label}...`;
+      const card = addRunCard(`${request.label} · 模板 ${request.body.storyboard_template_id}`);
+      try {
+        await streamRequest(request, card);
+      } catch (err) {
+        card.push({ type: "error", message: err.message });
+        statusEl.textContent = "生成失败";
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function runBatch() {
+      const text = $("sourceText").value.trim();
+      if (text.length < 1) {
+        alert("先输入内容。");
+        return;
+      }
+      const ids = parseTemplateIds($("batchTemplateIds").value);
+      if (!ids.length) {
+        alert("先填写要跑的分镜模板 ID。");
+        return;
+      }
+      const concurrency = Math.max(1, Math.min(8, Number($("batchConcurrency").value || 3)));
+      setBusy(true);
+      let nextIndex = 0;
+      let doneCount = 0;
+      let failCount = 0;
+      statusEl.textContent = `批量开始：${ids.length} 个模板，并发 ${concurrency}`;
+
+      async function worker(workerIndex) {
+        while (nextIndex < ids.length) {
+          const currentIndex = nextIndex++;
+          const id = ids[currentIndex];
+          const request = buildRequest({
+            storyboardTemplateId: id,
+            title: `${$("title").value.trim() || "万山分镜实验"}-ID${id}`,
+          });
+          const card = addRunCard(`${request.label} · 分镜模板 ID ${id}`);
+          try {
+            card.push({ type: "batch_start", message: `并发槽 ${workerIndex + 1} 开始模板 ${id}`, template_id: id });
+            await streamRequest(request, card);
+          } catch (err) {
+            failCount += 1;
+            card.push({ type: "error", message: err.message, template_id: id });
+          } finally {
+            doneCount += 1;
+            statusEl.textContent = `批量运行中：${doneCount}/${ids.length} 完成，失败 ${failCount}，并发 ${concurrency}`;
+          }
+        }
+      }
+
+      try {
+        await Promise.all(Array.from({ length: Math.min(concurrency, ids.length) }, (_, index) => worker(index)));
+        statusEl.textContent = `批量完成：${doneCount}/${ids.length}，失败 ${failCount}`;
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    runBtn.addEventListener("click", run);
+    batchRunBtn.addEventListener("click", runBatch);
+    $("promptMode").addEventListener("change", () => updateModeState(false));
+    $("thinkingMode").addEventListener("change", () => updateModeState(false));
+    $("templatePickerBtn").addEventListener("click", openTemplateModal);
+    $("templateModalClose").addEventListener("click", closeTemplateModal);
+    $("templateModal").addEventListener("click", (event) => {
+      if (event.target === $("templateModal")) closeTemplateModal();
+    });
+    $("templateSearch").addEventListener("input", (event) => {
+      stateStore.templateSearch = event.target.value || "";
+      renderTemplateList();
+    });
+    $("templateTabShortDrama").addEventListener("click", () => {
+      stateStore.templateFlow = "short_drama";
+      updateTemplateFlowButtons();
+      renderTemplateList();
+    });
+    $("templateTabShortFilm").addEventListener("click", () => {
+      stateStore.templateFlow = "short_film";
+      updateTemplateFlowButtons();
+      renderTemplateList();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeTemplateModal();
+    });
+    sampleBtn.addEventListener("click", () => {
+      $("sourceText").value = sampleText;
+    });
+
+    loadStatus().catch((err) => {
+      statusEl.textContent = err.message;
+    }).finally(() => {
+      updateModeState(false);
+    });
+  </script>
+</body>
+</html>

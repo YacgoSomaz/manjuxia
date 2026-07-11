@@ -17,9 +17,104 @@ ADMIN_SERVER = "https://xiaoshuo.qianshanai.cn"
 # 生成时走 admin 服务端 assemble。目前只保护分镜生成模板(风格提示词暂不保护)。
 _PROTECTED_CATEGORIES = {"storyboard_generation"}
 
+_STORYBOARD_ORDER_HINTS = [
+    "慢节奏通用版",
+    "快节奏通用版",
+    "古偶权谋",
+    "古偶重生复仇",
+    "犯罪悬疑/冷峻现实主义",
+    "仙侠修仙/东方玄幻",
+    "机甲科幻/巨兽战争",
+    "江湖武林",
+    "都市逆袭",
+    "现代言情",
+    "2D日漫",
+    "2D国漫",
+    "民国少帅",
+    "乡村红色",
+    "海外",
+    "港式无厘头喜剧",
+    "古代悬疑",
+    "民国悬疑",
+    "现代刑侦",
+    "AIGC视频提示词",
+    "动漫视频分镜式剧本描述词模板",
+    "西方玄幻",
+]
+
+_STYLE_ORDER_HINTS = [
+    "2D仙侠/玄幻/古风修仙动漫风格",
+    "3D国漫仙侠/玄幻/古风风格",
+    "3D真人风格【海外】",
+    "3D真人风格【国内】",
+    "3D国漫现代都市/校园风格",
+    "2D国漫通用风格",
+    "3D国漫通用风格",
+]
+
+_STORYBOARD_LEGACY_MARKERS = (
+    "旧版勿用",
+    "旧版备份差异版",
+    "测试勿使用",
+    "差异版-",
+)
+
 
 def _is_protected_template(category: Optional[str], is_preset) -> bool:
     return (category in _PROTECTED_CATEGORIES) and (str(is_preset) == "1" or is_preset == 1)
+
+
+def _order_index(name: str, hints: List[str]) -> int:
+    for idx, hint in enumerate(hints):
+        if hint in name:
+            return idx
+    return len(hints) + 100
+
+
+def _storyboard_order_index(name: str) -> int:
+    if "横屏" in name or "16:9" in name or "横屏版" in name:
+        return 40 + _order_index(name, _STORYBOARD_ORDER_HINTS)
+    if "海外" in name or "出海" in name:
+        if "西方玄幻" in name:
+            return 60
+        return 14
+    return _order_index(name, _STORYBOARD_ORDER_HINTS)
+
+
+def _is_storyboard_legacy_row(row: Dict[str, Any]) -> bool:
+    name = row.get("name") or ""
+    if any(marker in name for marker in _STORYBOARD_LEGACY_MARKERS):
+        return True
+    # 老本地兜底模板和抓包差异模板保留在库里，但不放进正式产品选择器。
+    # 如果只剩旧模板，后面的排序函数会自动回退返回原列表，避免空列表。
+    if not row.get("admin_id") and (row.get("id") or 0) < 51:
+        return True
+    return not row.get("admin_id") and not name.startswith("即梦2.0")
+
+
+def _sort_product_templates(rows: List[Dict[str, Any]], category: Optional[str]) -> List[Dict[str, Any]]:
+    if category == "storyboard_generation":
+        visible = [row for row in rows if not _is_storyboard_legacy_row(row)]
+        if visible:
+            rows = visible
+        return sorted(
+            rows,
+            key=lambda row: (
+                _storyboard_order_index(row.get("name") or ""),
+                row.get("admin_id") or 10_000,
+                row.get("id") or 10_000,
+            ),
+        )
+    if category == "style_prompt":
+        return sorted(
+            rows,
+            key=lambda row: (
+                _order_index(row.get("name") or "", _STYLE_ORDER_HINTS),
+                row.get("admin_id") or 10_000,
+                row.get("id") or 10_000,
+            ),
+        )
+    return rows
 
 
 def _extract_timestamp_skew_offset(body: str) -> Optional[int]:
@@ -554,7 +649,7 @@ async def get_all(category_filter: Optional[str] = None):
             if d.get("is_preset") == 1 and d.get("category") != "style_prompt":
                 d["content"] = ""
             result.append(d)
-        return result
+        return _sort_product_templates(result, category_filter)
     finally:
         await db.close()
 

@@ -11,7 +11,7 @@ function b64url(value) {
   return Buffer.from(value).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-function createSignedLicense({ privateKey, productCode = "wanshan", deviceHash = "device-1", expiresAt = 2000, graceUntil = 3000 }) {
+function createSignedLicense({ privateKey, productCode = "wanshan_media", deviceHash = "device-1", expiresAt = 2000, graceUntil = 3000 }) {
   const payload = { license_id: "activation-1", activation_id: "activation-1", product_code: productCode, device_hash: deviceHash, features: ["basic"], issued_at: 1000, expires_at: expiresAt, grace_until: graceUntil };
   const payloadBytes = Buffer.from(JSON.stringify(payload));
   return { alg: "Ed25519", payload: b64url(payloadBytes), signature: b64url(crypto.sign(null, payloadBytes, privateKey)) };
@@ -37,9 +37,9 @@ test("verifies a signed license document and rejects tampering", () => {
   const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
   const rawPublic = publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("base64url");
   const license = createSignedLicense({ privateKey });
-  assert.equal(verifyLicenseDocument(license, { publicKey: rawPublic, productCode: "wanshan", deviceHash: "device-1", now: 1500 }).ok, true);
+  assert.equal(verifyLicenseDocument(license, { publicKey: rawPublic, productCode: "wanshan_media", deviceHash: "device-1", now: 1500 }).ok, true);
   const tampered = { ...license, payload: license.payload.slice(0, -1) + "A" };
-  assert.equal(verifyLicenseDocument(tampered, { publicKey: rawPublic, productCode: "wanshan", deviceHash: "device-1", now: 1500 }).ok, false);
+  assert.equal(verifyLicenseDocument(tampered, { publicKey: rawPublic, productCode: "wanshan_media", deviceHash: "device-1", now: 1500 }).ok, false);
 });
 
 test("rejects wrong product, device, and expired grace window", () => {
@@ -47,8 +47,8 @@ test("rejects wrong product, device, and expired grace window", () => {
   const rawPublic = publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("base64url");
   const license = createSignedLicense({ privateKey, expiresAt: 2000, graceUntil: 2100 });
   assert.equal(verifyLicenseDocument(license, { publicKey: rawPublic, productCode: "other", deviceHash: "device-1", now: 1500 }).reason, "product_mismatch");
-  assert.equal(verifyLicenseDocument(license, { publicKey: rawPublic, productCode: "wanshan", deviceHash: "device-2", now: 1500 }).reason, "device_mismatch");
-  assert.equal(verifyLicenseDocument(license, { publicKey: rawPublic, productCode: "wanshan", deviceHash: "device-1", now: 2200 }).reason, "expired");
+  assert.equal(verifyLicenseDocument(license, { publicKey: rawPublic, productCode: "wanshan_media", deviceHash: "device-2", now: 1500 }).reason, "device_mismatch");
+  assert.equal(verifyLicenseDocument(license, { publicKey: rawPublic, productCode: "wanshan_media", deviceHash: "device-1", now: 2200 }).reason, "expired");
 });
 
 test("activates through the existing API and stores encrypted state", async () => {
@@ -61,7 +61,7 @@ test("activates through the existing API and stores encrypted state", async () =
     calls.push({ url, options });
     return { ok: true, status: 200, json: async () => ({ license, activation_id: "activation-1", refresh_token: "refresh-token-123456" }) };
   };
-  const client = new LicenseClient({ baseUrl: "https://license.example", publicKey: rawPublic, productCode: "wanshan", deviceHash: "device-1", appVersion: "1.0.0", dataPath: path.join(tempDir, "license.dat"), safeStorage: fakeStorage(), fetchImpl });
+  const client = new LicenseClient({ baseUrl: "https://license.example", publicKey: rawPublic, productCode: "wanshan_media", deviceHash: "device-1", appVersion: "1.0.0", dataPath: path.join(tempDir, "license.dat"), safeStorage: fakeStorage(), fetchImpl });
   const result = await client.activate("LRX-TEST");
   assert.equal(result.success, true);
   assert.equal(calls[0].url, "https://license.example/v1/activate");
@@ -77,7 +77,7 @@ test("does not consume a card when encrypted local storage is unavailable", asyn
   const client = new LicenseClient({
     baseUrl: "https://license.example",
     publicKey: rawPublic,
-    productCode: "wanshan",
+    productCode: "wanshan_media",
     deviceHash: "device-1",
     appVersion: "1.0.0",
     dataPath: path.join(os.tmpdir(), "unused-license.dat"),
@@ -90,4 +90,27 @@ test("does not consume a card when encrypted local storage is unavailable", asyn
   const result = await client.activate("LRX-TEST");
   assert.equal(result.success, false);
   assert.equal(called, false);
+});
+
+test("defaults activation requests to the server-side wanshan product code", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "wanshan-license-default-"));
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
+  const rawPublic = publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("base64url");
+  const license = createSignedLicense({ privateKey, expiresAt: Math.floor(Date.now() / 1000) + 3600, graceUntil: Math.floor(Date.now() / 1000) + 7200 });
+  let requestBody = null;
+  const client = new LicenseClient({
+    baseUrl: "https://license.example",
+    publicKey: rawPublic,
+    deviceHash: "device-1",
+    appVersion: "1.0.0",
+    dataPath: path.join(tempDir, "license.dat"),
+    safeStorage: fakeStorage(),
+    fetchImpl: async (_url, options) => {
+      requestBody = JSON.parse(options.body);
+      return { ok: true, status: 200, json: async () => ({ license, activation_id: "activation-1", refresh_token: "refresh-token-123456" }) };
+    }
+  });
+  const result = await client.activate("LRX-TEST");
+  assert.equal(result.success, true);
+  assert.equal(requestBody.product_code, "wanshan_media");
 });

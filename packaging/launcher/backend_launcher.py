@@ -11,7 +11,13 @@ def main() -> int:
     if not backend.is_file():
         print(f"backend executable missing: {backend}", file=sys.stderr)
         return 2
-    process = subprocess.Popen([str(backend)], cwd=str(backend.parent), env=os.environ.copy())
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    process = subprocess.Popen(
+        [str(backend)],
+        cwd=str(backend.parent),
+        env=os.environ.copy(),
+        creationflags=creationflags,
+    )
     try:
         return process.wait()
     except KeyboardInterrupt:

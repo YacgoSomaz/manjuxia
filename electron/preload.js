@@ -31,6 +31,7 @@ const electronAPI = {
   },
   onLicenseInvalid: () => {},
   update: {
+    check: () => ipcRenderer.invoke("check-for-updates"),
     onUpdateAvailable: (callback) => ipcRenderer.on("update-available", (_event, payload) => callback(payload)),
     onUpdateProgress: (callback) => ipcRenderer.on("update-progress", (_event, payload) => callback(payload)),
     onUpdateDownloaded: (callback) => ipcRenderer.on("update-downloaded", () => callback()),

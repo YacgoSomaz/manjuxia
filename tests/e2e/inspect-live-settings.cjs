@@ -24,11 +24,21 @@ async function main() {
     await page.getByText("万山模型配置").waitFor({ state: "visible", timeout: 15000 });
     await page.screenshot({ path: path.join(projectDir, "test-artifacts", "live-settings.png"), fullPage: true });
     const bodyText = await page.locator("body").innerText();
-    if (!bodyText.includes("千山远端配置")) {
-      throw new Error("设置页缺少千山远端配置入口");
+    if (!bodyText.includes("一键本地配置")) {
+      throw new Error("设置页缺少一键本地配置入口");
     }
-    if (!bodyText.includes("管理本地配置")) {
-      throw new Error("设置页缺少本地配置兜底入口");
+    if (!bodyText.includes("使用本机加密配置")) {
+      throw new Error("设置页没有说明当前使用本机加密配置");
+    }
+    if (bodyText.includes("千山远端配置")) {
+      throw new Error("设置页不应再主推千山远端配置入口");
+    }
+    await page.getByText("一键本地配置").click();
+    await page.getByText("低代码本地配置").waitFor({ state: "visible", timeout: 5000 });
+    await page.getByText("厂商预设").waitFor({ state: "visible", timeout: 5000 });
+    const maxTokens = await page.locator('input[name="max_tokens"]').inputValue();
+    if (maxTokens !== "20000") {
+      throw new Error(`最大输出Token默认值错误: ${maxTokens}`);
     }
     console.log(bodyText.slice(0, 5000));
   } finally {

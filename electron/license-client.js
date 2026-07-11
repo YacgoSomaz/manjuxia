@@ -40,7 +40,7 @@ class LicenseClient {
   constructor({ baseUrl, publicKey, productCode, deviceHash, appVersion, dataPath, safeStorage, fetchImpl = globalThis.fetch, now = () => Math.floor(Date.now() / 1000) }) {
     this.baseUrl = String(baseUrl || "").replace(/\/+$/, "");
     this.publicKey = String(publicKey || "");
-    this.productCode = String(productCode || "wanshan");
+    this.productCode = String(productCode || "wanshan_media");
     this.deviceHash = String(deviceHash || "");
     this.appVersion = String(appVersion || "");
     this.dataPath = dataPath;

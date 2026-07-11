@@ -145,6 +145,9 @@ from api.subtitle_removal import router as subtitle_removal_router
 from api.settings import router as settings_router
 from api.queue import router as queue_router
 from api.team import router as team_router
+qianshan_lab_router = None
+if os.getenv("WANSHAN_ENABLE_QIANSHAN_LAB", "").strip() == "1":
+    from api.qianshan_lab import router as qianshan_lab_router
 # v3.61.28: 封面生成实验模块,完全解耦,删 api/cover.py + 这两行就还原
 from api.cover import router as cover_router
 # v3.61.92: 其他功能 (溶图)
@@ -353,6 +356,8 @@ app.include_router(subtitle_removal_router)
 app.include_router(settings_router)
 app.include_router(queue_router)
 app.include_router(team_router)
+if qianshan_lab_router is not None:
+    app.include_router(qianshan_lab_router)
 # v3.61.28: 封面生成实验路由
 app.include_router(cover_router)
 # v3.61.92: 其他功能 (溶图)
@@ -416,6 +421,15 @@ app.mount("/data/frames", StaticFiles(directory=frames_dir), name="frames")
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok", "message": "服务运行正常", "version": APP_VERSION}
+
+
+if qianshan_lab_router is not None:
+    @app.get("/qianshan-storyboard-lab")
+    async def qianshan_storyboard_lab_page():
+        page = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "qianshan-storyboard-lab.html")
+        if not os.path.exists(page):
+            raise _HTTPException(404, "分镜实验页面不存在")
+        return FileResponse(page)
 
 
 def _find_free_port():

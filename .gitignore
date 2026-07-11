@@ -26,6 +26,7 @@ backend/data/tpl_*.txt
 test-artifacts/
 tests/artifacts/
 *.pyc
+build/
 
 # Release build output and local commercial settings
 packaging/release/

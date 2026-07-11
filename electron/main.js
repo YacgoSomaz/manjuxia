@@ -8,6 +8,7 @@ const path = require("node:path");
 const { isTrustedExternalUrl, isTrustedJimengUrl } = require("./trusted-origins");
 const { verifyPackagedRelease } = require("./release-guard");
 const { LicenseClient } = require("./license-client");
+const { UpdateClient } = require("./update-client");
 
 const APP_NAME = "万山";
 
@@ -16,8 +17,12 @@ let jimengWindow = null;
 let qianshanConfigWindow = null;
 let backendProcess = null;
 let backendUrl = "http://127.0.0.1:8000";
+let backendLaunchStartedAt = 0;
 let licenseClient = null;
 let commercialBuild = false;
+let releaseConfig = null;
+let updateClient = null;
+const BACKEND_PORT_CANDIDATES = [8000, 18472, 28800, 38765, 48899];
 
 function rootDir() {
   return app.isPackaged ? process.resourcesPath : path.resolve(__dirname, "..");
@@ -47,11 +52,12 @@ function getMachineId() {
 
 function initializeLicenseClient() {
   const config = readReleaseConfig();
+  releaseConfig = config;
   commercialBuild = Boolean(config.commercial);
   licenseClient = new LicenseClient({
     baseUrl: config.license_server_url || process.env.WANSHAN_LICENSE_SERVER_URL || "",
     publicKey: config.license_public_key || process.env.WANSHAN_LICENSE_PUBLIC_KEY || "",
-    productCode: config.product_code || process.env.WANSHAN_PRODUCT_CODE || "wanshan",
+    productCode: config.product_code || process.env.WANSHAN_PRODUCT_CODE || "wanshan_media",
     deviceHash: getMachineId(),
     appVersion: app.getVersion(),
     dataPath: path.join(dataDir(), "license.dat"),
@@ -106,9 +112,20 @@ function sessionSecretFile() {
   return path.join(dataDir(), "backend.session");
 }
 
-function readBackendPort() {
+function isFreshRuntimeFile(filePath, minMtimeMs) {
+  if (!minMtimeMs) return true;
   try {
-    const raw = fs.readFileSync(backendPortFile(), "utf8").trim();
+    return fs.statSync(filePath).mtimeMs >= minMtimeMs - 500;
+  } catch (_) {
+    return false;
+  }
+}
+
+function readBackendPort(minMtimeMs = 0) {
+  try {
+    const filePath = backendPortFile();
+    if (!isFreshRuntimeFile(filePath, minMtimeMs)) return null;
+    const raw = fs.readFileSync(filePath, "utf8").trim();
     const port = Number.parseInt(raw, 10);
     if (Number.isFinite(port) && port > 0 && port < 65536) return port;
   } catch (_) {
@@ -117,9 +134,21 @@ function readBackendPort() {
   return null;
 }
 
-function readSessionSecret() {
+function backendPortCandidates() {
+  const filePort = readBackendPort();
+  const ports = [];
+  if (filePort) ports.push(filePort);
+  for (const port of BACKEND_PORT_CANDIDATES) {
+    if (!ports.includes(port)) ports.push(port);
+  }
+  return ports;
+}
+
+function readSessionSecret(minMtimeMs = 0) {
   try {
-    const buf = fs.readFileSync(sessionSecretFile());
+    const filePath = sessionSecretFile();
+    if (!isFreshRuntimeFile(filePath, minMtimeMs)) return "";
+    const buf = fs.readFileSync(filePath);
     if (buf.length === 32) return buf.toString("hex");
     const raw = buf.toString("utf8").trim();
     if (/^[0-9a-fA-F]{64}$/.test(raw)) return raw.toLowerCase();
@@ -145,10 +174,25 @@ function requestHealth(url) {
 
 async function waitForBackend() {
   for (let i = 0; i < 60; i += 1) {
-    const port = readBackendPort();
-    if (port) {
-      backendUrl = `http://127.0.0.1:${port}`;
-      if (await requestHealth(backendUrl)) return true;
+    if (backendProcess && i < 30) {
+      const freshPort = readBackendPort(backendLaunchStartedAt);
+      const freshSecret = readSessionSecret(backendLaunchStartedAt);
+      if (freshPort && freshSecret) {
+        const candidateUrl = `http://127.0.0.1:${freshPort}`;
+        if (await requestHealth(candidateUrl)) {
+          backendUrl = candidateUrl;
+          return true;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      continue;
+    }
+    for (const port of backendPortCandidates()) {
+      const candidateUrl = `http://127.0.0.1:${port}`;
+      if (await requestHealth(candidateUrl)) {
+        backendUrl = candidateUrl;
+        return true;
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
@@ -183,13 +227,14 @@ function startBackend() {
   } catch (_) {
     // Ignore stale runtime files.
   }
+  backendLaunchStartedAt = Date.now();
 
   backendProcess = childProcess.spawn(command, args, {
     cwd,
     env: {
       ...process.env,
       WANSHAN_APP_NAME: APP_NAME,
-      WANSHAN_ENABLE_CLOUD: process.env.WANSHAN_ENABLE_CLOUD || "1",
+      WANSHAN_ENABLE_CLOUD: process.env.WANSHAN_ENABLE_CLOUD || "0",
       PYTHONUTF8: "1"
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -487,12 +532,29 @@ ipcMain.handle("jimeng-inject-script", async (_event, script) => {
 ipcMain.handle("embed-config:open-llm-config", () => openQianshanConfigWindow());
 ipcMain.handle("embed-config:sync-llm-token", () => captureQianshanCloudToken());
 
-ipcMain.handle("start-update-download", () => ({
-  success: false,
-  error: "万山本地离线版已禁用自动更新"
-}));
+ipcMain.handle("check-for-updates", async () => {
+  if (!updateClient) return { updateAvailable: false, reason: "updater_not_initialized" };
+  try {
+    return await updateClient.check();
+  } catch (error) {
+    const payload = { error: error.message || String(error) };
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("update-error", payload);
+    return { updateAvailable: false, ...payload };
+  }
+});
 
-ipcMain.handle("cancel-update-download", () => true);
+ipcMain.handle("start-update-download", async () => {
+  if (!updateClient) return { success: false, error: "更新器尚未初始化" };
+  try {
+    return await updateClient.downloadAndInstall();
+  } catch (error) {
+    const payload = { error: error.message || String(error) };
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("update-error", payload);
+    return { success: false, ...payload };
+  }
+});
+
+ipcMain.handle("cancel-update-download", () => (updateClient ? updateClient.cancel() : true));
 
 ipcMain.handle("app:info", () => ({
   name: APP_NAME,
@@ -551,6 +613,10 @@ app.whenReady().then(async () => {
   startBackend();
   await waitForBackend();
   createWindow();
+  updateClient = new UpdateClient({ app, config: releaseConfig, dataDir: dataDir(), mainWindow });
+  if (app.isPackaged) {
+    setTimeout(() => updateClient.check().catch((error) => updateClient.emit("update-error", { error: error.message || String(error) })), 5000);
+  }
 });
 
 app.on("window-all-closed", () => {

@@ -30,6 +30,17 @@ foreach ($item in $sourceItems) {
 Copy-Item -LiteralPath (Join-Path $projectRoot "backend/main.py") -Destination $src -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot "backend/_version.py") -Destination $src -Force
 Get-ChildItem -LiteralPath $src -Recurse -Directory -Filter "__pycache__" -Force | Remove-Item -Recurse -Force
+if ($env:WANSHAN_ENABLE_QIANSHAN_LAB -ne "1") {
+  $qianshanLabFiles = @(
+    (Join-Path $src "api/qianshan_lab.py"),
+    (Join-Path $src "services/qianshan_storyboard_lab.py")
+  )
+  foreach ($labFile in $qianshanLabFiles) {
+    if (Test-Path -LiteralPath $labFile) {
+      Remove-Item -LiteralPath $labFile -Force
+    }
+  }
+}
 
 $embedded = Join-Path $src "services/wanshan_prompt_seed_embedded.py"
 $seedB64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($dataFile))
