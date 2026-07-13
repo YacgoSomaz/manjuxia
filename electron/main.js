@@ -22,7 +22,10 @@ let licenseClient = null;
 let commercialBuild = false;
 let releaseConfig = null;
 let updateClient = null;
+let licenseRefreshTimer = null;
+let licenseRefreshInFlight = false;
 const BACKEND_PORT_CANDIDATES = [8000, 18472, 28800, 38765, 48899];
+const LICENSE_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 
 function rootDir() {
   return app.isPackaged ? process.resourcesPath : path.resolve(__dirname, "..");
@@ -82,6 +85,86 @@ async function syncLicenseContext() {
   if (cloudToken && cloudToken.accessToken) {
     await pushCloudTokenToBackend(cloudToken);
   }
+}
+
+async function clearLicenseContext() {
+  try {
+    await fetch(`${backendUrl}/api/license/context/clear`, { method: "POST" });
+  } catch (_) {
+    // The next backend start begins with an empty in-memory context.
+  }
+}
+
+function activationHash(reason) {
+  const value = String(reason || "unknown").trim() || "unknown";
+  return `/activation?reason=${encodeURIComponent(value)}`;
+}
+
+function shouldLogoutForLicenseFailure(reason) {
+  return String(reason || "") !== "network";
+}
+
+async function navigateToActivation(reason) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const hash = activationHash(reason);
+  try {
+    const currentUrl = mainWindow.webContents.getURL();
+    if (currentUrl.includes(`#${hash}`)) return;
+    await mainWindow.webContents.executeJavaScript(
+      `window.location.hash = ${JSON.stringify(hash)}`,
+      true
+    );
+  } catch (_) {
+    try {
+      await mainWindow.loadFile(path.join(rootDir(), "frontend", "index.html"), { hash });
+    } catch (error) {
+      console.error("[license] failed to navigate to activation:", error);
+    }
+  }
+}
+
+async function enforceLicenseState(source = "timer") {
+  if (!commercialBuild || !licenseClient) return true;
+  if (licenseRefreshInFlight) return true;
+  licenseRefreshInFlight = true;
+  try {
+    const result = await licenseClient.verify();
+    if (result && result.ok) {
+      await syncLicenseContext();
+      return true;
+    }
+    const reason = (result && result.reason) || licenseClient.lastFailReason || "unknown";
+    console.warn(`[license] verification failed from ${source}: ${reason}`);
+    if (shouldLogoutForLicenseFailure(reason)) {
+      licenseClient.logout();
+      await clearLicenseContext();
+    }
+    await navigateToActivation(reason);
+    return false;
+  } catch (error) {
+    console.error(`[license] verification error from ${source}:`, error);
+    await navigateToActivation("network");
+    return false;
+  } finally {
+    licenseRefreshInFlight = false;
+  }
+}
+
+function startLicenseRefreshTimer() {
+  if (!commercialBuild || !licenseClient || licenseRefreshTimer) return;
+  licenseRefreshTimer = setInterval(() => {
+    enforceLicenseState("interval").catch((error) => {
+      console.error("[license] interval refresh failed:", error);
+    });
+  }, LICENSE_REFRESH_INTERVAL_MS);
+  if (typeof licenseRefreshTimer.unref === "function") licenseRefreshTimer.unref();
+  console.log(`[license] periodic refresh enabled: ${LICENSE_REFRESH_INTERVAL_MS / 60000} minutes`);
+}
+
+function stopLicenseRefreshTimer() {
+  if (!licenseRefreshTimer) return;
+  clearInterval(licenseRefreshTimer);
+  licenseRefreshTimer = null;
 }
 
 async function pushCloudTokenToBackend(token) {
@@ -577,17 +660,11 @@ ipcMain.handle("license:activate", async (_event, cardKey) => {
 });
 ipcMain.handle("license:verify", async () => {
   if (!commercialBuild || !licenseClient) return true;
-  const result = await licenseClient.verify();
-  if (result.ok) await syncLicenseContext();
-  return Boolean(result.ok);
+  return enforceLicenseState("ipc");
 });
 ipcMain.handle("license:logout", async () => {
   if (licenseClient) licenseClient.logout();
-  try {
-    await fetch(`${backendUrl}/api/license/context/clear`, { method: "POST" });
-  } catch (_) {
-    // The next backend start begins with an empty in-memory context.
-  }
+  await clearLicenseContext();
   return true;
 });
 
@@ -613,6 +690,7 @@ app.whenReady().then(async () => {
   startBackend();
   await waitForBackend();
   createWindow();
+  startLicenseRefreshTimer();
   updateClient = new UpdateClient({ app, config: releaseConfig, dataDir: dataDir(), mainWindow });
   if (app.isPackaged) {
     setTimeout(() => updateClient.check().catch((error) => updateClient.emit("update-error", { error: error.message || String(error) })), 5000);
@@ -625,5 +703,6 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  stopLicenseRefreshTimer();
   stopBackend();
 });
