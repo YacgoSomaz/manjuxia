@@ -125,6 +125,44 @@ async def init_db():
         """
         await db.execute(create_prompt_templates)
         await auto_migrate_table(db, "prompt_templates", create_prompt_templates)
+
+        # 作品标签定义表：用于小说导入打标签、模板推荐和流程校验。
+        logger.info("创建表: tag_definitions")
+        create_tag_definitions = """
+            CREATE TABLE IF NOT EXISTS tag_definitions (
+                code TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                dimension TEXT NOT NULL,
+                aliases TEXT DEFAULT '[]',
+                description TEXT DEFAULT '',
+                sort_order INTEGER DEFAULT 0,
+                enabled INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
+                updated_at TIMESTAMP DEFAULT (datetime('now', '+8 hours'))
+            )
+        """
+        await db.execute(create_tag_definitions)
+        await auto_migrate_table(db, "tag_definitions", create_tag_definitions)
+
+        logger.info("创建表: novel_tags")
+        create_novel_tags = """
+            CREATE TABLE IF NOT EXISTS novel_tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                novel_id INTEGER NOT NULL,
+                tag_code TEXT NOT NULL,
+                label TEXT NOT NULL,
+                dimension TEXT NOT NULL,
+                score REAL DEFAULT 1.0,
+                source TEXT DEFAULT 'manual',
+                evidence TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
+                updated_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
+                UNIQUE(novel_id, tag_code),
+                FOREIGN KEY (novel_id) REFERENCES novels(id) ON DELETE CASCADE
+            )
+        """
+        await db.execute(create_novel_tags)
+        await auto_migrate_table(db, "novel_tags", create_novel_tags)
         
         # 大模型API配置表
         logger.info("创建表: llm_configs")
@@ -243,6 +281,7 @@ async def init_db():
                 scene_meta TEXT DEFAULT '{}',
                 remote_chapter_id TEXT DEFAULT NULL,
                 remote_version INTEGER DEFAULT 0,
+                sync_outdated INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
                 FOREIGN KEY (novel_id) REFERENCES novels(id) ON DELETE CASCADE,
                 FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
@@ -271,6 +310,7 @@ async def init_db():
                 grid_image TEXT DEFAULT NULL,
                 panorama_url TEXT DEFAULT NULL,
                 audio_file TEXT DEFAULT NULL,
+                voice_id TEXT DEFAULT NULL,
                 volc_asset_id TEXT DEFAULT NULL,
                 volc_asset_uri TEXT DEFAULT NULL,
                 volc_asset_status TEXT DEFAULT NULL,
@@ -346,6 +386,13 @@ async def init_db():
                 video_submit_time TIMESTAMP DEFAULT NULL,
                 extra_reference_image TEXT DEFAULT NULL,
                 extra_reference_desc TEXT DEFAULT NULL,
+                topview_image TEXT DEFAULT NULL,
+                topview_prompt TEXT DEFAULT NULL,
+                topview_start_prompt TEXT DEFAULT NULL,
+                topview_end_prompt TEXT DEFAULT NULL,
+                topview_dispatch_text TEXT DEFAULT NULL,
+                start_frame_image TEXT DEFAULT NULL,
+                end_frame_image TEXT DEFAULT NULL,
                 template_id INTEGER DEFAULT NULL,
                 video_fail_reason TEXT DEFAULT NULL,
                 end_state TEXT DEFAULT NULL,
@@ -401,6 +448,54 @@ async def init_db():
         """
         await db.execute(create_video_task_queue)
         await auto_migrate_table(db, "video_task_queue", create_video_task_queue)
+        # v3.61.296: 全局队列按 storyboard 做活跃态硬幂等。
+        # 创建部分唯一索引前先折叠历史脏数据,避免同一分镜留下多条 queued/generating 行。
+        try:
+            cur_dup = await db.execute(
+                """SELECT storyboard_id, COUNT(*) AS cnt
+                FROM video_task_queue
+                WHERE status IN ('queued','generating')
+                GROUP BY storyboard_id
+                HAVING COUNT(*) > 1"""
+            )
+            dup_groups = await cur_dup.fetchall()
+            collapsed = 0
+            for group in dup_groups:
+                storyboard_id = group["storyboard_id"]
+                cur_rows = await db.execute(
+                    """SELECT id, status, jimeng_task_id, started_at, created_at
+                    FROM video_task_queue
+                    WHERE storyboard_id = ? AND status IN ('queued','generating')
+                    ORDER BY
+                        CASE WHEN status='generating' THEN 0 ELSE 1 END,
+                        CASE WHEN jimeng_task_id IS NOT NULL AND jimeng_task_id != '' THEN 0 ELSE 1 END,
+                        id DESC""",
+                    (storyboard_id,),
+                )
+                rows = await cur_rows.fetchall()
+                if len(rows) <= 1:
+                    continue
+                keep_id = rows[0]["id"]
+                drop_ids = [int(row["id"]) for row in rows[1:]]
+                placeholders = ",".join("?" * len(drop_ids))
+                await db.execute(
+                    f"""UPDATE video_task_queue
+                    SET status='aborted',
+                        finished_at=datetime('now', '+8 hours'),
+                        error_code='DUPLICATE_ACTIVE_COLLAPSED',
+                        error_message='启动时发现同一分镜存在重复活跃队列项,已保留一条并折叠其余项'
+                    WHERE id IN ({placeholders})""",
+                    drop_ids,
+                )
+                collapsed += len(drop_ids)
+                logger.warning(
+                    f"[queue] 折叠重复活跃队列 storyboard_id={storyboard_id}, "
+                    f"keep={keep_id}, aborted={drop_ids}"
+                )
+            if collapsed:
+                logger.warning(f"[queue] 已折叠 {collapsed} 条重复活跃队列项")
+        except Exception as e:
+            logger.warning(f"折叠重复活跃队列项失败(继续启动): {e}")
         # 索引
         try:
             await db.execute(
@@ -411,6 +506,11 @@ async def init_db():
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_queue_novel ON video_task_queue(novel_id, status)"
+            )
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_active_storyboard_unique "
+                "ON video_task_queue(storyboard_id) "
+                "WHERE status IN ('queued','generating')"
             )
         except Exception as e:
             logger.warning(f"video_task_queue 索引创建失败(忽略): {e}")

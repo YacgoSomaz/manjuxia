@@ -62,6 +62,24 @@ def _build_default_prompt(novel_name: str, characters: List[dict]) -> str:
     )
 
 
+def _public_image_config_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "name": item.get("name") or f"配置#{item.get('id')}",
+        "model_name": item.get("model_name") or item.get("modelName") or "",
+        "is_default": bool(item.get("is_default") or item.get("isDefault") == 1),
+    }
+
+
+async def _list_preferred_local_image_configs() -> List[Dict[str, Any]]:
+    from services.llm_service import LLMService
+
+    local_items = await LLMService._get_local_all("image")
+    if local_items:
+        return local_items
+    return await LLMService.get_all("image")
+
+
 def _overlay_title_on_image(image_db_url: str, title: str, style: str = "top") -> Optional[str]:
     """v3.61.34: 模型出图后用 PIL 叠中文标题
     返回新 /data/images/cover_titled_xxx.png 路径(失败返回 None,调用方 fallback 用原图)
@@ -324,36 +342,27 @@ async def cover_init(novel_id: int):
 
 @router.get("/image-configs")
 async def list_image_configs():
-    from services import cloud_llm_sync
     try:
-        items = await cloud_llm_sync.list_configs("image")
+        items = await _list_preferred_local_image_configs()
     except Exception as e:
-        logger.warning(f"[cover/image-configs] 云端拉配置失败: {e}")
+        logger.warning(f"[cover/image-configs] 获取图片配置失败: {e}")
         return {"success": False, "items": [], "message": f"获取配置失败: {e}"}
-    out = []
-    for it in items or []:
-        out.append({
-            "id": it.get("id"),
-            "name": it.get("name") or f"配置#{it.get('id')}",
-            "model_name": it.get("modelName") or "",
-            "is_default": it.get("isDefault") == 1,
-        })
-    return {"success": True, "items": out}
+    return {"success": True, "items": [_public_image_config_item(it) for it in items or []]}
 
 
 async def _run_cover_job(job_id: str, req: CoverGenerateRequest):
     """异步任务:实际跑图生图。完成后写到 _COVER_JOBS,关弹窗也能查"""
     from services.image_service import ImageService
-    from services import cloud_llm_sync
 
     job = _COVER_JOBS[job_id]
     try:
         # 1. 选 config
         config_id = req.config_id
         if not config_id:
-            cfg = await cloud_llm_sync.get_active_config(config_type="image")
+            configs = await _list_preferred_local_image_configs()
+            cfg = configs[0] if configs else None
             if not cfg:
-                job.update(status="failed", error="未找到可用的图片模型,请到千山AI个人中心配置", finished_at=time.time())
+                job.update(status="failed", error="未找到可用的图片模型,请到模型API配置添加图片大模型", finished_at=time.time())
                 return
             config_id = cfg.get("id")
 

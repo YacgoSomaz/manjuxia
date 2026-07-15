@@ -196,6 +196,7 @@ async def generate_section_storyboards(request: GenerateSectionRequest):
                 inherit_prev_state=request.inherit_prev_state,
                 cross_chapter_inherit=request.cross_chapter_inherit,
                 with_character_state=request.with_character_state,
+                avoid_same_shot_size=request.avoid_same_shot_size,
             )
             logger.info(f"[storyboard-api] 场景 {request.scene_index} 分镜生成完成: success={result.get('success')}, count={result.get('count')}")
             return result
@@ -868,6 +869,7 @@ async def regenerate_single_section(request: RegenerateSingleSectionRequest):
             inherit_prev_state=request.inherit_prev_state,
             cross_chapter_inherit=request.cross_chapter_inherit,
             with_character_state=request.with_character_state,
+            avoid_same_shot_size=request.avoid_same_shot_size,
         )
 
         logger.info(f"[storyboard-api] /regenerate-single-section 服务返回: success={result.get('success')}, "

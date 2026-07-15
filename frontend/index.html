@@ -2,12 +2,22 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <link rel="icon" type="image/png" href="./assets/manjuxia-app-icon.png" />
+    <meta name="theme-color" content="#ffffff" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>万山</title>
+    <title>漫剧虾</title>
+    <script>
+      window.__manjuxiaNativeFetch = window.fetch.bind(window);
+    </script>
+    <script src="./multipart-fetch-bridge.js"></script>
+    <script src="./manjuxia-brand.js"></script>
     <script type="module" crossorigin src="./assets/index-CHppf6so.js"></script>
+    <script src="./multipart-fetch-finalizer.js"></script>
     <script defer src="./wanshan-local-config.js"></script>
+    <script defer src="./wanshan-novel-tags.js"></script>
+    <script defer src="./wanshan-extraction-batch.js"></script>
     <link rel="stylesheet" crossorigin href="./assets/index-DcZCm4BG.css">
+    <link rel="stylesheet" href="./manjuxia-light.css">
   </head>
   <body>
     <div id="app"></div>

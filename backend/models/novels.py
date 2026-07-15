@@ -1,12 +1,14 @@
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 
 class NovelCreate(BaseModel):
     name: str
     raw_content: str
     mode: Optional[str] = None   # v3.61.269:'import'(小说默认) / 'script_import'(剧本导入)
+    visual_tags: Optional[List[str]] = None
+    screen_mode_tags: Optional[List[str]] = None
 
 
 class NovelResponse(BaseModel):
@@ -18,6 +20,7 @@ class NovelResponse(BaseModel):
     updated_at: Optional[datetime] = None
     mode: Optional[str] = None      # 'import' 或 'create'
     outline: Optional[str] = None   # JSON 格式大纲
+    novel_tags: Optional[List[Dict[str, Any]]] = None
 
     class Config:
         from_attributes = True

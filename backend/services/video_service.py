@@ -131,32 +131,65 @@ class VideoService:
         """获取dreamina可执行文件路径
             
         优先级：
-        1. 打包环境：从 backend-server.exe 所在目录推算
-        2. PATH 环境变量查找
-        3. 回退到用户 ~/bin/dreamina.exe
+        1. DREAMINA_PATH 环境变量
+        2. 项目 build/dreamina/dreamina.exe
+        3. 打包环境 resources/backend-dist/dreamina/dreamina.exe
+        4. PATH 环境变量查找
+        5. 回退到用户 ~/bin/dreamina.exe
         """
         if self._dreamina_path:
             return self._dreamina_path
-            
-        # 打包环境：从 backend-server.exe 所在目录推算
+
+        candidates = []
+
+        env_path = os.environ.get("DREAMINA_PATH")
+        if env_path:
+            candidates.append(env_path)
+
+        # 开发环境: backend/services/video_service.py -> project root
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        candidates.append(os.path.join(project_root, "build", "dreamina", "dreamina.exe"))
+
+        # 打包环境：兼容 PyInstaller one-folder 与当前 Nuitka flat backend-dist 两种结构。
         if is_frozen():
             exe_dir = os.path.dirname(sys.executable)  # backend-dist/backend-server/
-            backend_dist_dir = os.path.dirname(exe_dir)  # backend-dist/
-            dreamina_path = os.path.join(backend_dist_dir, 'dreamina', 'dreamina.exe')
-            if os.path.exists(dreamina_path):
-                self._dreamina_path = dreamina_path
-                logger.info(f"[dreamina-cli] 打包环境检测到路径: {dreamina_path}")
-                return dreamina_path
-            logger.warning(f"[dreamina-cli] 打包环境但未找到dreamina: {dreamina_path}")
+            candidates.append(os.path.join(exe_dir, "dreamina", "dreamina.exe"))
+            candidates.append(os.path.join(os.path.dirname(exe_dir), "dreamina", "dreamina.exe"))
             
-        # PATH 环境变量查找
         path = shutil.which("dreamina")
-        if not path:
-            # 回退到当前用户目录下的 bin/dreamina.exe
-            user_home = os.path.expanduser("~")
-            path = os.path.join(user_home, "bin", "dreamina.exe")
-        self._dreamina_path = path
-        return path
+        if path:
+            candidates.append(path)
+
+        user_home = os.path.expanduser("~")
+        candidates.append(os.path.join(user_home, "bin", "dreamina.exe"))
+
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                self._dreamina_path = candidate
+                logger.info(f"[dreamina-cli] 检测到路径: {candidate}")
+                return candidate
+
+        fallback = candidates[-1]
+        self._dreamina_path = fallback
+        logger.warning("[dreamina-cli] 未找到 dreamina.exe,已检查: %s", "; ".join(candidates))
+        return fallback
+
+    def _dreamina_missing_error(self, cmd: str) -> dict:
+        expected = self._get_dreamina_path()
+        message = (
+            "即梦 CLI 执行器 dreamina.exe 未找到，无法使用「即梦CLI模式」。"
+            f"当前尝试路径: {expected}。"
+            "请将 dreamina.exe 放到项目 build/dreamina/dreamina.exe、"
+            "安装包 resources/backend-dist/dreamina/dreamina.exe，"
+            "或通过 DREAMINA_PATH 指定完整路径。"
+        )
+        return {
+            "success": False,
+            "code": "CLI_MISSING",
+            "error": message,
+            "message": message,
+            "cmd": cmd,
+        }
 
     @staticmethod
     def _extract_json_object(text: str):
@@ -206,6 +239,9 @@ class VideoService:
         cmd = self._get_dreamina_path()
         full_cmd = f"{cmd} {' '.join(args)}"
         logger.info(f"[dreamina-cli] 执行命令: {full_cmd}")
+        if not os.path.exists(cmd):
+            logger.error(f"[dreamina-cli] 执行器缺失: {cmd}")
+            return self._dreamina_missing_error(args[0] if args else "")
         try:
             process = await asyncio.create_subprocess_exec(
                 cmd, *args,
@@ -286,9 +322,70 @@ class VideoService:
         """检查登录状态并返回余额信息"""
         return await self._run_command("user_credit")
 
+    @staticmethod
+    def _extract_cli_error(text: str) -> str:
+        if not text:
+            return ""
+        import re as _re
+        matches = _re.findall(r"err=(.*?)(?:\s+logid\b|$)", text)
+        if matches:
+            return matches[-1].strip()
+        return text.strip()
+
+    @staticmethod
+    def _format_login_failure(return_code: int, detail: str = "") -> str:
+        clean_detail = VideoService._extract_cli_error(detail)
+        if "高级会员" in clean_detail or "Dreamina CLI" in clean_detail:
+            return (
+                "即梦CLI登录失败：当前即梦账号尚未开通可使用 Dreamina CLI 的高级会员权限。"
+                "请在即梦 Web 页面完成订阅/升级后，再回到万山点击“登录即梦”。"
+                f" 原始提示：{clean_detail}"
+            )
+        if "auth_token is empty" in clean_detail or "未检测到有效登录态" in clean_detail:
+            return "即梦CLI登录失败：网页登录成功不等于 CLI 授权成功，请重新点击“登录即梦”完成 CLI 授权。"
+        if clean_detail:
+            return f"即梦CLI登录失败：{clean_detail}"
+        return f"登录命令返回错误码: {return_code}(可能是用户主动关闭了登录窗口)"
+
+    @staticmethod
+    def _read_latest_cli_error() -> str:
+        log_root = os.path.join(os.path.expanduser("~"), ".dreamina_cli", "logs")
+        if not os.path.isdir(log_root):
+            return ""
+        latest = None
+        latest_mtime = -1
+        for root, _, files in os.walk(log_root):
+            for name in files:
+                if not name.lower().endswith(".log"):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                if mtime > latest_mtime:
+                    latest = path
+                    latest_mtime = mtime
+        if not latest:
+            return ""
+        try:
+            with open(latest, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[-80:]
+        except OSError:
+            return ""
+        text = "".join(lines)
+        login_lines = [
+            line for line in text.splitlines()
+            if ("command=dreamina login" in line or "waitForLogin" in line or "RunLogin" in line)
+            and (" err=" in line or "failure" in line)
+        ]
+        return "\n".join(login_lines[-6:]) if login_lines else text[-2000:]
+
     async def relogin(self) -> dict:
         """切换即梦账号:清旧凭证 + 启动新浏览器登录(等同于 logout + login)"""
         cmd = self._get_dreamina_path()
+        if not os.path.exists(cmd):
+            return self._dreamina_missing_error("relogin")
         try:
             process = await asyncio.create_subprocess_exec(
                 cmd, "relogin",
@@ -300,7 +397,8 @@ class VideoService:
             if return_code == 0:
                 return {"success": True, "message": "切换账号成功"}
             else:
-                return {"success": False, "message": f"切换账号命令返回错误码: {return_code}"}
+                detail = self._read_latest_cli_error()
+                return {"success": False, "message": self._format_login_failure(return_code, detail)}
         except asyncio.TimeoutError:
             return {"success": False, "message": "切换账号超时（5分钟）"}
         except Exception as e:
@@ -314,6 +412,8 @@ class VideoService:
         用户能看到 device code 提示 + 完成浏览器授权,关窗口或登录完成进程退出。
         """
         cmd = self._get_dreamina_path()
+        if not os.path.exists(cmd):
+            return self._dreamina_missing_error("login")
         try:
             # Windows 弹独立 cmd 窗口(CREATE_NEW_CONSOLE = 0x00000010)
             # 这样 dreamina 的交互式输出能显示给用户,stdin 也能输入
@@ -334,7 +434,8 @@ class VideoService:
             if return_code == 0:
                 return {"success": True, "message": "登录成功"}
             else:
-                return {"success": False, "message": f"登录命令返回错误码: {return_code}(可能是用户主动关闭了登录窗口)"}
+                detail = self._read_latest_cli_error()
+                return {"success": False, "message": self._format_login_failure(return_code, detail)}
         except asyncio.TimeoutError:
             return {"success": False, "message": "登录超时(5 分钟),请重试"}
         except Exception as e:

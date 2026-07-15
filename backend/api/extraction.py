@@ -5,7 +5,7 @@ import json
 import base64
 import logging
 import secrets  # v3.61.202:原子写 tmp 文件名加随机 token,防并发抢同一 tmp
-from typing import Optional, List
+from typing import Any, Literal, Optional, List
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel
 
@@ -55,6 +55,214 @@ async def _ensure_variant_visible(variant_id: int) -> dict:
         raise HTTPException(status_code=404, detail="马甲不存在")
     await _ensure_element_visible(variant.get("element_id"))
     return variant
+
+
+_extraction_batch_jobs: dict[str, dict[str, Any]] = {}
+_extraction_batch_tasks: dict[str, asyncio.Task] = {}
+
+
+class ExtractionBatchStartRequest(BaseModel):
+    novel_id: int
+    action: Literal["panorama", "grid"]
+    element_type: Literal["scene", "prop"]
+    element_ids: List[int]
+    config_id: int
+    template_id: Optional[int] = None
+    llm_config_id: Optional[int] = None
+
+
+def _public_batch_job(job: dict[str, Any]) -> dict[str, Any]:
+    element_ids = list(job.get("element_ids") or [])
+    success_ids = list(job.get("success_ids") or [])
+    failed_ids = list(job.get("failed_ids") or [])
+    processed_ids = set(success_ids) | set(failed_ids)
+    current_id = job.get("current_element_id")
+    remaining_ids = [
+        item_id for item_id in element_ids
+        if item_id not in processed_ids and item_id != current_id
+    ]
+    return {
+        "job_id": job.get("job_id"),
+        "novel_id": job.get("novel_id"),
+        "action": job.get("action"),
+        "element_type": job.get("element_type"),
+        "status": job.get("status"),
+        "total": len(element_ids),
+        "current": len(processed_ids),
+        "current_element_id": current_id,
+        "current_name": job.get("current_name") or "",
+        "success": len(success_ids),
+        "failed": len(failed_ids),
+        "element_ids": element_ids,
+        "success_ids": success_ids,
+        "failed_ids": failed_ids,
+        "remaining_ids": remaining_ids,
+        "failures": list(job.get("failures") or []),
+        "stop_requested": bool(job.get("stop_requested")),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+    }
+
+
+def _active_batch_for_novel(novel_id: int) -> Optional[dict[str, Any]]:
+    candidates = [
+        job for job in _extraction_batch_jobs.values()
+        if int(job.get("novel_id") or 0) == int(novel_id)
+        and job.get("status") in ("running", "stopping")
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda job: float(job.get("started_ts") or 0))
+
+
+async def _run_extraction_batch(job_id: str) -> None:
+    job = _extraction_batch_jobs[job_id]
+    try:
+        for element_id in list(job["element_ids"]):
+            if job.get("stop_requested"):
+                break
+
+            element = await ExtractionService.get_element(element_id)
+            job["current_element_id"] = element_id
+            job["current_name"] = (element or {}).get("name") or f"元素 {element_id}"
+            try:
+                if not element or int(element.get("novel_id") or 0) != int(job["novel_id"]):
+                    raise HTTPException(status_code=404, detail="元素不存在或不属于当前小说")
+
+                if job["action"] == "panorama":
+                    if element.get("element_type") != "scene":
+                        raise HTTPException(status_code=400, detail="批量全景只支持场景元素")
+                    panorama_result = await generate_panorama_endpoint(
+                        element_id,
+                        GeneratePanoramaRequest(config_id=job["config_id"]),
+                    )
+                    if not panorama_result.get("success"):
+                        raise HTTPException(status_code=500, detail=panorama_result.get("message") or "全景图生成失败")
+                    grid_result = await panorama_to_grid_endpoint(
+                        element_id,
+                        PanoramaToGridRequest(view_count=9),
+                    )
+                    if not grid_result.get("success"):
+                        raise HTTPException(status_code=500, detail=grid_result.get("message") or "拆 9 视图失败")
+                else:
+                    grid_result = await generate_grid_image(
+                        element_id,
+                        GenerateGridImageRequest(
+                            config_id=job["config_id"],
+                            template_id=job["template_id"],
+                            llm_config_id=job["llm_config_id"],
+                        ),
+                    )
+                    if not grid_result.get("success"):
+                        raise HTTPException(status_code=500, detail=grid_result.get("message") or "宫格图生成失败")
+
+                job["success_ids"].append(element_id)
+            except HTTPException as exc:
+                job["failed_ids"].append(element_id)
+                job["failures"].append(f"{job['current_name']}: {exc.detail}")
+            except Exception as exc:
+                logger.exception("[extraction-batch] item failed job=%s element=%s", job_id, element_id)
+                job["failed_ids"].append(element_id)
+                job["failures"].append(f"{job['current_name']}: {exc}")
+            finally:
+                job["current_element_id"] = None
+                job["current_name"] = ""
+
+        job["status"] = "stopped" if job.get("stop_requested") else "completed"
+    except asyncio.CancelledError:
+        job["status"] = "stopped"
+        job["stop_requested"] = True
+        raise
+    except Exception as exc:
+        logger.exception("[extraction-batch] runner failed job=%s", job_id)
+        job["status"] = "failed"
+        job["failures"].append(f"批次异常: {exc}")
+    finally:
+        job["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        job["current_element_id"] = None
+        job["current_name"] = ""
+        _extraction_batch_tasks.pop(job_id, None)
+
+
+@router.post("/batch/start")
+async def start_extraction_batch(request: ExtractionBatchStartRequest):
+    await _ensure_novel_visible(request.novel_id)
+    active = _active_batch_for_novel(request.novel_id)
+    if active:
+        raise HTTPException(status_code=409, detail="该小说已有批量任务在运行，请先等待或停止后续")
+
+    element_ids = list(dict.fromkeys(int(item_id) for item_id in request.element_ids if int(item_id) > 0))
+    if not element_ids:
+        raise HTTPException(status_code=400, detail="没有可执行的卡片")
+    if request.action == "grid" and (not request.template_id or not request.llm_config_id):
+        raise HTTPException(status_code=400, detail="批量宫格必须选择提示词模板和视觉大语言模型")
+    if request.action == "panorama" and request.element_type != "scene":
+        raise HTTPException(status_code=400, detail="批量全景只支持场景卡片")
+
+    for element_id in element_ids:
+        element = await ExtractionService.get_element(element_id)
+        if not element or int(element.get("novel_id") or 0) != int(request.novel_id):
+            raise HTTPException(status_code=404, detail=f"元素 {element_id} 不存在或不属于当前小说")
+        if request.action == "panorama" and element.get("element_type") != "scene":
+            raise HTTPException(status_code=400, detail="批量全景只支持场景卡片")
+        if request.action == "grid" and element.get("element_type") != request.element_type:
+            raise HTTPException(status_code=400, detail="批量宫格卡片类型不一致")
+        if request.action == "grid" and not (element.get("finished_image") or element.get("image_url")):
+            raise HTTPException(status_code=400, detail=f"{element.get('name') or element_id} 没有成品图或生成图")
+
+    job_id = secrets.token_hex(12)
+    job: dict[str, Any] = {
+        "job_id": job_id,
+        "novel_id": request.novel_id,
+        "action": request.action,
+        "element_type": request.element_type,
+        "element_ids": element_ids,
+        "config_id": request.config_id,
+        "template_id": request.template_id,
+        "llm_config_id": request.llm_config_id,
+        "status": "running",
+        "stop_requested": False,
+        "current_element_id": None,
+        "current_name": "",
+        "success_ids": [],
+        "failed_ids": [],
+        "failures": [],
+        "started_ts": time.time(),
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "finished_at": None,
+    }
+    _extraction_batch_jobs[job_id] = job
+    task = asyncio.create_task(_run_extraction_batch(job_id))
+    _extraction_batch_tasks[job_id] = task
+    return {"success": True, "job": _public_batch_job(job)}
+
+
+@router.get("/batch/active")
+async def get_active_extraction_batch(novel_id: int = Query(...)):
+    await _ensure_novel_visible(novel_id)
+    job = _active_batch_for_novel(novel_id)
+    return {"job": _public_batch_job(job) if job else None}
+
+
+@router.get("/batch/{job_id}")
+async def get_extraction_batch(job_id: str):
+    job = _extraction_batch_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="批量任务不存在或后端已重启")
+    await _ensure_novel_visible(int(job["novel_id"]))
+    return {"job": _public_batch_job(job)}
+
+
+@router.post("/batch/{job_id}/stop")
+async def stop_extraction_batch(job_id: str):
+    job = _extraction_batch_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="批量任务不存在或后端已重启")
+    await _ensure_novel_visible(int(job["novel_id"]))
+    if job.get("status") in ("running", "stopping"):
+        job["stop_requested"] = True
+        job["status"] = "stopping"
+    return {"success": True, "job": _public_batch_job(job)}
 
 
 def _is_recent_image_generation(element: dict, max_age_seconds: int = 45 * 60) -> bool:

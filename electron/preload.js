@@ -3,6 +3,9 @@ const { contextBridge, ipcRenderer } = require("electron");
 const electronAPI = {
   getBackendUrl: () => ipcRenderer.invoke("get-backend-url"),
   getSessionSecret: () => ipcRenderer.invoke("get-session-secret"),
+  localModelConfig: {
+    request: (request) => ipcRenderer.invoke("local-api:llm-configs", request)
+  },
   getAppVersion: () => ipcRenderer.invoke("get-app-version"),
   getVersionHistory: (limit) => ipcRenderer.invoke("get-version-history", limit),
   openExternal: (url) => ipcRenderer.invoke("open-external", url),
@@ -28,6 +31,15 @@ const electronAPI = {
     verify: () => ipcRenderer.invoke("license:verify"),
     getLastFailReason: () => ipcRenderer.invoke("license:get-last-fail-reason"),
     logout: () => ipcRenderer.invoke("license:logout")
+  },
+  account: {
+    sendCode: (phone) => ipcRenderer.invoke("account:send-code", phone),
+    login: (phone, code) => ipcRenderer.invoke("account:login", phone, code),
+    me: () => ipcRenderer.invoke("account:me"),
+    logout: () => ipcRenderer.invoke("account:logout"),
+    createPayment: (planId) => ipcRenderer.invoke("account:create-payment", planId),
+    paymentStatus: (orderNo) => ipcRenderer.invoke("account:payment-status", orderNo),
+    rechargeUrl: () => ipcRenderer.invoke("account:recharge-url")
   },
   onLicenseInvalid: () => {},
   update: {

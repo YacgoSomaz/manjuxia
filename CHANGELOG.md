@@ -1,5 +1,87 @@
 # Changelog
 
+## Unreleased - 2026-07-15
+
+### 账号与产品边界
+
+- 漫剧虾客户端统一使用 `comic_shrimp` 产品 ID 和 `comic_course` 权益；不能因为购买其他产品而解锁漫剧虾。
+- 登录态使用手机号验证码和 `anyq.site` 账号接口，客户端只信任服务端签名的 `account_license`，不使用未签名根节点字段作为授权依据。
+- 保留登录后的工作台可见性；没有会员时，点击具体会员功能再提示权益不足，不在启动阶段连续弹出模型/模板错误。
+
+### 小说导入与本地安全通道
+
+- 小说创建、文件上传、章节解析和增量导入不再要求商业会员，作为基础本地工作流开放。
+- 以上接口仍经过 Electron 与本地后端之间的 HMAC 签名通道，不是关闭全部安全校验。
+- 修复 Electron `FormData` 在签名 fetch 层被错误计算为空请求体的问题；新增 `frontend/multipart-fetch-bridge.js` 和 `frontend/multipart-fetch-finalizer.js`，真实上传会先物化 multipart 字节再签名发送。
+- 增加商业守卫回归测试，确保小说导入放行而脚本转换、标签保存、生成、导出等付费动作仍受保护。
+
+### 启动器、安装与更新
+
+- 启动页会在本地后端握手完成前保持显示，避免用户看到空白工作台；发布前测试已同步这一实际启动时序。
+- 保留单实例启动和二次启动聚焦已有窗口的行为。
+- 更新器只消费签名的 `update-v1` 产品发布载荷，校验产品、版本、HTTPS 下载地址、文件大小和 SHA-256，不读取 OSS 文件列表判断版本。
+- 一键发布脚本继续在构建前执行项目检查、后端提示词检查和发布安全测试；本轮只修复测试契约，未重新构建正式安装包。
+
+### 文档与交接
+
+- 新增 `docs/PROJECT_HANDOFF.md`，记录当前账号协议、运行方式、发布边界、测试结果和下一步。
+- 新增 `docs/PROJECT_FILE_MAP.md`，记录目录职责、核心文件和常见 BUG 定位路径。
+- README 更新为账号登录版、`comic_shrimp` 产品协议和当前发布流程。
+- 本地 Nuitka 崩溃诊断文件加入 Git 忽略规则，避免误提交构建机诊断产物。
+
+## 0.1.10-dev - 2026-07-13
+
+### 品牌与白色主题
+
+- 客户端展示名从“万山漫剧”调整为“漫剧虾”，商业产品码仍保持 `wanshan_media`，用于兼容现有授权后台。
+- Electron 主进程使用新展示名，但本地数据目录继续沿用 `%APPDATA%\万山\data`，避免改名后丢失已有小说、模型配置和授权缓存。
+- 新增 `frontend/manjuxia-brand.js` 和 `frontend/manjuxia-light.css`，在编译后前端上覆盖品牌文案、页面标题和 Codex 风格白色简约主题。
+- 更新后续商业构建命名，安装目录、桌面快捷方式、exe 和安装包输出将使用“漫剧虾”。
+
+### 对齐千山 3.61.381/3.61.382
+
+- 确认千山安装目录为 `D:\qianshan\xiaoyangmengjuchang`，当前安装版本为 `3.61.381`，更新源为阿里云 `xiaoshuotool/app/3.61.381/`。
+- 查阅千山更新日志，确认近期新增重点包括小说标签、批量场景全景/宫格图、TopView 刷新、视频素材保序和脚本编辑修复。
+- 新增源码审计文档：`docs/QIANSHAN_361381_SOURCE_AUDIT.md`，记录已补、未补、移植风险和建议顺序。
+
+### 小说标签
+
+- 新增 `tag_definitions` 和 `novel_tags` 数据表，启动时可自动迁移旧库。
+- 新增 `backend/services/tag_service.py`，同步千山标签体系，包含屏幕模式、视觉方向、受众、题材和分镜主题标签。
+- 新增小说标签接口：标签定义、文本分析、读取标签、保存标签、按现有小说重新分析标签。
+- 小说列表和小说详情返回 `novel_tags`，模板上下文返回 `novel_tag_genres` 和 `screen_mode`，供后续推荐链路使用。
+- 新增 `frontend/wanshan-novel-tags.js`，在小说页提供轻量“小说标签管理”入口，支持手动设置、AI 分析和保存。
+- 为保持本地优先，导入/创建小说后的自动打标只使用本地关键词规则；只有用户主动点击“AI分析题材”才会调用已配置的大模型。
+
+### 信息提取批量任务
+
+- 新增 `/api/extraction/batch/start`、`/api/extraction/batch/active`、`/api/extraction/batch/{job_id}`、`/api/extraction/batch/{job_id}/stop`。
+- 批量全景任务复用现有单场景全景生成接口，并自动拆 9 视图宫格。
+- 批量宫格任务复用现有素材宫格图生成接口，支持场景和道具卡片。
+- 批量任务在后端进程内维护状态，刷新页面后可继续查询；停止操作会阻止派发后续卡片。
+- 新增 `frontend/wanshan-extraction-batch.js`，在信息提取页提供“批量生图”入口：可选择小说、任务类型、场景/道具、图片模型、宫格模板和视觉大语言模型，支持只处理缺失项、全选可执行项、进度轮询和停止后续。
+
+### 视频队列与素材链路
+
+- 移植千山视频素材超过 9 个时的自动保序策略，优先保留主要人物、主场景、道具、用户关键帧、尾帧和 TopView 调度图。
+- 修复 TopView 调度图进入视频参考图时的标签格式，避免被追加普通“参考图”后缀。
+- 全局视频队列新增同一分镜活跃态硬幂等：启动时折叠历史重复 `queued/generating` 项，并创建 `idx_queue_active_storyboard_unique` 部分唯一索引。
+- 入队接口改为事务内检查/复用活跃队列项，降低重复点击或并发请求造成同一分镜重复派单的风险。
+
+### TopView / 兼容字段
+
+- `storyboards` 新增 `topview_image`、`topview_prompt`、`topview_start_prompt`、`topview_end_prompt`、`topview_dispatch_text`、`start_frame_image`、`end_frame_image`。
+- `scripts` 新增 `sync_outdated`，为后续团队/远端同步后的“剧本已过期”提示预留。
+- `extracted_elements` 新增 `voice_id`，为后续人物音色/TTS 绑定预留。
+- 分镜生成和重新生成接口新增 `avoid_same_shot_size`，并把上一末镜景别/机位/运镜信息传给服务端拼装 payload，便于远端规则做跨小节景别避重。
+
+### 验证
+
+- 已通过 Python 编译检查：`backend/api/extraction.py`、`backend/api/novels.py`、`backend/services/tag_service.py` 等。
+- 已通过 `node --check frontend/wanshan-novel-tags.js` 和 `node --check frontend/wanshan-extraction-batch.js`。
+- 已用临时 `WANSHAN_DATA_DIR` 初始化数据库并烟测标签种子与样本文本分析。
+- 已新增并通过后端针对性测试：视频素材保序、队列活跃态幂等、千山兼容 schema、分镜景别连续性 payload。
+
 ## 0.1.9 - 2026-07-12
 
 ### 产品与模板
@@ -42,7 +124,7 @@
 ### 构建与验证
 
 - 商业构建入口：`packaging/build/build_release.ps1`。
-- 当前安装包：`packaging/release/installer/万山Setup_0.1.9.exe`，不提交到普通 Git。
+- 当前安装包：`packaging/release/installer/万山Setup_0.1.9.exe`，这是改名前的历史产物，不提交到普通 Git。
 - 当前安装包大小约 `212.65 MB`。
 - 当前安装包 SHA-256：`82b859b3233ba686cf846386bf7d3aba6a7073cce2768f607ef1e1b9ef2ffe40`。
 - 已验证 `npm run check`、`npm run test:security`、Python 编译检查、发布扫描、远端卡密创建和远端激活。

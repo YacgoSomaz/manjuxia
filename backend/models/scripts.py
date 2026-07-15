@@ -39,6 +39,7 @@ class ScriptListItem(BaseModel):
     content: str
     created_at: datetime
     chapter_title: Optional[str] = None
+    sync_outdated: int = 0
 
 
 class ScriptListResponse(BaseModel):

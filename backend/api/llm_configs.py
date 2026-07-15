@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional
 from models.llm_configs import LLMConfigCreate, LLMConfigUpdate, LLMConfigResponse
 from services.llm_service import LLMService
 from services.model_presets import get_model_presets, get_all_presets, get_provider_presets
+from services.trusted_providers import require_trusted_model_url
 from utils.local_signature import require_local_signature
 import httpx
 
@@ -18,7 +19,7 @@ router = APIRouter(
 
 @router.get("/", response_model=List[LLMConfigResponse])
 async def get_llm_configs(
-    config_type: Optional[str] = Query(None, description="配置类型筛选: llm/image/video"),
+    config_type: Optional[str] = Query(None, description="配置类型筛选: llm/image/video/audio"),
     force: bool = Query(False, description="是否强制绕过 30s 缓存,前端刷新按钮请传 true"),
 ):
     """获取所有大模型配置,支持按类型筛选。
@@ -49,7 +50,7 @@ async def create_llm_config(config: LLMConfigCreate):
 # ==================== 静态路径端点(必须在 /{config_id} 之前) ====================
 
 @router.get("/presets", response_model=Dict[str, Any])
-async def get_model_presets_endpoint(config_type: Optional[str] = Query(None, description="配置类型: llm/image/video")):
+async def get_model_presets_endpoint(config_type: Optional[str] = Query(None, description="配置类型: llm/image/video/audio")):
     """[旧接口] 获取按模型 ID 索引的预置(供现有 UI 使用,逐步废弃)"""
     if config_type:
         presets = get_model_presets(config_type)
@@ -77,7 +78,10 @@ class ProbeModelsRequest(BaseModel):
 @router.post("/probe-models")
 async def probe_models(req: ProbeModelsRequest):
     """探测中转站/OpenAI 兼容服务的可用模型列表(GET {base_url}/models)"""
-    base_url = (req.base_url or "").rstrip("/")
+    try:
+        base_url = require_trusted_model_url(req.base_url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     path = req.probe_path or "/models"
     if not path.startswith("/"):
         path = "/" + path

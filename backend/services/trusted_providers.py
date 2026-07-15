@@ -1,4 +1,10 @@
-"""Trusted outbound model provider policy for WanShan."""
+"""Outbound model endpoint policy for WanShan.
+
+The app ships with trusted first-party presets, but users also need to connect
+OpenAI-compatible relay providers. Relay URLs are allowed only when they are
+basic HTTPS public endpoints, so users can work while we still block obvious
+credential leaks and local-network probes.
+"""
 
 import ipaddress
 from urllib.parse import urlparse
@@ -8,6 +14,8 @@ TRUSTED_MODEL_HOSTS = {
     "api.deepseek.com",
     "api.openai.com",
     "ark.cn-beijing.volces.com",
+    "dashscope.aliyuncs.com",
+    "api.siliconflow.cn",
     "api.lingyaai.cn",
     "api.wuyinkeji.com",
     "api.bltcy.cn",
@@ -26,8 +34,24 @@ def _is_loopback(hostname: str) -> bool:
         return False
 
 
+def _is_blocked_ip_literal(hostname: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return any(
+        (
+            ip.is_private,
+            ip.is_link_local,
+            ip.is_multicast,
+            ip.is_reserved,
+            ip.is_unspecified,
+        )
+    )
+
+
 def require_trusted_model_url(value: str) -> str:
-    """Validate an LLM endpoint before any request leaves the application."""
+    """Validate a model endpoint before any request leaves the application."""
     raw = (value or "").strip().rstrip("/")
     parsed = urlparse(raw)
     hostname = (parsed.hostname or "").lower()
@@ -41,7 +65,11 @@ def require_trusted_model_url(value: str) -> str:
             raise ValueError("本机模型地址必须使用 HTTP 或 HTTPS")
         return raw
     if parsed.scheme != "https":
-        raise ValueError("受信任服务商必须使用 HTTPS")
-    if hostname not in TRUSTED_MODEL_HOSTS:
-        raise ValueError("模型地址不在受信任服务商白名单中")
+        raise ValueError("模型地址必须使用 HTTPS")
+    if _is_blocked_ip_literal(hostname):
+        raise ValueError("模型地址不能指向内网或保留地址")
+
+    # Built-in providers still pass by exact host, while custom relay providers
+    # pass as public HTTPS domains. This keeps relay support usable without
+    # allowing plaintext, embedded credentials, fragments, or private IPs.
     return raw

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import json
 
 from database.db import get_db
 from utils.paths import get_data_dir
@@ -8,6 +9,15 @@ from utils.timezone import now_beijing_str
 
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_template_payload(payload):
+    """Accept both the exported {"templates": [...]} form and a raw list."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict) and isinstance(payload.get("templates"), list):
+        return payload["templates"]
+    return None
 
 MANDATORY_LOCAL_TEMPLATES = [
     {
@@ -129,10 +139,14 @@ MANDATORY_LOCAL_TEMPLATES = [
 
 def _embedded_templates():
     try:
-        from services.wanshan_prompt_seed_embedded import TEMPLATES
+        from services.wanshan_prompt_seed_embedded import load_templates
     except Exception:
         return None
-    return TEMPLATES if isinstance(TEMPLATES, list) else None
+    try:
+        return _normalize_template_payload(load_templates())
+    except Exception as exc:
+        logger.warning("[wanshan_prompt_seed] embedded seed unavailable: %s", exc)
+        return None
 
 
 def _seed_file_path() -> str:
@@ -154,7 +168,9 @@ async def seed_prompt_templates() -> int:
             templates = []
         else:
             with open(path, "r", encoding="utf-8") as f:
-                templates = json.load(f)
+                templates = _normalize_template_payload(json.load(f)) or []
+
+    templates = list(templates)
 
     categories_with_content = {
         (tpl.get("category") or "uncategorized").strip()

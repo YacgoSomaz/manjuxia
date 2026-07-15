@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, shell, safeStorage } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, shell, safeStorage, Menu } = require("electron");
 const childProcess = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -8,44 +8,101 @@ const path = require("node:path");
 const { isTrustedExternalUrl, isTrustedJimengUrl } = require("./trusted-origins");
 const { verifyPackagedRelease } = require("./release-guard");
 const { LicenseClient } = require("./license-client");
+const { AccountClient } = require("./account-client");
 const { UpdateClient } = require("./update-client");
+const { readReleaseConfig } = require("./release-config");
+const { removeApplicationMenu } = require("./shell-hardening");
+const { normalizeLlmConfigRequest } = require("./local-api-bridge");
 
-const APP_NAME = "万山";
+const APP_NAME = "漫剧虾";
+const DATA_APP_NAME = "万山";
+const PRODUCT_ID = "comic_shrimp";
+const isBackendSmoke = process.argv.includes("--backend-smoke");
+const isPrimaryInstance = isBackendSmoke ? true : app.requestSingleInstanceLock();
+
+if (!isPrimaryInstance) {
+  app.exit(0);
+}
 
 let mainWindow = null;
+let splashWindow = null;
 let jimengWindow = null;
 let qianshanConfigWindow = null;
 let backendProcess = null;
 let backendUrl = "http://127.0.0.1:8000";
 let backendLaunchStartedAt = 0;
+let backendReadyPromise = null;
+const runtimeId = `${process.pid}-${Date.now()}`;
 let licenseClient = null;
 let commercialBuild = false;
 let releaseConfig = null;
 let updateClient = null;
+let authMode = "license";
 let licenseRefreshTimer = null;
 let licenseRefreshInFlight = false;
 const BACKEND_PORT_CANDIDATES = [8000, 18472, 28800, 38765, 48899];
 const LICENSE_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 
+function focusMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+if (isPrimaryInstance) {
+  app.on("second-instance", () => {
+    focusMainWindow();
+  });
+}
+
 function rootDir() {
   return app.isPackaged ? process.resourcesPath : path.resolve(__dirname, "..");
+}
+
+function appIconPath() {
+  return path.join(rootDir(), "frontend", "assets", "manjuxia-app-icon.ico");
+}
+
+function createSplashWindow() {
+  splashWindow = new BrowserWindow({
+    width: 520,
+    height: 320,
+    minWidth: 520,
+    minHeight: 320,
+    maxWidth: 520,
+    maxHeight: 320,
+    title: APP_NAME,
+    icon: appIconPath(),
+    show: true,
+    frame: false,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    backgroundColor: "#081126",
+    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true }
+  });
+  const markup = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><style>
+    *{box-sizing:border-box}body{margin:0;background:#081126;color:#e7f1ff;font-family:"Microsoft YaHei",sans-serif}
+    main{height:320px;padding:42px;display:flex;flex-direction:column;justify-content:center;background:radial-gradient(circle at 78% 18%,#123c672e,transparent 36%)}
+    .brand{display:flex;align-items:center;gap:14px;font-size:25px;font-weight:700;color:#ffffff}.mark{width:42px;height:42px;border-radius:14px;background:#17c9d6;display:grid;place-items:center;color:#071122;font-size:22px}
+    .copy{margin:22px 0 12px;color:#b8c9e3;font-size:14px}.line{height:4px;border-radius:3px;background:#1b2a47;overflow:hidden}.line span{display:block;width:42%;height:100%;border-radius:inherit;background:#20d5de;animation:loading 1.35s ease-in-out infinite}
+    .step{margin-top:18px;color:#78dce6;font-size:13px}@keyframes loading{0%{transform:translateX(-110%)}55%{transform:translateX(180%)}100%{transform:translateX(260%)}}
+  </style></head><body><main><div class="brand"><div class="mark">✦</div><span>漫剧虾</span></div><div class="copy">正在准备你的 AI 漫剧创作工作台</div><div class="line"><span></span></div><div class="step" id="step">正在检查应用文件…</div></main><script>const steps=["正在检查应用文件…","正在启动本地创作引擎…","正在载入工作台…"];let i=0;setInterval(()=>{i=(i+1)%steps.length;document.getElementById("step").textContent=steps[i]},1200)</script></body></html>`;
+  splashWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(markup)}`);
+  splashWindow.on("closed", () => { splashWindow = null; });
+}
+
+function closeSplashWindow() {
+  if (splashWindow && !splashWindow.isDestroyed()) splashWindow.destroy();
+  splashWindow = null;
 }
 
 function dataDir() {
   const override = process.env.WANSHAN_DATA_DIR;
   if (override) return path.resolve(override);
   const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
-  return path.join(appData, APP_NAME, "data");
-}
-
-function readReleaseConfig() {
-  const configPath = process.env.WANSHAN_RELEASE_CONFIG || path.join(rootDir(), "release_config.json");
-  try {
-    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-    return { ...config, commercial: Boolean(config.commercial) };
-  } catch (_) {
-    return { commercial: process.env.WANSHAN_COMMERCIAL === "1" };
-  }
+  return path.join(appData, DATA_APP_NAME, "data");
 }
 
 function getMachineId() {
@@ -54,13 +111,26 @@ function getMachineId() {
 }
 
 function initializeLicenseClient() {
-  const config = readReleaseConfig();
+  const config = readReleaseConfig({ rootDir: rootDir(), isPackaged: app.isPackaged, env: process.env });
   releaseConfig = config;
   commercialBuild = Boolean(config.commercial);
+  authMode = String(config.auth_mode || process.env.WANSHAN_AUTH_MODE || (commercialBuild ? "account" : "license")).toLowerCase();
+  if (authMode === "account") {
+    licenseClient = new AccountClient({
+      baseUrl: config.account_api_url || process.env.WANSHAN_ACCOUNT_API_URL || "https://anyq.site",
+      publicKey: config.account_public_key || process.env.WANSHAN_ACCOUNT_PUBLIC_KEY || "",
+      productCode: PRODUCT_ID,
+      deviceHash: getMachineId(),
+      appVersion: app.getVersion(),
+      dataPath: path.join(dataDir(), "account.dat"),
+      safeStorage
+    });
+    return;
+  }
   licenseClient = new LicenseClient({
     baseUrl: config.license_server_url || process.env.WANSHAN_LICENSE_SERVER_URL || "",
     publicKey: config.license_public_key || process.env.WANSHAN_LICENSE_PUBLIC_KEY || "",
-    productCode: config.product_code || process.env.WANSHAN_PRODUCT_CODE || "wanshan_media",
+    productCode: PRODUCT_ID,
     deviceHash: getMachineId(),
     appVersion: app.getVersion(),
     dataPath: path.join(dataDir(), "license.dat"),
@@ -71,12 +141,19 @@ function initializeLicenseClient() {
 async function syncLicenseContext() {
   if (!commercialBuild || !licenseClient) return;
   const info = licenseClient.getInfo();
-  if (!info || !backendUrl) return;
+  if (!info || !info.active || !backendUrl) return;
   try {
-    await fetch(`${backendUrl}/api/license/context/set`, {
+    await requestBackend("/api/license/context/set", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ license_key: info.license_key, machine_id: getMachineId(), source: "wanshan" })
+      body: {
+        license_key: info.license_key,
+        machine_id: getMachineId(),
+        source: "account",
+        product_id: info.product_id,
+        entitlement: "comic_course",
+        expires_at: info.expires_at,
+        signed_until: info.signed_until
+      }
     });
   } catch (_) {
     // The local app remains usable if its local backend is still starting.
@@ -89,7 +166,7 @@ async function syncLicenseContext() {
 
 async function clearLicenseContext() {
   try {
-    await fetch(`${backendUrl}/api/license/context/clear`, { method: "POST" });
+    await requestBackend("/api/license/context/clear", { method: "POST", body: {} });
   } catch (_) {
     // The next backend start begins with an empty in-memory context.
   }
@@ -101,6 +178,9 @@ function activationHash(reason) {
 }
 
 function shouldLogoutForLicenseFailure(reason) {
+  if (authMode === "account") {
+    return !["network", "expired", "unauthorized_tool"].includes(String(reason || ""));
+  }
   return String(reason || "") !== "network";
 }
 
@@ -131,6 +211,10 @@ async function enforceLicenseState(source = "timer") {
     const result = await licenseClient.verify();
     if (result && result.ok) {
       await syncLicenseContext();
+      return true;
+    }
+    if (authMode === "account" && result && result.authenticated) {
+      await clearLicenseContext();
       return true;
     }
     const reason = (result && result.reason) || licenseClient.lastFailReason || "unknown";
@@ -167,32 +251,123 @@ function stopLicenseRefreshTimer() {
   licenseRefreshTimer = null;
 }
 
+async function requirePaidDesktopAction() {
+  if (!commercialBuild || authMode !== "account" || !licenseClient) return { allowed: true };
+  const result = typeof licenseClient.verifyCached === "function" ? licenseClient.verifyCached() : await licenseClient.verify();
+  if (result && result.ok) {
+    await syncLicenseContext();
+    return { allowed: true };
+  }
+  if (result && result.authenticated) {
+    await clearLicenseContext();
+    const choice = await dialog.showMessageBox(mainWindow || undefined, {
+      type: "info",
+      title: "需要漫剧虾会员",
+      message: "此功能需要漫剧虾会员",
+      detail: "当前账号可以浏览工作台。开通或续费后即可使用生成、编辑、导出和即梦相关功能。",
+      buttons: ["取消", "去官网开通"],
+      defaultId: 1,
+      cancelId: 0,
+      noLink: true
+    });
+    if (choice.response === 1) {
+      const handoff = await licenseClient.createWebHandoff();
+      await shell.openExternal(handoff.continueUrl || "https://anyq.site/");
+    }
+    return { allowed: false, message: "此功能需要漫剧虾会员，请先到官网开通或续费" };
+  }
+  await enforceLicenseState("paid-ipc");
+  return { allowed: false, message: "请先完成手机号登录" };
+}
+
+async function checkForUpdatesOnStartup() {
+  if (!updateClient) return;
+  try {
+    const result = await updateClient.check();
+    if (!result.updateAvailable) return;
+
+    if (!result.mandatory) {
+      const choice = await dialog.showMessageBox(mainWindow || undefined, {
+        type: "info",
+        title: `${APP_NAME}有新版本`,
+        message: `发现新版本 ${result.version}`,
+        detail: result.notes || "安装更新可获得最新功能与修复。",
+        buttons: ["稍后", "立即安装"],
+        defaultId: 1,
+        cancelId: 0,
+        noLink: true
+      });
+      if (choice.response !== 1) return;
+      const downloaded = await updateClient.downloadAndInstall();
+      if (!downloaded.success) {
+        await dialog.showMessageBox(mainWindow || undefined, {
+          type: "error",
+          title: "更新失败",
+          message: downloaded.error || "安装包下载失败，请稍后重试。",
+          buttons: ["知道了"],
+          noLink: true
+        });
+      }
+      return;
+    }
+
+    const choice = await dialog.showMessageBox(mainWindow || undefined, {
+      type: "info",
+      title: `${APP_NAME}需要更新`,
+      message: `检测到必须安装的新版本 ${result.version}`,
+      detail: result.notes || "请完成更新后继续使用。",
+      buttons: ["立即更新", "退出"],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true
+    });
+    if (choice.response !== 0) {
+      app.quit();
+      return;
+    }
+
+    const downloaded = await updateClient.downloadAndInstall();
+    if (!downloaded.success) {
+      await dialog.showMessageBox(mainWindow || undefined, {
+        type: "error",
+        title: "更新失败",
+        message: downloaded.error || "安装包下载失败，无法继续使用当前版本。",
+        buttons: ["退出"],
+        noLink: true
+      });
+      app.quit();
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    updateClient.emit("update-error", { error: message });
+  }
+}
+
 async function pushCloudTokenToBackend(token) {
   if (!token || !token.accessToken || !backendUrl) return { success: false, message: "远端登录态为空" };
   try {
-    const response = await fetch(`${backendUrl}/api/license/context/set-cloud-token`, {
+    const response = await requestBackend("/api/license/context/set-cloud-token", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+      body: {
         accessToken: token.accessToken,
         refreshToken: token.refreshToken || "",
         expiresIn: Number(token.expiresIn || 7200),
         userId: token.userId || null,
         team: token.team || null
-      })
+      }
     });
-    return await response.json().catch(() => ({ success: response.ok }));
+    return response;
   } catch (error) {
     return { success: false, message: error instanceof Error ? error.message : "同步远端登录态失败" };
   }
 }
 
 function backendPortFile() {
-  return path.join(dataDir(), "backend.port");
+  return path.join(dataDir(), `backend.${runtimeId}.port`);
 }
 
 function sessionSecretFile() {
-  return path.join(dataDir(), "backend.session");
+  return path.join(dataDir(), `backend.${runtimeId}.session`);
 }
 
 function isFreshRuntimeFile(filePath, minMtimeMs) {
@@ -241,6 +416,38 @@ function readSessionSecret(minMtimeMs = 0) {
   return "";
 }
 
+function createBackendSignatureHeaders(pathname, bodyText = "") {
+  const secretHex = readSessionSecret(backendLaunchStartedAt);
+  if (!secretHex) throw new Error("本地后端安全通道尚未就绪");
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const bodyHash = crypto.createHash("sha256").update(bodyText, "utf8").digest("hex");
+  const licenseKey = licenseClient?.getInfo()?.license_key || "account-bridge";
+  const message = `${licenseKey}|${pathname}|${timestamp}|${nonce}|${bodyHash}`;
+  const token = crypto.createHmac("sha256", Buffer.from(secretHex, "hex")).update(message, "utf8").digest("hex");
+  return {
+    "X-Session-License": licenseKey,
+    "X-Session-Nonce": nonce,
+    "X-Session-Timestamp": timestamp,
+    "X-Session-Token": token
+  };
+}
+
+async function requestBackend(requestPath, { method = "GET", body, bodyText } = {}) {
+  await ensureBackendSecureReady();
+  if (!backendUrl) throw new Error("本地后端尚未启动");
+  const backendOrigin = new URL(backendUrl);
+  const target = new URL(String(requestPath || ""), `${backendUrl}/`);
+  if (target.origin !== backendOrigin.origin) throw new Error("本地后端请求地址无效");
+  const serializedBody = bodyText === undefined ? (body === undefined ? "" : JSON.stringify(body)) : String(bodyText);
+  const headers = createBackendSignatureHeaders(target.pathname, serializedBody);
+  if (body !== undefined || bodyText !== undefined) headers["Content-Type"] = "application/json";
+  const response = await fetch(target, { method, headers, body: body === undefined && bodyText === undefined ? undefined : serializedBody });
+  const data = await response.json().catch(() => ({ success: response.ok }));
+  if (!response.ok) throw new Error(data.detail || data.message || `本地后端请求失败(${response.status})`);
+  return data;
+}
+
 function requestHealth(url) {
   return new Promise((resolve) => {
     const req = http.get(`${url}/api/health`, (res) => {
@@ -257,21 +464,10 @@ function requestHealth(url) {
 
 async function waitForBackend() {
   for (let i = 0; i < 60; i += 1) {
-    if (backendProcess && i < 30) {
-      const freshPort = readBackendPort(backendLaunchStartedAt);
-      const freshSecret = readSessionSecret(backendLaunchStartedAt);
-      if (freshPort && freshSecret) {
-        const candidateUrl = `http://127.0.0.1:${freshPort}`;
-        if (await requestHealth(candidateUrl)) {
-          backendUrl = candidateUrl;
-          return true;
-        }
-      }
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      continue;
-    }
-    for (const port of backendPortCandidates()) {
-      const candidateUrl = `http://127.0.0.1:${port}`;
+    const freshPort = readBackendPort(backendLaunchStartedAt);
+    const freshSecret = readSessionSecret(backendLaunchStartedAt);
+    if (freshPort && freshSecret) {
+      const candidateUrl = `http://127.0.0.1:${freshPort}`;
       if (await requestHealth(candidateUrl)) {
         backendUrl = candidateUrl;
         return true;
@@ -282,25 +478,68 @@ async function waitForBackend() {
   return false;
 }
 
+function hasBackendSecureChannel() {
+  const freshPort = readBackendPort(backendLaunchStartedAt);
+  const freshSecret = readSessionSecret(backendLaunchStartedAt);
+  return Boolean(freshPort && freshSecret && backendUrl === `http://127.0.0.1:${freshPort}`);
+}
+
+async function ensureBackendSecureReady() {
+  if (hasBackendSecureChannel()) return;
+  if (!backendReadyPromise) {
+    backendReadyPromise = waitForBackend().finally(() => {
+      backendReadyPromise = null;
+    });
+  }
+  const ready = await backendReadyPromise;
+  if (!ready || !hasBackendSecureChannel()) {
+    throw new Error("本地后端安全通道启动超时，请稍后重试");
+  }
+}
+
 function startBackend() {
   const backendMain = path.join(rootDir(), "backend", "main.py");
   const backendDist = path.join(rootDir(), "backend-dist");
-  const packagedLauncher = path.join(backendDist, "backend-launcher.exe");
-  const packagedBackend = path.join(backendDist, "backend-server.exe");
+  const packagedBackend = path.join(backendDist, "backend-server", "backend-server.exe");
+  const legacyPackagedBackend = path.join(backendDist, "backend-server.exe");
   let command = process.env.WANSHAN_PYTHON || "python";
   let args = [backendMain];
   let cwd = path.dirname(backendMain);
-  if (app.isPackaged && fs.existsSync(packagedLauncher)) {
-    command = packagedLauncher;
-    args = [];
-    cwd = backendDist;
-  } else if (app.isPackaged && fs.existsSync(packagedBackend)) {
+  if (app.isPackaged && fs.existsSync(packagedBackend)) {
     command = packagedBackend;
+    args = [];
+    cwd = path.dirname(packagedBackend);
+  } else if (app.isPackaged && fs.existsSync(legacyPackagedBackend)) {
+    command = legacyPackagedBackend;
     args = [];
     cwd = backendDist;
   } else if (!fs.existsSync(backendMain)) {
     console.warn("[wanshan] backend entrypoint not found:", backendMain);
     return;
+  }
+
+  // argv is the authoritative pairing channel for the installed backend. It
+  // prevents the renderer from attaching to a stale fallback port when a
+  // Windows launch environment loses a custom child-process environment key.
+  args = args.concat([
+    "--wanshan-backend-port-file", backendPortFile(),
+    "--wanshan-session-secret-file", sessionSecretFile()
+  ]);
+
+  // Source-mode restarts used to leave Python backends listening on every
+  // fallback port. The next renderer could then pair a fresh session secret
+  // with an old backend and all read-only selectors appeared empty.
+  if (!app.isPackaged && process.platform === "win32") {
+    const escapedBackendMain = backendMain.replace(/'/g, "''");
+    const cleanupCommand = `$target='${escapedBackendMain}'; Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like \"*$target*\" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+    try {
+      childProcess.execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", cleanupCommand], {
+        windowsHide: true,
+        stdio: "ignore"
+      });
+    } catch (_) {
+      // A failed cleanup only means the normal dynamic port fallback is used.
+    }
   }
 
   fs.mkdirSync(dataDir(), { recursive: true });
@@ -311,12 +550,18 @@ function startBackend() {
     // Ignore stale runtime files.
   }
   backendLaunchStartedAt = Date.now();
+  backendReadyPromise = null;
 
   backendProcess = childProcess.spawn(command, args, {
     cwd,
     env: {
       ...process.env,
-      WANSHAN_APP_NAME: APP_NAME,
+      WANSHAN_APP_NAME: DATA_APP_NAME,
+      WANSHAN_BACKEND_PORT_FILE: backendPortFile(),
+      WANSHAN_SESSION_SECRET_FILE: sessionSecretFile(),
+      WANSHAN_REQUIRE_ACCOUNT_AUTH: commercialBuild ? "1" : "0",
+      WANSHAN_REQUIRED_PRODUCT_ID: PRODUCT_ID,
+      WANSHAN_REQUIRED_ENTITLEMENT: "comic_course",
       WANSHAN_ENABLE_CLOUD: process.env.WANSHAN_ENABLE_CLOUD || "0",
       PYTHONUTF8: "1"
     },
@@ -340,6 +585,13 @@ function stopBackend() {
     backendProcess.kill("SIGTERM");
   }
   backendProcess = null;
+  backendReadyPromise = null;
+  try {
+    fs.rmSync(backendPortFile(), { force: true });
+    fs.rmSync(sessionSecretFile(), { force: true });
+  } catch (_) {
+    // Ignore cleanup failures.
+  }
 }
 
 function hasBlockedLaunchArgument() {
@@ -371,7 +623,8 @@ function createWindow() {
     minWidth: 1200,
     minHeight: 700,
     title: APP_NAME,
-    backgroundColor: "#0b1020",
+    icon: appIconPath(),
+    backgroundColor: "#f6f7f9",
     show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -384,7 +637,10 @@ function createWindow() {
   closePackagedDevTools(mainWindow);
 
   mainWindow.loadFile(path.join(rootDir(), "frontend", "index.html"));
-  mainWindow.once("ready-to-show", () => mainWindow && mainWindow.show());
+  mainWindow.once("ready-to-show", () => {
+    if (mainWindow) mainWindow.show();
+    closeSplashWindow();
+  });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (isTrustedExternalUrl(url)) {
       shell.openExternal(url);
@@ -535,6 +791,16 @@ ipcMain.handle("get-session-secret", () => readSessionSecret());
 ipcMain.handle("get-app-version", () => app.getVersion());
 ipcMain.handle("get-version-history", () => ({ versions: [] }));
 
+ipcMain.handle("local-api:llm-configs", async (_event, request = {}) => {
+  const method = String(request.method || "GET").toUpperCase();
+  const requestPath = normalizeLlmConfigRequest(request.path, method);
+  const rawBody = request.body === undefined || request.body === null ? undefined : String(request.body);
+  if (rawBody && Buffer.byteLength(rawBody, "utf8") > 512 * 1024) {
+    throw new Error("本地模型配置请求内容过大");
+  }
+  return requestBackend(requestPath, { method, bodyText: rawBody });
+});
+
 ipcMain.handle("safe-storage:encrypt", (_event, value) => encryptText(value));
 ipcMain.handle("safe-storage:decrypt", (_event, value) => decryptText(value));
 
@@ -569,7 +835,9 @@ ipcMain.handle("quit-app", async () => {
   return true;
 });
 
-ipcMain.handle("open-jimeng", () => {
+ipcMain.handle("open-jimeng", async () => {
+  const access = await requirePaidDesktopAction();
+  if (!access.allowed) return { success: false, code: "membership_required", message: access.message };
   openJimengWindow();
   return { success: true, message: "即梦窗口已打开" };
 });
@@ -587,6 +855,8 @@ ipcMain.handle("jimeng-get-url", () => {
 });
 
 ipcMain.handle("jimeng-navigate", async (_event, url) => {
+  const access = await requirePaidDesktopAction();
+  if (!access.allowed) return { success: false, code: "membership_required", message: access.message };
   if (!jimengWindow || jimengWindow.isDestroyed()) {
     return { success: false, message: "即梦窗口未打开" };
   }
@@ -598,6 +868,8 @@ ipcMain.handle("jimeng-navigate", async (_event, url) => {
 });
 
 ipcMain.handle("jimeng-inject-script", async (_event, script) => {
+  const access = await requirePaidDesktopAction();
+  if (!access.allowed) return { success: false, code: "membership_required", message: access.message };
   if (!jimengWindow || jimengWindow.isDestroyed()) {
     return { success: false, message: "即梦窗口未打开" };
   }
@@ -612,8 +884,16 @@ ipcMain.handle("jimeng-inject-script", async (_event, script) => {
   }
 });
 
-ipcMain.handle("embed-config:open-llm-config", () => openQianshanConfigWindow());
-ipcMain.handle("embed-config:sync-llm-token", () => captureQianshanCloudToken());
+ipcMain.handle("embed-config:open-llm-config", async () => {
+  const access = await requirePaidDesktopAction();
+  if (!access.allowed) return { success: false, code: "membership_required", message: access.message };
+  return openQianshanConfigWindow();
+});
+ipcMain.handle("embed-config:sync-llm-token", async () => {
+  const access = await requirePaidDesktopAction();
+  if (!access.allowed) return { success: false, code: "membership_required", message: access.message };
+  return captureQianshanCloudToken();
+});
 
 ipcMain.handle("check-for-updates", async () => {
   if (!updateClient) return { updateAvailable: false, reason: "updater_not_initialized" };
@@ -654,26 +934,95 @@ ipcMain.handle("license:get-info", () => (commercialBuild && licenseClient ? lic
 ipcMain.handle("license:get-last-fail-reason", () => licenseClient?.lastFailReason || "");
 ipcMain.handle("license:activate", async (_event, cardKey) => {
   if (!commercialBuild || !licenseClient) return { success: true, license_type: "permanent", expires_at: null };
+  if (authMode === "account") return { success: false, message: "当前版本已切换为手机号验证码登录，请使用账号登录入口" };
   const result = await licenseClient.activate(cardKey);
   if (result.success) await syncLicenseContext();
   return result;
 });
 ipcMain.handle("license:verify", async () => {
   if (!commercialBuild || !licenseClient) return true;
+  if (authMode === "account" && typeof licenseClient.verifyCached === "function") {
+    return licenseClient.verifyCached().ok;
+  }
   return enforceLicenseState("ipc");
 });
 ipcMain.handle("license:logout", async () => {
+  if (licenseClient && typeof licenseClient.logoutRemote === "function") await licenseClient.logoutRemote();
   if (licenseClient) licenseClient.logout();
   await clearLicenseContext();
   return true;
 });
 
+ipcMain.handle("account:send-code", async (_event, phone) => {
+  if (!commercialBuild || authMode !== "account" || !licenseClient || typeof licenseClient.sendCode !== "function") {
+    return { success: false, message: "账号登录服务未启用" };
+  }
+  try {
+    return await licenseClient.sendCode(phone);
+  } catch (error) {
+    console.error("[account] send-code request failed:", {
+      message: error instanceof Error ? error.message : String(error),
+      code: error && error.code ? error.code : "",
+      cause: error && error.cause ? String(error.cause.message || error.cause) : ""
+    });
+    return { success: false, message: error instanceof Error ? error.message : "验证码发送失败" };
+  }
+});
+
+ipcMain.handle("account:login", async (_event, phone, code) => {
+  if (!commercialBuild || authMode !== "account" || !licenseClient || typeof licenseClient.login !== "function") {
+    return { success: false, message: "账号登录服务未启用" };
+  }
+  const result = await licenseClient.login(phone, code);
+  if (result.success && result.active) {
+    void syncLicenseContext().catch((error) => console.warn("[account] deferred local context sync failed:", error));
+  }
+  return result;
+});
+
+ipcMain.handle("account:me", async () => {
+  if (!commercialBuild || authMode !== "account" || !licenseClient) return { success: true, user: null, active: true };
+  const verified = typeof licenseClient.verifyCached === "function" ? licenseClient.verifyCached() : await licenseClient.verify();
+  return { success: true, ok: verified.ok, authenticated: Boolean(verified.ok || verified.authenticated), reason: verified.reason || "", info: licenseClient.getInfo() };
+});
+
+ipcMain.handle("account:logout", async () => {
+  if (licenseClient && typeof licenseClient.logoutRemote === "function") await licenseClient.logoutRemote();
+  if (licenseClient) licenseClient.logout();
+  await clearLicenseContext();
+  return { success: true };
+});
+
+ipcMain.handle("account:create-payment", async (_event, planId) => {
+  if (!commercialBuild || authMode !== "account" || !licenseClient || typeof licenseClient.createPayment !== "function") {
+    return { success: false, message: "账号支付服务未启用" };
+  }
+  return licenseClient.createPayment(planId);
+});
+
+ipcMain.handle("account:payment-status", async (_event, orderNo) => {
+  if (!commercialBuild || authMode !== "account" || !licenseClient || typeof licenseClient.getPaymentStatus !== "function") {
+    return { success: false, message: "账号支付服务未启用" };
+  }
+  return licenseClient.getPaymentStatus(orderNo);
+});
+
+ipcMain.handle("account:recharge-url", async () => {
+  if (!commercialBuild || authMode !== "account" || !licenseClient || typeof licenseClient.createWebHandoff !== "function") {
+    return { success: true, continueUrl: "https://anyq.site/" };
+  }
+  return licenseClient.createWebHandoff();
+});
+
 app.whenReady().then(async () => {
   app.setName(APP_NAME);
+  removeApplicationMenu(Menu);
+  createSplashWindow();
   if (app.isPackaged) {
     const blockedArgument = hasBlockedLaunchArgument();
     if (blockedArgument) {
-      dialog.showErrorBox("万山启动失败", `检测到被禁止的启动参数：${blockedArgument}`);
+      dialog.showErrorBox(`${APP_NAME}启动失败`, `检测到被禁止的启动参数：${blockedArgument}`);
+      closeSplashWindow();
       app.quit();
       return;
     }
@@ -682,18 +1031,54 @@ app.whenReady().then(async () => {
   if (app.isPackaged) {
     const releaseCheck = verifyPackagedRelease(path.dirname(rootDir()));
     if (!releaseCheck.ok) {
-      dialog.showErrorBox("万山启动失败", `安装包完整性校验失败：${releaseCheck.reason}`);
+      dialog.showErrorBox(`${APP_NAME}启动失败`, `安装包完整性校验失败：${releaseCheck.reason}`);
+      closeSplashWindow();
       app.quit();
       return;
     }
   }
   startBackend();
-  await waitForBackend();
+  backendReadyPromise = waitForBackend();
+  const backendReady = await backendReadyPromise;
+  if (!backendReady) {
+    const message = "本地创作引擎未能启动，请退出后重试。";
+    console.error("[backend] startup synchronization failed:", message);
+    if (isBackendSmoke) {
+      console.error("BACKEND_SMOKE_FAIL", message);
+      app.exit(1);
+      return;
+    }
+    dialog.showErrorBox(`${APP_NAME}启动失败`, message);
+    closeSplashWindow();
+    app.quit();
+    return;
+  }
+
+  if (isBackendSmoke) {
+    try {
+      const templates = await requestBackend("/api/templates/?category=storyboard_generation");
+      const templateItems = Array.isArray(templates)
+        ? templates
+        : (Array.isArray(templates?.data) ? templates.data : []);
+      const count = templateItems.length;
+      if (count < 20) throw new Error(`分镜模板数量不足: ${count}`);
+      console.log(`BACKEND_SMOKE_OK templates=${count} url=${backendUrl}`);
+      app.exit(0);
+    } catch (error) {
+      console.error("BACKEND_SMOKE_FAIL", error instanceof Error ? error.message : String(error));
+      app.exit(1);
+    }
+    return;
+  }
+
   createWindow();
+  void syncLicenseContext().catch((error) => console.error("[backend] startup synchronization failed:", error));
+  backendReadyPromise = null;
   startLicenseRefreshTimer();
+  setTimeout(() => enforceLicenseState("startup").catch((error) => console.error("[license] startup verification failed:", error)), 800);
   updateClient = new UpdateClient({ app, config: releaseConfig, dataDir: dataDir(), mainWindow });
   if (app.isPackaged) {
-    setTimeout(() => updateClient.check().catch((error) => updateClient.emit("update-error", { error: error.message || String(error) })), 5000);
+    setTimeout(() => checkForUpdatesOnStartup(), 5000);
   }
 });
 

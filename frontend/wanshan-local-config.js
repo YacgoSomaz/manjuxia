@@ -3,9 +3,10 @@
   const BAR_ID = "wanshan-local-config-bar";
   const MODAL_ID = "wanshan-local-config-modal";
   const TYPES = [
-    ["llm", "大语言模型"],
-    ["image", "图片生成模型"],
-    ["video", "视频生成模型"],
+    ["llm", "语言大模型"],
+    ["image", "图片大模型"],
+    ["video", "视频大模型"],
+    ["audio", "语音大模型"],
   ];
   const DEFAULT_MAX_TOKENS = 20000;
   const DEFAULT_CONTEXT_WINDOW = 131072;
@@ -61,18 +62,24 @@
         max_tokens: DEFAULT_MAX_TOKENS,
         context_window: DEFAULT_CONTEXT_WINDOW,
       },
-      { id: "custom", label: "自定义 OpenAI 兼容", name: "自定义模型", base_url: "", model_name: "", max_tokens: DEFAULT_MAX_TOKENS, context_window: DEFAULT_CONTEXT_WINDOW },
+      { id: "custom", label: "自定义 / 中转站 OpenAI 兼容", name: "自定义中转站", base_url: "", model_name: "", max_tokens: DEFAULT_MAX_TOKENS, context_window: DEFAULT_CONTEXT_WINDOW },
     ],
     image: [
       { id: "volcengine-image", label: "火山方舟生图", name: "火山生图", base_url: "https://ark.cn-beijing.volces.com/api/v3", model_name: "ep-请填你的生图接入点ID", image_ratio: "16:9" },
       { id: "openai-image", label: "OpenAI 图片", name: "OpenAI 图片", base_url: "https://api.openai.com/v1", model_name: "gpt-image-1", image_ratio: "16:9" },
-      { id: "custom-image", label: "自定义图片接口", name: "自定义图片", base_url: "", model_name: "", image_ratio: "16:9" },
+      { id: "custom-image", label: "自定义 / 中转站图片接口", name: "自定义图片中转站", base_url: "", model_name: "", image_ratio: "16:9" },
     ],
     video: [
       { id: "volcengine-video", label: "火山方舟视频", name: "火山视频", base_url: "https://ark.cn-beijing.volces.com/api/v3", model_name: "ep-请填你的视频接入点ID", generation_mode: "image2video", image_ratio: "16:9", duration: 5 },
       { id: "cool-video", label: "Cool Seedance", name: "Cool 视频", base_url: "https://api.mjapi.cc.cd", model_name: "cool-seedance-2-fast-720p", generation_mode: "image2video", image_ratio: "16:9", duration: 5 },
       { id: "xinglian-video", label: "星链云 SD2", name: "星链云视频", base_url: "https://www.vjimeng.vip", model_name: "sd2-720p-fast", generation_mode: "image2video", image_ratio: "16:9", duration: 5 },
       { id: "jimeng-local", label: "即梦网页登录", name: "即梦视频", base_url: "", model_name: "seedance-2.0-fast", generation_mode: "image2video", image_ratio: "16:9", duration: 5 },
+      { id: "custom-video", label: "自定义 / 中转站视频接口", name: "自定义视频中转站", base_url: "", model_name: "", generation_mode: "image2video", image_ratio: "16:9", duration: 5 },
+    ],
+    audio: [
+      { id: "volcengine-audio", label: "火山方舟语音", name: "火山语音", base_url: "https://ark.cn-beijing.volces.com/api/v3", model_name: "ep-请填你的语音接入点ID" },
+      { id: "openai-audio", label: "OpenAI 语音", name: "OpenAI 语音", base_url: "https://api.openai.com/v1", model_name: "tts-1" },
+      { id: "custom-audio", label: "自定义 / 中转站语音接口", name: "自定义语音中转站", base_url: "", model_name: "" },
     ],
   };
 
@@ -137,6 +144,14 @@
   }
 
   async function api(path, options) {
+    const bridge = window.electronAPI && window.electronAPI.localModelConfig;
+    if (bridge && typeof bridge.request === "function") {
+      return bridge.request({
+        path,
+        method: (options && options.method) || "GET",
+        body: options && options.body,
+      });
+    }
     const base = await backendBase();
     const res = await fetch(base + path, {
       headers: { "Content-Type": "application/json", ...(options && options.headers) },
@@ -241,12 +256,15 @@
       payload.image_ratio = formValue(form, "image_ratio") || "16:9";
       payload.download_timeout = numberValue(form, "download_timeout", 120);
       payload.retry_count = numberValue(form, "retry_count", 0);
-    } else {
+    } else if (currentType === "video") {
       payload.generation_mode = formValue(form, "generation_mode") || "image2video";
       payload.image_ratio = formValue(form, "image_ratio") || "16:9";
       payload.duration = numberValue(form, "duration", 5);
       payload.download_timeout = numberValue(form, "download_timeout", 120);
       payload.retry_count = numberValue(form, "retry_count", 0);
+    } else if (currentType === "audio") {
+      const extra = formValue(form, "extra_params");
+      payload.extra_params = extra ? JSON.parse(extra) : {};
     }
     if (!payload.name || !payload.model_name) throw new Error("配置名称和模型名称不能为空");
     if (currentType !== "video" && (!payload.base_url || (!editing && !payload.api_key))) {
@@ -335,8 +353,8 @@
     const common = [
       field("name", "配置名称", cfg.name || preset.name || ""),
       field("api_key", editing ? "API Key（留空保持原值）" : "API Key", "", { type: "password", autocomplete: "off", hint: "只保存在本机加密配置里，不写进安装包。" }),
-      field("model_name", currentType === "llm" ? "模型名称 / 接入点ID" : "模型 / 接入点ID", cfg.model_name || preset.model_name || ""),
-      field("base_url", "API地址", cfg.base_url || preset.base_url || "", { hint: "已按厂商预填；只有自定义接口才需要改。" }),
+      field("model_name", currentType === "llm" ? "语言模型 / 接入点ID" : currentType === "image" ? "图片模型 / 接入点ID" : currentType === "video" ? "视频模型 / 接入点ID" : "语音模型 / 接入点ID", cfg.model_name || preset.model_name || ""),
+      field("base_url", "API地址", cfg.base_url || preset.base_url || "", { hint: "官方厂商会自动预填；中转站请选择“自定义 / 中转站”，填写 HTTPS 地址和 Key。" }),
     ];
     const typed = currentType === "llm"
       ? [
@@ -362,7 +380,8 @@
               ]),
             ]),
           ]
-        : [
+        : currentType === "video"
+          ? [
             field("generation_mode", "生成模式", cfg.generation_mode || preset.generation_mode || "image2video", { options: [["image2video", "图生视频"], ["text2video", "文生视频"], ["multimodal2video", "多图/参考视频"]] }),
             field("image_ratio", "画幅比例", cfg.image_ratio || preset.image_ratio || "16:9", { options: [["16:9", "16:9 横屏"], ["9:16", "9:16 竖屏"], ["1:1", "1:1 方图"], ["4:3", "4:3"], ["3:4", "3:4"]] }),
             field("duration", "视频时长(秒)", cfg.duration || preset.duration || 5, { type: "number" }),
@@ -374,9 +393,18 @@
                 field("retry_count", "重试次数", cfg.retry_count || 0, { type: "number" }),
               ]),
             ]),
-          ];
+          ]
+          : [
+              el("details", { class: "wlc-advanced" }, [
+                el("summary", { text: "高级设置（默认不用改）" }),
+                el("div", { class: "wlc-grid" }, [
+                  field("request_timeout", "请求超时(秒)", cfg.request_timeout || 120, { type: "number" }),
+                  field("extra_params", "额外参数(JSON)", extra, { type: "textarea", placeholder: "通常留空。语音厂商要求 voice、speed、format 等参数时才填写。" }),
+                ]),
+              ]),
+            ];
     const form = el("form", { class: "wlc-form" }, [
-      el("p", { class: "wlc-intro", text: "低代码本地配置：选厂商，填 API Key，确认模型名即可。请求头和常规参数已自动处理。" }),
+      el("p", { class: "wlc-intro", text: "低代码本地配置：官方厂商选预设后填 API Key；中转站请选择“自定义 / 中转站”，填写 HTTPS API 地址、Key 和模型名。" }),
       editing ? document.createTextNode("") : presetSelector(),
       el("div", { class: "wlc-grid" }, common.concat(typed)),
       el("div", { class: "wlc-actions" }, [
@@ -454,6 +482,8 @@
       renderModal();
     }
   }
+
+  window.manjuxiaOpenLocalModelConfig = openModal;
 
   async function openRemoteConfig() {
     const api = window.electronAPI || {};

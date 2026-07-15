@@ -232,6 +232,31 @@ class ExtractionService:
                         
             except Exception as e:
                 errors.append(f"章节 {chapter_id}: {str(e)}")
+
+        missing_script_errors = [
+            err for err in errors
+            if "尚未转换为剧本" in err or "请先进行剧本转换" in err
+        ]
+        if not elements_map and errors and len(missing_script_errors) == len(errors):
+            return {
+                "success": False,
+                "code": "SCRIPT_REQUIRED",
+                "count": 0,
+                "skipped": 0,
+                "total_unique": 0,
+                "message": "所选章节尚未生成剧本，请先到「剧本转换」生成剧本后，再提取人物、场景或道具。",
+                "errors": errors,
+            }
+        if not elements_map and errors:
+            return {
+                "success": False,
+                "code": "EXTRACTION_EMPTY",
+                "count": 0,
+                "skipped": 0,
+                "total_unique": 0,
+                "message": "没有提取到可保存的内容，请检查章节剧本、提示词模板或模型返回结果。",
+                "errors": errors,
+            }
         
         # 保存到数据库
         saved_count = 0

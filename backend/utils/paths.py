@@ -10,6 +10,30 @@ def is_frozen() -> bool:
 APP_NAME = os.environ.get("WANSHAN_APP_NAME", "万山")
 
 
+def get_runtime_file_override(env_name: str, argument_name: str) -> str:
+    """Read an Electron-provided runtime file path.
+
+    Installed Windows builds pass the path both through environment variables
+    and argv.  argv is a deliberate fallback for launch environments that do
+    not reliably preserve a child process's custom environment variables.
+    """
+    value = os.environ.get(env_name, "").strip()
+    if value:
+        return os.path.abspath(value)
+
+    prefix = f"{argument_name}="
+    for index, argument in enumerate(sys.argv[1:], start=1):
+        if argument == argument_name and index + 1 < len(sys.argv):
+            candidate = str(sys.argv[index + 1]).strip()
+            if candidate:
+                return os.path.abspath(candidate)
+        if argument.startswith(prefix):
+            candidate = argument[len(prefix):].strip()
+            if candidate:
+                return os.path.abspath(candidate)
+    return ""
+
+
 def get_data_dir() -> str:
     """获取 data 目录路径(数据库 / 日志 / 缓存 / 尾帧 用 — 始终在系统目录,不可改)
     默认路径: %APPDATA%/万山/data

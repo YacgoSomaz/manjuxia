@@ -254,6 +254,16 @@ VIDEO_MODEL_PRESETS = {
     },
 }
 
+# 语音模型预置配置
+AUDIO_MODEL_PRESETS = {
+    "tts-1": {
+        "display_name": "OpenAI TTS 1",
+    },
+    "ep-voice-endpoint": {
+        "display_name": "火山方舟语音接入点",
+    },
+}
+
 
 def get_model_presets(config_type: str = "llm"):
     """获取指定类型的预置模型配置"""
@@ -263,6 +273,8 @@ def get_model_presets(config_type: str = "llm"):
         presets = IMAGE_MODEL_PRESETS
     elif config_type == "video":
         presets = VIDEO_MODEL_PRESETS
+    elif config_type == "audio":
+        presets = AUDIO_MODEL_PRESETS
     else:
         presets = LLM_MODEL_PRESETS
     
@@ -281,6 +293,7 @@ def get_all_presets():
         "llm": get_model_presets("llm"),
         "image": get_model_presets("image"),
         "video": get_model_presets("video"),
+        "audio": get_model_presets("audio"),
     }
 
 
@@ -292,6 +305,8 @@ def get_model_preset(model_id: str, config_type: str = "llm"):
         preset = IMAGE_MODEL_PRESETS.get(model_id)
     elif config_type == "video":
         preset = VIDEO_MODEL_PRESETS.get(model_id)
+    elif config_type == "audio":
+        preset = AUDIO_MODEL_PRESETS.get(model_id)
     else:
         preset = None
 

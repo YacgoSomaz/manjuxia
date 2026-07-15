@@ -1,6 +1,6 @@
 # 商业版发布加固
 
-本目录是万山漫剧商业版发布流程的安全骨架。它不包含服务端私钥、管理员令牌、模型 API Key 或用户数据。
+本目录是漫剧虾商业版发布流程的安全骨架。它不包含服务端私钥、管理员令牌、模型 API Key 或用户数据。
 
 Electron `asar` 只是归档格式，不是加密。正式包不能包含 `src/`、`.env`、prompt、测试、源码映射、开发文档、接口密钥或用户数据；前端构建必须关闭 sourcemap，授权验签放在 Electron 主进程，客户端只携带授权公钥。
 
@@ -20,12 +20,12 @@ Electron `asar` 只是归档格式，不是加密。正式包不能包含 `src/`
 
 当前构建入口已接入后端 Nuitka 编译、PyInstaller 启动器、Electron 运行时组装、签名清单生成、发布扫描和 Inno Setup 安装包构建。构建时会在临时源码副本中生成提示词模板嵌入模块，正式发布目录不落地 `backend/data/wanshan_prompt_seed.json`。
 
-授权客户端已按当前授权服务器协议接入，协议边界包括：
+账号客户端已按 anyq.site 统一账户协议接入，客户端只检查 `products[]` 里的 `comic_shrimp` 产品和 `comic_course` 权益。服务器返回 `account_license` Ed25519 签名信封，客户端内置账号公钥验签；裸 JSON 字段被抓包篡改时不会解锁。协议边界包括：
 
-- 激活、校验、续期和离线宽限接口
-- 请求签名或 TLS 证书策略
+- 手机号验证码登录、账号校验和网页登录交接接口
+- 账号权益签名、TLS 传输和短有效期签名缓存
 - 设备标识规则
-- 成功和失败响应字段
+- 成功和失败响应字段，尤其是 `user`、`products`、`account_license`
 - 公钥格式与签名算法
 
 真实值只通过本地参数或 CI Secret 注入，禁止写入 Git。
@@ -36,14 +36,14 @@ Electron `asar` 只是归档格式，不是加密。正式包不能包含 `src/`
 
 ## 当前商业产品
 
-- 产品显示名：万山漫剧
-- 产品代码：`wanshan_media`
-- 授权服务器：`https://license.runmo.art`
-- 更新接口：`https://license.runmo.art/v1/update?product_code=wanshan_media`
-- 当前商业测试包：`0.1.9`
-- 当前安装包 SHA-256：`82b859b3233ba686cf846386bf7d3aba6a7073cce2768f607ef1e1b9ef2ffe40`
+- 产品显示名：漫剧虾
+- 产品代码：`comic_shrimp`
+- 必需权益：`comic_course`
+- 账号/充值服务器：`https://anyq.site`
+- 账号权益公钥：`CqLAEE2KnduTFtw1gVQIExS1qLRa-XI3TaWpbchMbKc`
+- 当前商业测试包：以后以 `release_config.json` 和发布目录为准
 
-管理后台有多个产品时，万山漫剧必须使用 `wanshan_media` 生成卡密。不要选择直播复盘侠，否则客户端会因产品码不匹配拒绝授权。
+管理后台有多个产品时，漫剧虾必须使用 `comic_shrimp` 下单/发权益。不要选择直播复盘侠或运营虾，否则客户端会因产品码或权益不匹配拒绝解锁。
 
 ## 目标构建流程
 

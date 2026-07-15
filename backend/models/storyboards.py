@@ -27,6 +27,7 @@ class GenerateSectionRequest(BaseModel):
     inherit_prev_state: bool = True    # 是否继承上一小节的 end_state(默认开启)
     cross_chapter_inherit: bool = False  # 是否跨章节继承(默认关闭,跨章通常有时间跳跃)
     with_character_state: bool = True  # v3.61.229 是否生成人物状态(默认开);关=不注入/不输出/清空本节状态块
+    avoid_same_shot_size: bool = True  # 跨小节景别避重(默认开)
 
 class RegenerateSingleSectionRequest(BaseModel):
     """单个小节重新生成请求"""
@@ -43,6 +44,7 @@ class RegenerateSingleSectionRequest(BaseModel):
     inherit_prev_state: bool = True    # 是否继承上一小节的 end_state(默认开启)
     cross_chapter_inherit: bool = False  # 是否跨章节继承
     with_character_state: bool = True  # v3.61.229 是否生成人物状态(默认开)
+    avoid_same_shot_size: bool = True  # 跨小节景别避重(默认开)
 
 class StoryboardCreate(BaseModel):
     novel_id: int
@@ -70,6 +72,13 @@ class StoryboardUpdate(BaseModel):
     auto_excluded_audios: Optional[List[str]] = None  # v3.61.136: 跟随 prompt 自动管理
     section_start_state: Optional[dict] = None  # 本节起始时,激活角色(本节 characters 列表里的)的状态快照 {"角色名": "姿态[...]·..."}
     scene_type: Optional[str] = None  # 节类型: normal(默认,主时间线) / flashback(回忆) / dream(梦境) / vision(幻觉) / parallel(平行叙事)
+    topview_image: Optional[str] = None
+    topview_prompt: Optional[str] = None
+    topview_start_prompt: Optional[str] = None
+    topview_end_prompt: Optional[str] = None
+    topview_dispatch_text: Optional[str] = None
+    start_frame_image: Optional[str] = None
+    end_frame_image: Optional[str] = None
     sort_order: Optional[int] = None
     section_number: Optional[int] = None
     section_info: Optional[dict] = None
@@ -94,6 +103,13 @@ class StoryboardResponse(BaseModel):
     video_status: Optional[str] = None  # pending/generating/completed/failed/chain_aborted
     video_url: Optional[str] = None
     submit_id: Optional[str] = None
+    topview_image: Optional[str] = None
+    topview_prompt: Optional[str] = None
+    topview_start_prompt: Optional[str] = None
+    topview_end_prompt: Optional[str] = None
+    topview_dispatch_text: Optional[str] = None
+    start_frame_image: Optional[str] = None
+    end_frame_image: Optional[str] = None
     last_frame_path: Optional[str] = None  # 视频生成成功后,ffmpeg 抽出的尾帧 jpg 相对路径(供下一镜接帧用)
     chain_prev: Optional[dict] = None  # 计算字段:可接的上一镜信息 {"storyboard_id":..., "section_label":..., "frame_path":...}
     created_at: str

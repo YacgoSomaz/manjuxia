@@ -6,7 +6,7 @@ import os
 import secrets
 import hashlib
 import logging
-from utils.paths import get_data_dir
+from utils.paths import get_data_dir, get_runtime_file_override
 
 
 logger = logging.getLogger(__name__)
@@ -16,6 +16,12 @@ _DEVICE_KEY_CACHE: bytes | None = None
 
 
 def _session_secret_file() -> str:
+    override = get_runtime_file_override(
+        "WANSHAN_SESSION_SECRET_FILE",
+        "--wanshan-session-secret-file",
+    )
+    if override:
+        return override
     return os.path.join(get_data_dir(), "backend.session")
 
 

@@ -438,9 +438,118 @@ def _storyboard_assemble_eligibility(template: dict):
     return ("assemble", admin_id)
 
 
+def _parse_camera_continuity(camera_text: str) -> Optional[Dict[str, str]]:
+    """把 camera 文本拆成景别/机位/运镜,用于跨小节景别避重。"""
+    camera = str(camera_text or "").strip()
+    if not camera:
+        return None
+    parts = [p.strip() for p in re.split(r"\s*[,，]\s*", camera) if p.strip()]
+    if len(parts) < 2:
+        parts = [p.strip() for p in re.split(r"\s*[-－—]\s*", camera) if p.strip()]
+    if not parts:
+        return None
+    return {
+        "camera": camera,
+        "shot_size": parts[0],
+        "angle": parts[1] if len(parts) > 1 else "",
+        "movement": " - ".join(parts[2:]) if len(parts) > 2 else "",
+    }
+
+
+def _extract_tail_camera_continuity(text: str) -> Optional[Dict[str, str]]:
+    """从一节分镜文本中取最后一个镜号的 camera 信息。"""
+    if not text:
+        return None
+    tail: Optional[Dict[str, str]] = None
+    shot_re = re.compile(r"^\s*镜号\s*(\d+)\s*[:：]\s*(.*)$")
+    camera_re = re.compile(r"【([^】]{1,160})】")
+    for raw_line in str(text).splitlines():
+        m = shot_re.match(raw_line.strip())
+        if not m:
+            continue
+        cm = camera_re.search(m.group(2) or "")
+        if not cm:
+            continue
+        parsed = _parse_camera_continuity(cm.group(1))
+        if parsed:
+            parsed["shot_number"] = m.group(1)
+            tail = parsed
+    return tail
+
+
+async def _get_prev_section_tail_camera_continuity(
+    novel_id: int,
+    script_id: Optional[int],
+    scene_index: Optional[int],
+    section_number: int,
+    allow_cross_script: bool = False,
+) -> Optional[Dict[str, str]]:
+    """查找上一小节末镜 camera,供 admin-server 拼装景别避重提示。"""
+    if not script_id:
+        return None
+    cur_scene_idx = scene_index if scene_index is not None else 0
+    cur_section = section_number or 1
+    db = await get_db()
+    try:
+        async with db.execute(
+            """
+            SELECT id, description, prompt, scene_index, section_number
+            FROM storyboards
+            WHERE novel_id=? AND script_id=? AND scene_index IS NOT NULL
+              AND (scene_index < ? OR (scene_index = ? AND section_number < ?))
+            ORDER BY scene_index DESC, section_number DESC, sort_order DESC, id DESC
+            LIMIT 8
+            """,
+            (novel_id, script_id, cur_scene_idx, cur_scene_idx, cur_section),
+        ) as cur:
+            rows = await cur.fetchall()
+        for row in rows:
+            info = _extract_tail_camera_continuity(row["description"] or row["prompt"] or "")
+            if info and info.get("shot_size"):
+                info["storyboard_id"] = str(row["id"])
+                info["scene_index"] = str(row["scene_index"])
+                info["section_number"] = str(row["section_number"])
+                logger.info(
+                    f"[camera-chain] 找到上一末镜 sb={row['id']} "
+                    f"#{row['scene_index']}-{row['section_number']} camera={info.get('camera')}"
+                )
+                return info
+
+        if allow_cross_script:
+            async with db.execute(
+                """
+                SELECT id, description, prompt, script_id, scene_index, section_number
+                FROM storyboards
+                WHERE novel_id=? AND script_id<? AND script_id IS NOT NULL
+                ORDER BY script_id DESC, scene_index DESC, section_number DESC, sort_order DESC, id DESC
+                LIMIT 8
+                """,
+                (novel_id, script_id),
+            ) as cur:
+                rows = await cur.fetchall()
+            for row in rows:
+                info = _extract_tail_camera_continuity(row["description"] or row["prompt"] or "")
+                if info and info.get("shot_size"):
+                    info["storyboard_id"] = str(row["id"])
+                    info["script_id"] = str(row["script_id"])
+                    info["scene_index"] = str(row["scene_index"])
+                    info["section_number"] = str(row["section_number"])
+                    logger.info(
+                        f"[camera-chain] 跨章节找到上一末镜 sb={row['id']} "
+                        f"script={row['script_id']} camera={info.get('camera')}"
+                    )
+                    return info
+    except Exception as e:
+        logger.warning(f"[camera-chain] 查询上一末镜失败(忽略): {e}")
+    finally:
+        await db.close()
+    return None
+
+
 def _build_storyboard_assemble_payload(template: dict, admin_id, var_values: dict,
                                        scene_content: str, with_character_state: bool,
-                                       inject_block: str) -> dict:
+                                       inject_block: str,
+                                       camera_continuity: Optional[dict] = None) -> dict:
     """构造 assemble payload(不含模板明文,只给 admin_id + 变量值 + 状态块)。"""
     try:
         variables = json.loads(template.get("variables", "[]"))
@@ -453,6 +562,7 @@ def _build_storyboard_assemble_payload(template: dict, admin_id, var_values: dic
         "scene_content": scene_content or "",
         "with_character_state": bool(with_character_state),
         "inject_block": inject_block or "",
+        "camera_continuity": camera_continuity or None,
     }
 
 
@@ -2722,6 +2832,7 @@ class StoryboardService:
         inherit_prev_state: bool = True,
         cross_chapter_inherit: bool = False,
         with_character_state: bool = True,
+        avoid_same_shot_size: bool = True,
     ) -> Dict[str, Any]:
         """
         为单个场景生成分镜
@@ -2824,6 +2935,7 @@ class StoryboardService:
                     "storyboards": [], "message": _asm_admin_id,
                 }
             _assemble_inject_block = ""  # 状态继承块(本地算,assemble 时单独传 admin)
+            _camera_continuity = None  # 上一末镜结构化信息(完整提示词在 admin-server 拼)
             # 仅自建模板(legacy)才取 content 在本地拼;预置模板绝不取 content
             if _asm_mode == "legacy":
                 template = await get_template_by_id(template_id)
@@ -2882,6 +2994,19 @@ class StoryboardService:
                     "「🔗 本节结尾状态:」、以及姿态[/情绪[/伤势[/朝向关系[/持有道具[ 等状态行。"
                     "即使上文模板要求生成人物状态,本次也一律省略,只输出场景标头 + 镜号分镜内容。"
                 )
+
+            if avoid_same_shot_size:
+                _camera_continuity = await _get_prev_section_tail_camera_continuity(
+                    novel_id=novel_id,
+                    script_id=script_id,
+                    scene_index=scene_index,
+                    section_number=section_number,
+                    allow_cross_script=cross_chapter_inherit,
+                )
+                if _camera_continuity and _asm_mode == "legacy":
+                    logger.info("[camera-chain] legacy 自建模板跳过本地避重提示:核心规则仅在 admin-server assemble 拼装")
+                elif _camera_continuity:
+                    logger.info("[camera-chain] 预置模板 assemble 模式:上一末镜信息将交由 admin-server 拼装")
 
             # C 方案第三层:注入上一节的 end_state 作为"强制继承·不可覆盖"指令
             # 按本节 scene_type 过滤(主线跳过回忆节,回忆节跳过主线节)
@@ -3019,7 +3144,7 @@ class StoryboardService:
                 if _asm_mode == "assemble":
                     _assemble_payload = _build_storyboard_assemble_payload(
                         template, _asm_admin_id, variable_map, scene_content,
-                        with_character_state, _assemble_inject_block,
+                        with_character_state, _assemble_inject_block, _camera_continuity,
                     )
 
                 print("[DEBUG] 即将调用 call_llm, config_id={}".format(llm_config_id), flush=True)
@@ -4920,6 +5045,7 @@ class StoryboardService:
         inherit_prev_state: bool = True,
         cross_chapter_inherit: bool = False,
         with_character_state: bool = True,
+        avoid_same_shot_size: bool = True,
     ) -> Dict[str, Any]:
         """
         重新生成单个小节的分镜
@@ -4975,6 +5101,7 @@ class StoryboardService:
             if _asm_mode == "fail":
                 return {"success": False, "storyboard": None, "message": _asm_admin_id}
             _assemble_inject_block = ""
+            _camera_continuity = None
             # 仅自建模板(legacy)才取 content 在本地拼;预置模板绝不取 content
             if _asm_mode == "legacy":
                 template = await get_template_by_id(template_id)
@@ -5028,6 +5155,30 @@ class StoryboardService:
                     "「🔗 本节结尾状态:」、以及姿态[/情绪[/伤势[/朝向关系[/持有道具[ 等状态行。"
                     "即使上文模板要求生成人物状态,本次也一律省略,只输出场景标头 + 镜号分镜内容。"
                 )
+
+            _regen_scene_idx = None
+            if avoid_same_shot_size:
+                try:
+                    async with (await get_db()) as _cam_db:
+                        async with _cam_db.execute(
+                            "SELECT scene_index FROM storyboards WHERE id=?",
+                            (storyboard_id,),
+                        ) as _cam_cur:
+                            _cam_row = await _cam_cur.fetchone()
+                            _regen_scene_idx = _cam_row["scene_index"] if _cam_row else None
+                except Exception as _e:
+                    logger.warning(f"[camera-chain][regenerate] 反查 scene_index 失败(忽略): {_e}")
+                _camera_continuity = await _get_prev_section_tail_camera_continuity(
+                    novel_id=novel_id,
+                    script_id=script_id,
+                    scene_index=_regen_scene_idx,
+                    section_number=section_number,
+                    allow_cross_script=cross_chapter_inherit,
+                )
+                if _camera_continuity and _asm_mode == "legacy":
+                    logger.info("[camera-chain][regenerate] legacy 自建模板跳过本地避重提示:核心规则仅在 admin-server assemble 拼装")
+                elif _camera_continuity:
+                    logger.info("[camera-chain][regenerate] 预置模板 assemble 模式:上一末镜信息将交由 admin-server 拼装")
 
             # 状态链注入:重新生成单节时默认继承上节 end_state,用户可关闭
             # 按本节 scene_type 过滤(主线跳过回忆节,回忆节跳过主线节)
@@ -5140,7 +5291,7 @@ class StoryboardService:
                 if _asm_mode == "assemble":
                     _assemble_payload = _build_storyboard_assemble_payload(
                         template, _asm_admin_id, variable_map, scene_content,
-                        with_character_state, _assemble_inject_block,
+                        with_character_state, _assemble_inject_block, _camera_continuity,
                     )
 
                 response = await LLMService.call_llm_with_retry(

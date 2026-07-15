@@ -38,6 +38,41 @@ class NovelService:
         )
 
     @staticmethod
+    async def _attach_novel_tags(db, novels):
+        if not novels:
+            return novels
+        ids = [int(n["id"]) for n in novels if n.get("id") is not None]
+        if not ids:
+            return novels
+        placeholders = ",".join("?" for _ in ids)
+        cur = await db.execute(
+            f"""
+            SELECT novel_id, tag_code, label, dimension, score, source, evidence, updated_at
+            FROM novel_tags
+            WHERE novel_id IN ({placeholders})
+            ORDER BY dimension, score DESC, label
+            """,
+            ids,
+        )
+        grouped = {}
+        for row in await cur.fetchall():
+            dimension = row["dimension"] or ""
+            if dimension == "trope":
+                dimension = "genre"
+            grouped.setdefault(row["novel_id"], []).append({
+                "code": row["tag_code"],
+                "label": row["label"],
+                "dimension": dimension,
+                "score": row["score"],
+                "source": row["source"],
+                "evidence": row["evidence"] or "",
+                "updated_at": row["updated_at"],
+            })
+        for novel in novels:
+            novel["novel_tags"] = grouped.get(novel["id"], [])
+        return novels
+
+    @staticmethod
     def _is_visible_to_current_owner(row) -> bool:
         current_user_id, current_team_id, _current_seat_id = NovelService.current_owner_values()
         source_type = row["source_type"] if "source_type" in row.keys() else ""
@@ -115,6 +150,7 @@ class NovelService:
                     "owner_team_id": row["owner_team_id"] if "owner_team_id" in row.keys() else None,
                     "owner_seat_id": row["owner_seat_id"] if "owner_seat_id" in row.keys() else None,
                 })
+            await NovelService._attach_novel_tags(db, novels)
             return novels
         finally:
             await db.close()
@@ -140,7 +176,7 @@ class NovelService:
                     (novel_id,)
                 )
                 count_row = await cursor2.fetchone()
-                return {
+                novel = {
                     "id": row["id"],
                     "name": row["name"],
                     "raw_content": row["raw_content"],
@@ -153,6 +189,8 @@ class NovelService:
                     "remote_project_id": row["remote_project_id"] if "remote_project_id" in row.keys() else None,
                     "remote_team_id": row["remote_team_id"] if "remote_team_id" in row.keys() else None,
                 }
+                await NovelService._attach_novel_tags(db, [novel])
+                return novel
             return None
         finally:
             await db.close()

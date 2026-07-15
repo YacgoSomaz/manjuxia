@@ -155,6 +155,50 @@ def _parse_start_state_names(start_state_text: str) -> set:
     return names
 
 
+# 图片超过渠道 9 张上限时的保留优先级。数值越大越优先保留；
+# 同类素材保持原顺序，因此人物列表靠前的主角会优先保留。
+_IMAGE_KEEP_PRIORITY = {
+    "character": 6,
+    "scene": 5,
+    "prop": 4,
+    "reference": 3,
+    "extra_reference": 3,
+    "chain_prev_frame": 2,
+    "chain_frame": 2,
+    "topview_dispatch": 1,
+}
+
+
+def _image_asset_kind(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("kind") or "")
+    if isinstance(item, (tuple, list)) and len(item) > 2:
+        return str(item[2] or "")
+    return ""
+
+
+def _image_asset_name(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("name") or "")
+    if isinstance(item, (tuple, list)) and len(item) > 1:
+        return str(item[1] or "")
+    return ""
+
+
+def _select_image_keep_indices(items: List[Any], limit: int = 9) -> tuple[List[int], List[int]]:
+    """Select image indices by business priority while preserving upload order."""
+    if len(items) <= limit:
+        return list(range(len(items))), []
+    ranked = sorted(
+        range(len(items)),
+        key=lambda idx: (-_IMAGE_KEEP_PRIORITY.get(_image_asset_kind(items[idx]), 0), idx),
+    )
+    keep_set = set(ranked[:limit])
+    kept = [idx for idx in range(len(items)) if idx in keep_set]
+    removed = [idx for idx in range(len(items)) if idx not in keep_set]
+    return kept, removed
+
+
 def _build_file_refs(
     image_items: List[tuple],
     audio_items: List[tuple],
@@ -201,6 +245,9 @@ def _build_file_refs(
     for idx, item in enumerate(image_items, 1):
         name = _name(item)
         kind = _kind(item)
+        if kind == "topview_dispatch":
+            refs.append(f"{_ref_pfx}图片{idx} {name}")
+            continue
         type_desc = _kind_label_map.get(kind, "")
         label = f"{_ref_pfx}图片{idx} {name}{type_desc}参考图"
         if kind == "character":
@@ -2581,47 +2628,16 @@ async def _process_video_generation(
                 f"裁掉 {len(removed)} 个: {[n for _, n in removed]}"
             )
 
-        # 2) 总数 ≤ 10,音频 + 图片合并按优先级裁
+        # 2) 总数 ≤ 9。图片按保留优先级裁剪，同时保持最终上传原始顺序。
         total = len(image_items) + len(audio_items)
         if total > MAX_TOTAL:
-            overflow = total - MAX_TOTAL
-            # v3.59.54 用户指定优先级(数字越大越先裁):
-            # 道具 > 音频 > 关键帧 > 尾帧 > 人物 > 场景(场景最后裁)
-            # v3.61.154 Q4 修复:用户报"关联了道具结果没传上去",原 prop=5 最先裁不合理
-            #   挪到 prop=3(跟 reference 同级),让 prop 至少跟关键帧一样重要
-            #   超 9 张时还是会先裁 audio/prop,但不再"道具永远第一个砍"
-            priority = {
-                "scene":             0,  # 最后裁(场景图最重要)
-                "character":         1,
-                "chain_prev_frame":  2,
-                "reference":         3,
-                "prop":              3,  # v3.61.154: 5→3,跟 reference 同级,不再永远最先砍
-                "audio":             4,  # 最先裁
-            }
-            # 把 image_items + audio_items 合并成统一带 type 的列表
-            #   (combined_idx, 'img', orig_idx, path, name, elem_type)
-            #   (combined_idx, 'aud', orig_idx, path, name, 'audio')
-            combined: list = []
-            for i, (p, n, e) in enumerate(image_items):
-                combined.append([len(combined), 'img', i, p, n, e])
-            for i, (p, n) in enumerate(audio_items):
-                combined.append([len(combined), 'aud', i, p, n, 'audio'])
-            # 按 (priority 升序, combined_idx 升序) 排;
-            # 留到末尾的就是优先级最高(数字大)的,反向裁:
-            sorted_combined = sorted(
-                combined,
-                key=lambda x: (priority.get(x[5], 99), x[0]),
-                reverse=True,  # 倒序 → 优先级高的(数字大)在前
-            )
-            to_remove = sorted_combined[:overflow]
-            img_remove_set = set(x[2] for x in to_remove if x[1] == 'img')
-            aud_remove_set = set(x[2] for x in to_remove if x[1] == 'aud')
-            removed_names = [x[4] for x in to_remove]
-            image_items = [item for i, item in enumerate(image_items) if i not in img_remove_set]
-            audio_items = [item for i, item in enumerate(audio_items) if i not in aud_remove_set]
+            image_limit = max(0, MAX_TOTAL - len(audio_items))
+            kept_indices, removed_indices = _select_image_keep_indices(image_items, image_limit)
+            removed_names = [_image_asset_name(image_items[idx]) for idx in removed_indices]
+            image_items = [image_items[idx] for idx in kept_indices]
             logger.warning(
                 f"[video-gen] 分镜 {storyboard_id} 素材超出 {MAX_TOTAL} 个上限,"
-                f"裁掉 {overflow} 个: {removed_names}"
+                f"裁掉 {len(removed_indices)} 张图片: {removed_names}"
             )
 
         # 构建文件路径列表和引用描述

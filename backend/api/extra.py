@@ -320,78 +320,50 @@ async def delete_fusion_history(history_id: int):
     return {"success": True}
 
 
+def _image_config_category(item: Dict[str, Any]) -> str:
+    api_style = (item.get("api_style") or item.get("apiStyle") or "").lower()
+    base_url = (item.get("base_url") or item.get("baseUrl") or "").lower()
+    model_name = (item.get("model_name") or item.get("modelName") or "").lower().replace(" ", "")
+    provider_code = (item.get("provider_code") or item.get("providerCode") or "").lower()
+
+    if provider_code in ("volcengine", "doubao") or "volces.com" in base_url or "ark.cn-" in base_url:
+        return "volcengine"
+    if provider_code in ("wuyinkeji", "wuyinkeji_llm") or "wuyinkeji" in base_url or api_style == "wuyinkeji_async":
+        return "wuyinkeji"
+    if provider_code == "geek" or ("geek" in base_url and ("gptimage" in model_name or "gpt-image" in model_name)):
+        return "geek"
+    if provider_code == "cool" or "cool" in api_style or "mjapi" in base_url:
+        return "cool"
+    if provider_code in ("mooko", "kkai", "kkone") or "mooko.ai" in base_url or "kkone" in base_url:
+        return "mooko"
+    if provider_code:
+        return provider_code
+    return "custom"
+
+
+def _public_supported_image_config(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "name": item.get("name", ""),
+        "model_name": item.get("model_name") or item.get("modelName") or "",
+        "category": _image_config_category(item),
+    }
+
+
 @router.get("/fusion/supported-configs")
 async def list_supported_configs():
-    """列出当前支持多参考图融合的图片配置(从云端拉,跟其他模块统一)
+    """列出图片配置。
 
-    过滤规则:config_type='image' 且 (provider_code ∈ {wuyinkeji, wuyinkeji_llm, mooko, kkai, kkone}
-    或 base_url / model_name 命中 wuyinkeji / geek + gpt-image / cool / mooko.ai / kkone 关键字)
-    v3.61.192:补 KKAI(mooko/kkone)— fusion 后端已支持,但本端点白名单漏了它导致下拉不显示
+    万山的图片能力统一使用本地“图片大模型”配置；不要在列表阶段用旧白名单隐藏配置，
+    否则火山方舟等已导入模型会在前端显示 No data。
     """
-    items = []
     try:
-        # v3.61.92: 改走云端 cloud_llm_sync(本地 llm_configs 表已经不是权威源,见 LLMConfigView 提示)
-        from services import cloud_llm_sync
-        cloud_items = await cloud_llm_sync.list_configs("image")
+        local_items = await LLMService._get_local_all("image")
+        configs = local_items or await LLMService.get_all("image")
     except Exception as e:
-        logger.warning(f"[fusion] 云端拉 image 配置失败,fallback 到本地表: {e}")
-        cloud_items = None
-
-    if cloud_items:
-        # 云端格式:camelCase(configType / providerCode / baseUrl / modelName)
-        for r in cloud_items:
-            if not r.get("enabled", True):
-                continue
-            api_style = (r.get("apiStyle") or r.get("api_style") or "").lower()
-            base_url = (r.get("baseUrl") or "").lower()
-            model_name = (r.get("modelName") or "").lower().replace(" ", "")
-            provider_code = (r.get("providerCode") or "").lower()
-            is_wuyinkeji = (
-                provider_code in ("wuyinkeji", "wuyinkeji_llm")
-                or "wuyinkeji" in base_url
-                or api_style == "wuyinkeji_async"
-            )
-            is_geek_gpt = "geek" in base_url and ("gptimage" in model_name or "gpt-image" in model_name)
-            is_cool = "cool" in api_style or "mjapi" in base_url
-            is_mooko = (
-                provider_code in ("mooko", "kkai", "kkone")
-                or "mooko.ai" in base_url
-                or "kkone" in base_url
-            )
-            if is_wuyinkeji or is_geek_gpt or is_cool or is_mooko:
-                items.append({
-                    "id": r.get("id"),
-                    "name": r.get("name", ""),
-                    "model_name": r.get("modelName", ""),
-                    "category": "wuyinkeji" if is_wuyinkeji else ("geek" if is_geek_gpt else ("cool" if is_cool else "mooko")),
-                })
-    else:
-        # fallback 本地 SQLite
-        db = await get_db()
-        try:
-            cur = await db.execute(
-                "SELECT id, name, model_name, base_url, api_style FROM llm_configs WHERE config_type='image' ORDER BY id DESC"
-            )
-            rows = await cur.fetchall()
-        finally:
-            await db.close()
-        for r in rows:
-            api_style = (r["api_style"] or "").lower()
-            base_url = (r["base_url"] or "").lower()
-            model_name = (r["model_name"] or "").lower().replace(" ", "")
-            is_wuyinkeji = "wuyinkeji" in base_url or api_style == "wuyinkeji_async"
-            is_geek_gpt = "geek" in base_url and ("gptimage" in model_name or "gpt-image" in model_name)
-            is_cool = "cool" in api_style or "mjapi" in base_url
-            # 本地 fallback SQL 未选 provider_code,只能靠 base_url 判断 mooko/kkone
-            is_mooko = "mooko.ai" in base_url or "kkone" in base_url
-            if is_wuyinkeji or is_geek_gpt or is_cool or is_mooko:
-                items.append({
-                    "id": r["id"],
-                    "name": r["name"],
-                    "model_name": r["model_name"],
-                    "category": "wuyinkeji" if is_wuyinkeji else ("geek" if is_geek_gpt else ("cool" if is_cool else "mooko")),
-                })
-    return {"items": items}
+        logger.warning(f"[fusion] 获取 image 配置失败: {e}")
+        configs = []
+    return {"items": [_public_supported_image_config(r) for r in configs or []]}
 
 
 # ==================== v3.61.99 火山方舟素材库(企业版) ====================

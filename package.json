@@ -1,7 +1,7 @@
 {
   "name": "wanshan",
   "version": "0.1.0",
-  "description": "万山 - local-first AI video story studio",
+  "description": "漫剧虾 - local-first AI video story studio",
   "main": "electron/main.js",
   "private": true,
   "scripts": {
@@ -13,6 +13,7 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
-    "electron": "^43.1.0"
+    "electron": "^43.1.0",
+    "rcedit": "^4.0.1"
   }
 }

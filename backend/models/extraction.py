@@ -59,6 +59,8 @@ class ExtractedElementResponse(BaseModel):
     panorama_url: Optional[str] = None
     # 音频文件
     audio_file: Optional[str] = None
+    # 角色绑定音色,用于后续 TTS/配音流程。
+    voice_id: Optional[str] = None
     # v3.61.158:人物马甲(变体)— 当前激活的马甲 id;NULL = 用本体
     active_variant_id: Optional[int] = None
     active_variant_name: Optional[str] = None  # JOIN 出来的当前激活马甲名(防前端 N+1)

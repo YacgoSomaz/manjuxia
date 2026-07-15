@@ -17,6 +17,12 @@ function publicKeyFromRaw(rawPublicKey) {
   return crypto.createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), raw]), format: "der", type: "spki" });
 }
 
+function readJsonFile(filePath) {
+  // Windows PowerShell 5 writes UTF-8 files with a BOM for -Encoding UTF8.
+  // Accept that byte-order mark so a signed, otherwise valid release can boot.
+  return JSON.parse(fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, ""));
+}
+
 function walkFiles(root) {
   const result = [];
   for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
@@ -40,7 +46,7 @@ function verifyPackagedRelease(root) {
 
   let manifest;
   try {
-    manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    manifest = readJsonFile(manifestPath);
   } catch (error) {
     return { ok: false, reason: `invalid integrity manifest: ${error.message}` };
   }
@@ -50,7 +56,7 @@ function verifyPackagedRelease(root) {
 
   let releaseConfig;
   try {
-    releaseConfig = JSON.parse(fs.readFileSync(path.join(releaseRoot, "release_config.json"), "utf8"));
+    releaseConfig = readJsonFile(path.join(releaseRoot, "release_config.json"));
     const signature = decodeBase64Url(fs.readFileSync(signaturePath, "utf8").trim());
     const verified = crypto.verify(null, fs.readFileSync(manifestPath), publicKeyFromRaw(releaseConfig.integrity_public_key), signature);
     if (!verified) return { ok: false, reason: "integrity manifest signature mismatch" };

@@ -7,12 +7,13 @@ const path = require("node:path");
 
 const { verifyPackagedRelease } = require("../electron/release-guard");
 
-function createSignedRelease() {
+function createSignedRelease({ withBom = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wanshan-release-"));
   const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
   const rawPublic = publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("base64url");
   fs.writeFileSync(path.join(root, "万山.pyd"), Buffer.from("compiled-module"));
-  fs.writeFileSync(path.join(root, "release_config.json"), JSON.stringify({ integrity_public_key: rawPublic }));
+  const releaseConfig = JSON.stringify({ integrity_public_key: rawPublic });
+  fs.writeFileSync(path.join(root, "release_config.json"), withBom ? `\uFEFF${releaseConfig}` : releaseConfig);
   const files = {};
   for (const name of ["万山.pyd", "release_config.json"]) {
     const file = path.join(root, name);
@@ -26,6 +27,11 @@ function createSignedRelease() {
 
 test("accepts a signed release with an exact registered file set", () => {
   const root = createSignedRelease();
+  assert.deepEqual(verifyPackagedRelease(root), { ok: true });
+});
+
+test("accepts a signed release whose JSON metadata has a UTF-8 BOM", () => {
+  const root = createSignedRelease({ withBom: true });
   assert.deepEqual(verifyPackagedRelease(root), { ok: true });
 });
 

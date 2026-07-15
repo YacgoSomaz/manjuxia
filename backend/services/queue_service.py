@@ -10,6 +10,7 @@
 """
 import json
 import logging
+import sqlite3
 from typing import Optional, List, Dict, Any, Tuple
 
 from database.db import get_db
@@ -180,6 +181,9 @@ async def enqueue_batch(
     db = await get_db()
     try:
         params_json = json.dumps(params) if params else None
+        # Serialize enqueue writes so two fast clicks cannot interleave and leave
+        # duplicate active rows for the same storyboard.
+        await db.execute("BEGIN IMMEDIATE")
 
         for sb_id in storyboard_ids:
             # 取 prompt 快照(便于事后排查;实际生成时 worker 还是读最新的)
@@ -199,45 +203,39 @@ async def enqueue_batch(
             label = await build_label(sb_id)
             now_str = now_beijing_str()
 
-            # v3.60.3 关键改动: upsert 模式 — 同一 storyboard 只保留一条队列记录
-            # 1. 查这个 storyboard 的最新一条队列记录
+            # v3.61.296: 活跃态幂等必须先查 queued/generating,不能只查最新历史行。
+            # 否则“旧一点还有 queued,最新一条是 done/failed”的脏状态会被误复用,
+            # 最终留下同一个 storyboard 两条活跃队列行。
             cur = await db.execute(
                 "SELECT id, status, label, provider FROM video_task_queue "
-                "WHERE storyboard_id = ? ORDER BY id DESC LIMIT 1",
+                "WHERE storyboard_id = ? AND status IN ('queued','generating') "
+                "ORDER BY CASE WHEN status='generating' THEN 0 ELSE 1 END, id DESC LIMIT 1",
                 (sb_id,),
             )
-            existing = await cur.fetchone()
+            active = await cur.fetchone()
 
-            if existing:
-                _exist_provider = (existing["provider"] if "provider" in existing.keys() else None) or "jimeng"
-                # 1a. 已在 queued/generating
-                if existing["status"] in ACTIVE_STATUSES:
-                    # 同渠道 → 幂等跳过(原行为)
-                    if _exist_provider == provider:
-                        skipped.append({
-                            "storyboard_id": sb_id,
-                            "reason": f"已在队列({existing['status']})",
-                            "queue_id": existing["id"],
-                            "label": existing["label"],
-                        })
-                        continue
-                    # v3.61.213: 换了渠道 —— 正在 generating 的不抢占(避免与 worker 竞态),
-                    #   提示用户等完成或清队列;还在 queued 的直接抢占,落到下面复用重置成新渠道,
-                    #   修"旧即梦任务残留 → 换 Cool 重新生成仍被幂等跳过 → worker 跑旧即梦报登录"。
-                    if existing["status"] == STATUS_GENERATING:
-                        skipped.append({
-                            "storyboard_id": sb_id,
-                            "reason": f"该分镜正用 {_exist_provider} 生成中,完成或清队列后再换 {provider}",
-                            "queue_id": existing["id"],
-                            "label": existing["label"],
-                        })
-                        continue
-                    logger.info(
-                        f"[queue] sb={sb_id} 换渠道 {_exist_provider}->{provider},"
-                        f"抢占重置旧 queued 任务 queue_id={existing['id']}"
-                    )
-                    # fall through 到下面的复用重置(会写新 provider)
-                # 1b. 历史是 done/failed/aborted,或 换渠道的 queued: 复用这一行,重置为 queued
+            if active:
+                active_provider = (active["provider"] if "provider" in active.keys() else None) or "jimeng"
+                if active_provider == provider:
+                    skipped.append({
+                        "storyboard_id": sb_id,
+                        "reason": f"已在队列({active['status']})",
+                        "queue_id": active["id"],
+                        "label": active["label"],
+                    })
+                    continue
+                if active["status"] == STATUS_GENERATING:
+                    skipped.append({
+                        "storyboard_id": sb_id,
+                        "reason": f"该分镜正用 {active_provider} 生成中,完成或清队列后再换 {provider}",
+                        "queue_id": active["id"],
+                        "label": active["label"],
+                    })
+                    continue
+                logger.info(
+                    f"[queue] sb={sb_id} 换渠道 {active_provider}->{provider},"
+                    f"抢占重置旧 queued 任务 queue_id={active['id']}"
+                )
                 await db.execute(
                     """UPDATE video_task_queue SET
                         novel_id = ?,
@@ -268,40 +266,98 @@ async def enqueue_batch(
                         chain_frame_desc, video_config_id, params_json,
                         prompt_snapshot, priority, STATUS_QUEUED, label,
                         provider,
-                        now_str, existing["id"],
+                        now_str, active["id"],
                     ),
                 )
-                # 同步 storyboard 的 provider
                 await db.execute(
                     "UPDATE storyboards SET video_provider = ? WHERE id = ?",
                     (provider, sb_id),
                 )
-                enqueued.append(existing["id"])
+                enqueued.append(active["id"])
                 continue
 
-            # 2. 没有历史: 正常 INSERT
+            # 没有活跃行时,优先复用最新终态历史行；没有历史再 insert。
             cur = await db.execute(
-                """INSERT INTO video_task_queue
-                (novel_id, script_id, storyboard_id, mode, use_chain_frame,
-                 chain_frame_desc, video_config_id, params_json, prompt_snapshot,
-                 priority, status, label, provider, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    novel_id, script_id, sb_id, mode,
-                    1 if use_chain_frame else 0,
-                    chain_frame_desc, video_config_id, params_json,
-                    prompt_snapshot, priority, STATUS_QUEUED, label,
-                    provider,
-                    now_str,
-                ),
+                "SELECT id, status, label, provider FROM video_task_queue "
+                "WHERE storyboard_id = ? ORDER BY id DESC LIMIT 1",
+                (sb_id,),
             )
-            new_id = cur.lastrowid
-            # 同步 storyboard 的 provider
+            existing = await cur.fetchone()
+
+            try:
+                if existing:
+                    await db.execute(
+                        """UPDATE video_task_queue SET
+                            novel_id = ?,
+                            script_id = ?,
+                            mode = ?,
+                            use_chain_frame = ?,
+                            chain_frame_desc = ?,
+                            video_config_id = ?,
+                            params_json = ?,
+                            prompt_snapshot = ?,
+                            priority = ?,
+                            status = ?,
+                            label = ?,
+                            provider = ?,
+                            retry_count = 0,
+                            error_code = NULL,
+                            error_message = NULL,
+                            jimeng_task_id = NULL,
+                            video_url = NULL,
+                            last_frame_url = NULL,
+                            created_at = ?,
+                            started_at = NULL,
+                            finished_at = NULL
+                        WHERE id = ?""",
+                        (
+                            novel_id, script_id, mode,
+                            1 if use_chain_frame else 0,
+                            chain_frame_desc, video_config_id, params_json,
+                            prompt_snapshot, priority, STATUS_QUEUED, label,
+                            provider,
+                            now_str, existing["id"],
+                        ),
+                    )
+                    qid = existing["id"]
+                else:
+                    cur = await db.execute(
+                        """INSERT INTO video_task_queue
+                        (novel_id, script_id, storyboard_id, mode, use_chain_frame,
+                         chain_frame_desc, video_config_id, params_json, prompt_snapshot,
+                         priority, status, label, provider, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            novel_id, script_id, sb_id, mode,
+                            1 if use_chain_frame else 0,
+                            chain_frame_desc, video_config_id, params_json,
+                            prompt_snapshot, priority, STATUS_QUEUED, label,
+                            provider,
+                            now_str,
+                        ),
+                    )
+                    qid = cur.lastrowid
+            except sqlite3.IntegrityError:
+                cur = await db.execute(
+                    "SELECT id, status, label FROM video_task_queue "
+                    "WHERE storyboard_id = ? AND status IN ('queued','generating') "
+                    "ORDER BY CASE WHEN status='generating' THEN 0 ELSE 1 END, id DESC LIMIT 1",
+                    (sb_id,),
+                )
+                row = await cur.fetchone()
+                skipped.append({
+                    "storyboard_id": sb_id,
+                    "reason": f"已在队列({row['status'] if row else 'active'})",
+                    "queue_id": row["id"] if row else None,
+                    "label": row["label"] if row else label,
+                })
+                continue
+
             await db.execute(
                 "UPDATE storyboards SET video_provider = ? WHERE id = ?",
                 (provider, sb_id),
             )
-            enqueued.append(new_id)
+            enqueued.append(qid)
 
         await db.commit()
         logger.info(
@@ -309,6 +365,12 @@ async def enqueue_batch(
             f"enqueued={len(enqueued)} skipped={len(skipped)}"
         )
         return {"enqueued": enqueued, "skipped": skipped}
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         await db.close()
 

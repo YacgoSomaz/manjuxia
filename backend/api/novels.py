@@ -11,6 +11,7 @@ from services.novel_creation_service import NovelCreationService
 from services.script_service import ScriptService
 from services.log_service import check_novel_running
 from services.llm_service import LLMService
+from services.tag_service import TagService, normalize_tag
 from services.template_service import get_by_id as get_template_by_id
 from utils.timezone import now_beijing_str
 
@@ -65,6 +66,48 @@ class NovelIncrementalImportRequest(BaseModel):
     raw_content: str
 
 
+class TagAnalysisRequest(BaseModel):
+    name: str
+    content: str
+    mode: Optional[str] = None
+    visual_tags: Optional[List[str]] = None
+    screen_mode_tags: Optional[List[str]] = None
+
+
+class ExistingNovelTagAnalysisRequest(BaseModel):
+    visual_tags: Optional[List[str]] = None
+    screen_mode_tags: Optional[List[str]] = None
+
+
+class NovelTagsUpdateRequest(BaseModel):
+    tags: List[Dict[str, Any]]
+
+
+def _parse_tag_form_value(raw: Optional[str], dimension: str) -> List[str]:
+    if not raw:
+        return []
+    values: List[Any]
+    try:
+        parsed = json.loads(raw)
+        values = parsed if isinstance(parsed, list) else [parsed]
+    except Exception:
+        values = [part.strip() for part in str(raw).split(",") if part.strip()]
+    result = []
+    for value in values:
+        item = normalize_tag(value, dimension)
+        if item and item["label"] not in result:
+            result.append(item["label"])
+    return result[:1]
+
+
+def _parse_visual_tags(raw: Optional[str]) -> List[str]:
+    return _parse_tag_form_value(raw, "visual_medium")
+
+
+def _parse_screen_mode_tags(raw: Optional[str]) -> List[str]:
+    return _parse_tag_form_value(raw, "screen_mode")
+
+
 async def _read_upload_raw_content(file: UploadFile) -> tuple[str, str]:
     """读取 txt/docx 上传内容,返回 (filename, raw_content)。"""
     filename = file.filename or ""
@@ -101,6 +144,41 @@ async def _read_upload_raw_content(file: UploadFile) -> tuple[str, str]:
     return filename, raw_content
 
 
+async def _load_novel_tag_source(novel_id: int) -> Dict[str, Any]:
+    novel = await NovelService.get_by_id(novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail="小说不存在")
+    content = novel.get("raw_content") or ""
+    if not content:
+        chapters = await NovelService.get_chapters(novel_id)
+        content = "\n\n".join(ch.get("content") or "" for ch in chapters)
+    return {
+        "name": novel.get("name") or "",
+        "mode": novel.get("mode") or "",
+        "content": content,
+    }
+
+
+async def _analyze_novel_tags_best_effort(
+    novel_id: int,
+    name: str,
+    content: str,
+    selected_visual: Optional[List[str]] = None,
+    selected_screen_mode: Optional[List[str]] = None,
+    mode: str = "",
+) -> None:
+    try:
+        tags = TagService._heuristic_tags(
+            name=name,
+            content=content,
+            selected_visual=selected_visual or [],
+            selected_screen_mode=selected_screen_mode or [],
+        )
+        await TagService.save_novel_tags(novel_id, tags)
+    except Exception as exc:
+        logger.warning("[novel-tags] 自动打标签失败 novel_id=%s: %s", novel_id, exc)
+
+
 class BatchRewriteRequest(BaseModel):
     chapter_ids: List[int]
     llm_config_id: int
@@ -115,10 +193,40 @@ async def get_novels():
     return await NovelService.get_all()
 
 
+@router.get("/tag-definitions")
+async def list_tag_definitions():
+    """作品标签库。"""
+    return {"tags": await TagService.list_definitions()}
+
+
+@router.post("/analyze-tags")
+async def analyze_tags(request: TagAnalysisRequest):
+    """仅分析文本标签，不落库，给前端预览/手动重算使用。"""
+    if not (request.content or "").strip():
+        raise HTTPException(status_code=400, detail="分析内容不能为空")
+    return await TagService.analyze_content(
+        name=request.name,
+        content=request.content,
+        selected_visual=request.visual_tags or [],
+        selected_screen_mode=request.screen_mode_tags or [],
+        mode=request.mode or "",
+    )
+
+
 @router.post("/", response_model=NovelResponse)
 async def create_novel(novel: NovelCreate):
     """创建小说（JSON方式）"""
-    return await NovelService.create(novel)
+    created = await NovelService.create(novel)
+    if created and created.get("id"):
+        asyncio.create_task(_analyze_novel_tags_best_effort(
+            novel_id=created["id"],
+            name=created.get("name") or novel.name,
+            content=novel.raw_content,
+            selected_visual=novel.visual_tags or [],
+            selected_screen_mode=novel.screen_mode_tags or [],
+            mode=novel.mode or "import",
+        ))
+    return created
 
 
 @router.post("/upload", response_model=NovelResponse)
@@ -126,6 +234,8 @@ async def upload_novel(
     file: UploadFile = File(...),
     mode: str = Form("import"),
     name: str = Form(""),
+    visual_tags: str = Form(""),
+    screen_mode_tags: str = Form(""),
 ):
     """上传 .txt 或 .docx 文件导入小说/剧本。mode: import(小说) / script_import(剧本)"""
     filename = file.filename or ""
@@ -168,8 +278,70 @@ async def upload_novel(
     # 优先使用用户填写的名称;留空则用文件名(去掉扩展名)
     name = (name or "").strip() or filename.rsplit('.', 1)[0]
 
-    novel = NovelCreate(name=name, raw_content=raw_content, mode=(mode or "import"))
-    return await NovelService.create(novel)
+    visual_tag_list = _parse_visual_tags(visual_tags)
+    screen_mode_tag_list = _parse_screen_mode_tags(screen_mode_tags)
+    novel = NovelCreate(
+        name=name,
+        raw_content=raw_content,
+        mode=(mode or "import"),
+        visual_tags=visual_tag_list,
+        screen_mode_tags=screen_mode_tag_list,
+    )
+    created = await NovelService.create(novel)
+    if created and created.get("id"):
+        asyncio.create_task(_analyze_novel_tags_best_effort(
+            novel_id=created["id"],
+            name=created.get("name") or name,
+            content=raw_content,
+            selected_visual=visual_tag_list,
+            selected_screen_mode=screen_mode_tag_list,
+            mode=mode or "import",
+        ))
+    return created
+
+
+@router.get("/{novel_id}/tags")
+async def get_novel_tags(novel_id: int):
+    """获取小说/剧本内容标签。"""
+    if not await NovelService.get_by_id(novel_id):
+        raise HTTPException(status_code=404, detail="小说不存在")
+    return {"tags": await TagService.get_novel_tags(novel_id)}
+
+
+@router.put("/{novel_id}/tags")
+async def update_novel_tags(novel_id: int, request: NovelTagsUpdateRequest):
+    """手动保存内容标签。"""
+    if not await NovelService.get_by_id(novel_id):
+        raise HTTPException(status_code=404, detail="小说不存在")
+    normalized_tags = []
+    for raw in request.tags or []:
+        item = normalize_tag(raw.get("code") or raw.get("label"), raw.get("dimension"))
+        if item:
+            normalized_tags.append({
+                "code": item["code"],
+                "label": item["label"],
+                "dimension": item["dimension"],
+                "score": raw.get("score", 1.0),
+                "source": raw.get("source") or "manual",
+                "evidence": raw.get("evidence") or "",
+            })
+    saved = await TagService.save_novel_tags(novel_id, normalized_tags)
+    missing = TagService.missing_required_conversion_tags(saved)
+    return {"tags": saved, "missing_required_tags": missing}
+
+
+@router.post("/{novel_id}/tags/analyze")
+async def analyze_existing_novel_tags(novel_id: int, request: ExistingNovelTagAnalysisRequest):
+    """重新分析内容标签。视觉和屏幕模式只回显用户选择。"""
+    source = await _load_novel_tag_source(novel_id)
+    return await TagService.analyze_content(
+        name=source["name"],
+        content=source["content"],
+        selected_visual=request.visual_tags or [],
+        selected_screen_mode=request.screen_mode_tags or [],
+        mode=source["mode"],
+        novel_id=novel_id,
+    )
 
 
 @router.get("/{novel_id}", response_model=NovelResponse)
@@ -228,12 +400,27 @@ async def get_novel_template_context(novel_id: int):
         r3 = await cur.fetchone()
         storyboard_template_id = r3["template_id"] if r3 else None
 
+        novel_tags = await TagService.get_novel_tags(novel_id)
+        novel_tag_genres = [
+            t["label"]
+            for t in novel_tags
+            if t.get("dimension") in ("audience", "genre", "trope", "visual_medium")
+        ]
+        screen_mode = None
+        for t in novel_tags:
+            if t.get("dimension") == "screen_mode":
+                screen_mode = "landscape" if t.get("label") == "横屏" else "portrait"
+                break
+
         return {
             "novel_id": novel_id,
             "script_to_novel_template_id": novel_template_id,
             "script_conversion_template_id": script_template_id,
             "script_conversion_template_genres": script_template_genres,
             "storyboard_template_id": storyboard_template_id,
+            "novel_tags": novel_tags,
+            "novel_tag_genres": json.dumps(novel_tag_genres, ensure_ascii=False),
+            "screen_mode": screen_mode,
         }
     finally:
         await db.close()

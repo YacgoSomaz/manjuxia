@@ -5,7 +5,7 @@ import logging
 import logging.handlers
 import datetime
 import traceback
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 
 
 def setup_windows_encoding():
@@ -145,6 +145,8 @@ from api.subtitle_removal import router as subtitle_removal_router
 from api.settings import router as settings_router
 from api.queue import router as queue_router
 from api.team import router as team_router
+from api.license_context import router as license_context_router
+from utils.local_access import require_local_business_access
 qianshan_lab_router = None
 if os.getenv("WANSHAN_ENABLE_QIANSHAN_LAB", "").strip() == "1":
     from api.qianshan_lab import router as qianshan_lab_router
@@ -279,7 +281,7 @@ async def lifespan(app: FastAPI):
     #   误导排查 — 改成读 backend.port 文件拿真实端口
     try:
         from utils.paths import get_data_dir as _gdd_lifespan
-        _pf = os.path.join(_gdd_lifespan(), 'backend.port')
+        _pf = os.environ.get("WANSHAN_BACKEND_PORT_FILE") or os.path.join(_gdd_lifespan(), 'backend.port')
         if os.path.exists(_pf):
             with open(_pf, 'r', encoding='utf-8') as _f:
                 _real_port = _f.read().strip() or '?'
@@ -315,7 +317,10 @@ app = FastAPI(title="万山 API", lifespan=lifespan)
 @app.middleware("http")
 async def global_exception_middleware(request: Request, call_next):
     try:
+        await require_local_business_access(request)
         return await call_next(request)
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
     except Exception as e:
         # 记录完整的错误信息
         error_detail = {
@@ -356,6 +361,7 @@ app.include_router(subtitle_removal_router)
 app.include_router(settings_router)
 app.include_router(queue_router)
 app.include_router(team_router)
+app.include_router(license_context_router)
 if qianshan_lab_router is not None:
     app.include_router(qianshan_lab_router)
 # v3.61.28: 封面生成实验路由
@@ -455,8 +461,11 @@ def _find_free_port():
 def _write_port_file(port: int):
     """把 backend 监听的端口写到 data/backend.port,Electron 启动时读取拼 BACKEND_URL"""
     try:
-        from utils.paths import get_data_dir as _gdd
-        port_file = os.path.join(_gdd(), 'backend.port')
+        from utils.paths import get_data_dir as _gdd, get_runtime_file_override
+        port_file = get_runtime_file_override(
+            "WANSHAN_BACKEND_PORT_FILE",
+            "--wanshan-backend-port-file",
+        ) or os.path.join(_gdd(), 'backend.port')
         with open(port_file, 'w', encoding='utf-8') as f:
             f.write(str(port))
         print(f"[port] 端口写入文件: {port_file} = {port}", flush=True)

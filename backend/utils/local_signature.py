@@ -49,6 +49,13 @@ def _compute_token(secret: bytes, license_key: str, path: str, timestamp: str, n
 
 async def require_local_signature(request: Request):
     """FastAPI 依赖式校验.挂在 endpoint 上即可"""
+    # The global business-access middleware verifies every /api request before
+    # route dependencies run. Reusing that verified result avoids consuming the
+    # one-time nonce twice when a legacy route also declares this dependency.
+    verified = getattr(request.state, "local_signature", None)
+    if verified is not None:
+        return verified
+
     license_key = request.headers.get("X-Session-License", "")
     nonce = request.headers.get("X-Session-Nonce", "")
     timestamp = request.headers.get("X-Session-Timestamp", "")
@@ -83,4 +90,6 @@ async def require_local_signature(request: Request):
         raise HTTPException(status_code=403, detail="bad session token")
 
     _nonce_seen[nonce] = now + NONCE_TTL_SEC
-    return {"license_key": license_key}
+    result = {"license_key": license_key}
+    request.state.local_signature = result
+    return result

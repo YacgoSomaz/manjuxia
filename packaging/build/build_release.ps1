@@ -2,16 +2,20 @@
 param(
   [Parameter(Mandatory = $true)] [string]$Version,
   [switch]$Commercial,
+  [ValidateSet("account", "license")] [string]$AuthMode = "account",
+  [string]$AccountApiUrl = "https://anyq.site",
+  [string]$AccountPublicKey = "",
   [string]$LicenseServerUrl = "",
   [string]$LicensePublicKey = "",
-  [string]$ProductCode = "wanshan_media",
+  [string]$ProductCode = "comic_shrimp",
   [string]$IntegrityPublicKey = "",
-  [string]$UpdateFeedUrl = "",
   [string]$UpdatePublicKey = "",
-  [string]$UpdateInstallerUrl = "",
+  [string]$CodeSignThumbprint = "",
+  [string]$SignTool = "",
+  [string]$Python = "python",
   [string]$OutputRoot = "packaging/release",
   [switch]$SkipBackendCompile,
-  [switch]$SkipLauncherBuild,
+  [switch]$DisableBackendCache,
   [switch]$SkipElectronBuild,
   [switch]$SkipInstallerCheck
 )
@@ -19,7 +23,7 @@ param(
 $ErrorActionPreference = "Stop"
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 $output = Join-Path $projectRoot $OutputRoot
-$stage = Join-Path $output "万山-$Version"
+$stage = Join-Path $output "漫剧虾-$Version"
 
 function Require-Command([string]$Name, [string]$Hint = $Name) {
   if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
@@ -49,17 +53,29 @@ if (-not $SkipInstallerCheck) {
   Add-InnoSetupToPath
   Require-Command "iscc" "Inno Setup ISCC.exe"
 }
-if ($Commercial -and [string]::IsNullOrWhiteSpace($LicenseServerUrl)) {
+if ($Commercial -and $AuthMode -eq "license" -and [string]::IsNullOrWhiteSpace($LicenseServerUrl)) {
   throw "Commercial build requires -LicenseServerUrl"
 }
-if ($Commercial -and [string]::IsNullOrWhiteSpace($LicensePublicKey)) {
+if ($Commercial -and $AuthMode -eq "license" -and [string]::IsNullOrWhiteSpace($LicensePublicKey)) {
   throw "Commercial build requires -LicensePublicKey"
+}
+if ($Commercial -and $AuthMode -eq "account" -and [string]::IsNullOrWhiteSpace($AccountApiUrl)) {
+  throw "Commercial account build requires -AccountApiUrl"
+}
+if ($Commercial -and $AuthMode -eq "account" -and [string]::IsNullOrWhiteSpace($AccountPublicKey)) {
+  throw "Commercial account build requires -AccountPublicKey"
 }
 if ($Commercial -and [string]::IsNullOrWhiteSpace($IntegrityPublicKey)) {
   throw "Commercial build requires -IntegrityPublicKey"
 }
-if ($ProductCode -notmatch '^[A-Za-z0-9_.-]+$') {
-  throw "ProductCode must contain only ASCII letters, numbers, dot, underscore, or hyphen"
+if ($ProductCode -ne "comic_shrimp") {
+  throw "漫剧虾构建的 ProductCode 必须固定为 comic_shrimp"
+}
+if ($Commercial -and [string]::IsNullOrWhiteSpace($UpdatePublicKey)) {
+  throw "Commercial build requires -UpdatePublicKey (update-v1 public key)"
+}
+if ($Commercial -and $UpdatePublicKey -eq $AccountPublicKey) {
+  throw "update-v1 public key must be distinct from account-v1 public key"
 }
 
 if (Test-Path -LiteralPath $stage) {
@@ -69,7 +85,7 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
 $localKeyDir = Join-Path $env:LOCALAPPDATA "万山\build-keys"
 if ([string]::IsNullOrWhiteSpace($IntegrityPublicKey)) {
-  $keyJson = & python (Join-Path $PSScriptRoot "Ensure-Ed25519Key.py") $localKeyDir
+  $keyJson = & $Python (Join-Path $PSScriptRoot "Ensure-Ed25519Key.py") $localKeyDir
   if ($LASTEXITCODE -ne 0) { throw "failed to prepare local manifest signing key" }
   $keyInfo = $keyJson | ConvertFrom-Json
   $IntegrityPublicKey = [string]$keyInfo.public
@@ -78,50 +94,95 @@ if ([string]::IsNullOrWhiteSpace($IntegrityPublicKey)) {
   }
   Write-Output "using local build signing key: $($keyInfo.key_dir)"
 }
-if ([string]::IsNullOrWhiteSpace($UpdatePublicKey)) {
-  $UpdatePublicKey = $IntegrityPublicKey
-}
-
 $releaseConfig = [ordered]@{
-  app_name = "万山"
+  app_name = "漫剧虾"
   version = $Version
   commercial = [bool]$Commercial
+  auth_mode = $AuthMode
+  account_api_url = $AccountApiUrl.TrimEnd("/")
+  account_public_key = $AccountPublicKey
   product_code = $ProductCode
   license_server_url = $LicenseServerUrl
   license_public_key = $LicensePublicKey
   integrity_public_key = $IntegrityPublicKey
-  update_feed_url = $UpdateFeedUrl
   update_public_key = $UpdatePublicKey
   integrity_manifest = "integrity_manifest.json"
 }
-$releaseConfig | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage "release_config.json") -Encoding UTF8
+$releaseConfigJson = $releaseConfig | ConvertTo-Json -Depth 4
+[System.IO.File]::WriteAllText(
+  (Join-Path $stage "release_config.json"),
+  $releaseConfigJson,
+  [System.Text.UTF8Encoding]::new($false)
+)
 
 if (-not $SkipBackendCompile) {
-  & (Join-Path $PSScriptRoot "Compile-Backend.ps1") -ReleaseDir $stage
-}
-if (-not $SkipLauncherBuild) {
-  & (Join-Path $PSScriptRoot "Build-Launcher.ps1") -ReleaseDir $stage
+  & (Join-Path $PSScriptRoot "Compile-Backend.ps1") -ReleaseDir $stage -Python $Python -DisableBackendCache:$DisableBackendCache
 }
 if (-not $SkipElectronBuild) {
   & (Join-Path $PSScriptRoot "Build-ElectronApp.ps1") -ReleaseDir $stage -Version $Version
 }
+if (-not $SkipElectronBuild) {
+  & (Join-Path $PSScriptRoot "Verify-PackagedBackend.ps1") -ReleaseDir $stage
+  if ($LASTEXITCODE -ne 0) { throw "packaged backend runtime verification failed" }
+}
 
-& python (Join-Path $PSScriptRoot "Generate-IntegrityManifest.py") $stage
+function Resolve-SignTool {
+  if ($SignTool) {
+    if (-not (Test-Path -LiteralPath $SignTool)) { throw "SignTool not found: $SignTool" }
+    return (Resolve-Path -LiteralPath $SignTool).Path
+  }
+  $command = Get-Command "signtool.exe" -ErrorAction SilentlyContinue
+  if ($command) { return $command.Source }
+  $sdkRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
+  if (Test-Path -LiteralPath $sdkRoot) {
+    $candidate = Get-ChildItem -Path $sdkRoot -Filter "signtool.exe" -Recurse -ErrorAction SilentlyContinue |
+      Sort-Object FullName -Descending | Select-Object -First 1
+    if ($candidate) { return $candidate.FullName }
+  }
+  throw "signtool.exe not found"
+}
+
+function Sign-ReleaseBinary([string]$FilePath) {
+  if ([string]::IsNullOrWhiteSpace($CodeSignThumbprint)) { return }
+  if (-not $script:ResolvedSignTool) { $script:ResolvedSignTool = Resolve-SignTool }
+  & $script:ResolvedSignTool sign /sha1 $CodeSignThumbprint /fd SHA256 /tr "http://timestamp.digicert.com" /td SHA256 /v $FilePath
+  if ($LASTEXITCODE -ne 0) { throw "code signing failed: $FilePath" }
+  if ((Get-AuthenticodeSignature -FilePath $FilePath).Status -ne "Valid") { throw "code signing verification failed: $FilePath" }
+}
+
+$mainExe = Join-Path $stage "漫剧虾.exe"
+if (-not $SkipElectronBuild -and -not (Test-Path -LiteralPath $mainExe)) { throw "main executable missing: $mainExe" }
+if (Test-Path -LiteralPath $mainExe) { Sign-ReleaseBinary $mainExe }
+
+& $Python (Join-Path $PSScriptRoot "Generate-IntegrityManifest.py") $stage
 if ($LASTEXITCODE -ne 0) { throw "integrity manifest generation failed" }
 & (Join-Path $PSScriptRoot "Scan-Release.ps1") -ReleaseDir $stage
 
 if (-not $SkipInstallerCheck) {
-  $installerOut = Join-Path $output "installer"
+  $installerOut = Join-Path $output "installer\comic-shrimp\$Version"
   New-Item -ItemType Directory -Path $installerOut -Force | Out-Null
-  & iscc /DMyAppVersion="$Version" /DReleaseDir="$stage" /DInstallerOutputDir="$installerOut" (Join-Path $projectRoot "packaging\installer\万山.iss")
-  if ($LASTEXITCODE -ne 0) { throw "Inno Setup installer build failed" }
-  $installer = Join-Path $installerOut "万山Setup_$Version.exe"
-  if (-not (Test-Path -LiteralPath $installer)) { throw "installer missing: $installer" }
-  if (-not [string]::IsNullOrWhiteSpace($UpdateInstallerUrl)) {
-    & python (Join-Path $PSScriptRoot "Generate-UpdateManifest.py") --installer $installer --version $Version --url $UpdateInstallerUrl --output (Join-Path $installerOut "update.json")
-    if ($LASTEXITCODE -ne 0) { throw "update manifest generation failed" }
+  $isccArgs = @("/DMyAppVersion=$Version", "/DReleaseDir=$stage", "/DInstallerOutputDir=$installerOut")
+  if ($CodeSignThumbprint) {
+    if (-not $script:ResolvedSignTool) { $script:ResolvedSignTool = Resolve-SignTool }
+    $innoSignCommand = '$q' + $script:ResolvedSignTool + '$q sign /sha1 ' + $CodeSignThumbprint + ' /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /v $f'
+    $isccArgs += "/DInnoSignTool=1"
+    $isccArgs += "/Smanjuxia=$innoSignCommand"
   }
+  & iscc @isccArgs (Join-Path $projectRoot "packaging\installer\万山.iss")
+  if ($LASTEXITCODE -ne 0) { throw "Inno Setup installer build failed" }
+  $installer = Join-Path $installerOut "漫剧虾Setup_$Version.exe"
+  if (-not (Test-Path -LiteralPath $installer)) { throw "installer missing: $installer" }
+  if ($CodeSignThumbprint -and (Get-AuthenticodeSignature -FilePath $installer).Status -ne "Valid") {
+    throw "installer code signing verification failed: $installer"
+  }
+  $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+  $bytes = (Get-Item -LiteralPath $installer).Length
   Write-Output "installer ready: $installer"
+  Write-Output "release product_id: comic_shrimp"
+  Write-Output "release version: $Version"
+  Write-Output "release sha256: $hash"
+  Write-Output "release bytes: $bytes"
+  Write-Output "code signing: $(if ($CodeSignThumbprint) { 'valid' } else { 'pending' })"
 }
 
 Write-Output "release staging directory prepared: $stage"

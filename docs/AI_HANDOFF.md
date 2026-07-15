@@ -1,5 +1,7 @@
 # AI Handoff: 万山漫剧
 
+> 兼容入口：最新、最完整的接手资料请先阅读 [`PROJECT_HANDOFF.md`](PROJECT_HANDOFF.md) 和 [`PROJECT_FILE_MAP.md`](PROJECT_FILE_MAP.md)。
+
 这份文档给后续接手的 AI 或开发者快速建立上下文。不要在仓库中写入真实管理员令牌、服务端私钥、模型 API Key、用户数据库、Cookie、日志、安装包或本地构建私钥。
 
 ## 一句话目标
@@ -10,7 +12,7 @@
 小说原文 → 章节/大纲 → 剧本转换 → 人物/场景/道具提取 → 分镜 → 图片/视频生成
 ```
 
-商业版需要卡密激活，授权产品码是 `wanshan_media`，后台显示名是“万山漫剧”。
+商业版使用手机号账号登录，产品 ID / aud 是 `comic_shrimp`，必需权益是 `comic_course`，后台显示名是“漫剧虾”。
 
 ## 核心目录
 
@@ -81,7 +83,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File packaging\build\build_release.ps1 
 
 客户端：
 
-- `electron/license-client.js` 负责激活、刷新、验签和本地授权缓存。
+- `electron/account-client.js` 负责验证码登录、刷新、验签和本地授权缓存。
 - `electron/main.js` 从 `release_config.json` 读取商业配置。
 - 客户端只放公钥，不放服务端私钥。
 - 授权信封格式是 `license.payload + license.signature`，算法 Ed25519。
@@ -89,16 +91,15 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File packaging\build\build_release.ps1 
 
 服务端：
 
-- 授权服务器：`https://license.runmo.art`
-- 万山产品码：`wanshan_media`
-- 后台显示名：`万山漫剧`
-- 管理后台创建万山卡密时必须选择“万山漫剧”，不能选“直播复盘侠”。
+- 账号服务器：`https://anyq.site`
+- 产品 ID：`comic_shrimp`
+- 必需权益：`comic_course`
+- 充值通过网页登录交接票据跳转，票据不放进 URL 查询参数，也不返回 Cookie 或管理员令牌。
 
 ## 更新器
 
 - `electron/update-client.js` 负责读取更新接口、校验下载包 SHA-256 并启动安装器。
-- 当前更新接口：`https://license.runmo.art/v1/update?product_code=wanshan_media`
-- 0.1.9 安装包 SHA-256：`82b859b3233ba686cf846386bf7d3aba6a7073cce2768f607ef1e1b9ef2ffe40`
+- 更新接口和公钥来自本地发布配置，产品必须固定为 `comic_shrimp`；不得用 OSS 文件列表判断更新。
 
 ## 模板与排序
 
@@ -136,6 +137,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File packaging\build\build_release.ps1 
   - 继续排查 pandas/docx 等是否是硬依赖。
 - 前端仍是编译后资源，长期建议回收原始 Vue 工程或重建源码工程。
 - 内部分镜实验台不应进入正式商业包，但可以保留在开发仓库帮助测试模板。
+- 前端是编译后资源，某些问题只能在打包后才暴露；每个版本必须做干净安装、覆盖安装、卸载保留数据和运行中二次启动测试。
 
 ## 禁止事项
 

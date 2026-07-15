@@ -9,6 +9,8 @@ const TRUSTED_EXTERNAL_HOSTS = new Set([
   "qianshanai.cn",
   "www.qianshanai.cn",
   "api.qianshanai.cn",
+  "anyq.site",
+  "www.anyq.site",
   "www.vjimeng.vip",
   "jimeng.jianying.com",
   "www.jianying.com",

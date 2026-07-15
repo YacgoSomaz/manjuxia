@@ -54,6 +54,21 @@ class LocalLlmConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(configs[0]["id"], created["id"])
         self.assertEqual(configs[0]["api_key"], "test****only")
 
+    async def test_audio_config_type_is_stored_separately(self):
+        created = await LLMService.create(
+            LLMConfigCreate(
+                name="Audio local test",
+                base_url="https://api.example.com/v1",
+                api_key="audio-key-only",
+                model_name="tts-1",
+                config_type="audio",
+            )
+        )
+
+        self.assertEqual(created["config_type"], "audio")
+        configs = await LLMService.get_all("audio")
+        self.assertTrue(any(item["id"] == created["id"] for item in configs))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,7 +15,7 @@ class LLMConfigCreate(BaseModel):
     context_window: int = Field(default=1048576, ge=256, le=1048576, description="上下文窗口大小")
     extra_params: Optional[Dict[str, Any]] = Field(default=None, description="额外参数")
     # 新增字段
-    config_type: Literal['llm', 'image', 'video'] = Field(default='llm', description="配置类型")
+    config_type: Literal['llm', 'image', 'video', 'audio'] = Field(default='llm', description="配置类型")
     image_ratio: Optional[str] = Field(default='16:9', description="图片比例")
     request_timeout: Optional[int] = Field(default=60, ge=1, le=3000, description="请求超时时间(秒),最大50分钟")
     download_timeout: Optional[int] = Field(default=60, ge=1, le=3000, description="下载超时时间(秒),最大50分钟")
@@ -35,7 +35,7 @@ class LLMConfigUpdate(BaseModel):
     context_window: Optional[int] = Field(default=None, ge=256, le=1048576, description="上下文窗口大小")
     extra_params: Optional[Dict[str, Any]] = Field(default=None, description="额外参数")
     # 新增字段
-    config_type: Optional[Literal['llm', 'image', 'video']] = Field(default=None, description="配置类型")
+    config_type: Optional[Literal['llm', 'image', 'video', 'audio']] = Field(default=None, description="配置类型")
     image_ratio: Optional[str] = Field(default=None, description="图片比例")
     request_timeout: Optional[int] = Field(default=None, ge=1, le=3000, description="请求超时时间(秒),最大50分钟")
     download_timeout: Optional[int] = Field(default=None, ge=1, le=3000, description="下载超时时间(秒),最大50分钟")

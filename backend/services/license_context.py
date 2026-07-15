@@ -13,13 +13,31 @@ _current: Dict[str, Optional[str]] = {
     "license_key": None,
     "machine_id": None,
     "source": None,  # 'qianshan' / 'thirdparty'
+    "authorized": False,
+    "product_id": None,
+    "entitlement": None,
+    "expires_at": None,
+    "signed_until": None,
 }
 
 
-def set_context(license_key: str, machine_id: str, source: Optional[str] = None) -> None:
+def set_context(
+    license_key: str,
+    machine_id: str,
+    source: Optional[str] = None,
+    product_id: Optional[str] = None,
+    entitlement: Optional[str] = None,
+    expires_at: Optional[str] = None,
+    signed_until: Optional[int] = None,
+) -> None:
     _current["license_key"] = license_key
     _current["machine_id"] = machine_id
     _current["source"] = source or "qianshan"
+    _current["authorized"] = True
+    _current["product_id"] = product_id
+    _current["entitlement"] = entitlement
+    _current["expires_at"] = expires_at
+    _current["signed_until"] = signed_until
     logger.info(f"[license_context] 已写入: license_key=***{license_key[-4:] if license_key and len(license_key) >= 4 else ''}, source={source}")
 
 
@@ -31,6 +49,11 @@ def clear_context() -> None:
     _current["license_key"] = None
     _current["machine_id"] = None
     _current["source"] = None
+    _current["authorized"] = False
+    _current["product_id"] = None
+    _current["entitlement"] = None
+    _current["expires_at"] = None
+    _current["signed_until"] = None
 
 
 def is_set() -> bool:

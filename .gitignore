@@ -25,6 +25,7 @@ backend/data/tpl_*.txt
 # Local test output and captured media
 test-artifacts/
 tests/artifacts/
+.tmp/
 *.pyc
 build/
 
@@ -40,3 +41,6 @@ Thumbs.db
 .DS_Store
 
 server-src/
+
+# Local compiler diagnostics
+nuitka-crash-report.xml
