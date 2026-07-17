@@ -243,10 +243,12 @@ def get_qianshan_db_path() -> Path:
 
 
 def get_qianshan_lab_history(limit: int = 100) -> List[Dict[str, Any]]:
-    """Return the user's prior lab input text from the old Qianshan database.
+    """Return the user's prior lab inputs and their final Qianshan outputs.
 
     The lab creates a dedicated novel and chapter for each Qianshan run. This
     query is deliberately read-only and only selects those dedicated run names.
+    It prefers the final ``storyboard_generate`` LLM response and falls back to
+    the storyboard records that were successfully written by older runs.
     """
     db_path = get_qianshan_db_path()
     if not db_path.exists():
@@ -266,7 +268,47 @@ def get_qianshan_lab_history(limit: int = 100) -> List[Dict[str, Any]]:
                     c.title AS chapter_title,
                     c.content AS input_text,
                     c.sort_order,
-                    c.updated_at
+                    c.updated_at,
+                    COALESCE(
+                        (
+                            SELECT l.output_content
+                            FROM llm_logs AS l
+                            WHERE l.novel_id = n.id
+                              AND l.task_type = 'storyboard_generate'
+                              AND l.status = 'success'
+                              AND COALESCE(l.output_content, '') != ''
+                            ORDER BY COALESCE(l.created_at, '') DESC, l.id DESC
+                            LIMIT 1
+                        ),
+                        (
+                            SELECT group_concat(description, char(10) || char(10) || '---' || char(10) || char(10))
+                            FROM (
+                                SELECT b.description AS description
+                                FROM storyboards AS b
+                                WHERE b.novel_id = n.id
+                                  AND COALESCE(b.description, '') != ''
+                                ORDER BY COALESCE(b.sort_order, 0) ASC, b.id ASC
+                            )
+                        ),
+                        ''
+                    ) AS output_text,
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM llm_logs AS l
+                            WHERE l.novel_id = n.id
+                              AND l.task_type = 'storyboard_generate'
+                              AND l.status = 'success'
+                              AND COALESCE(l.output_content, '') != ''
+                        ) THEN 'llm_log'
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM storyboards AS b
+                            WHERE b.novel_id = n.id
+                              AND COALESCE(b.description, '') != ''
+                        ) THEN 'storyboards'
+                        ELSE 'unavailable'
+                    END AS output_source
                 FROM novels AS n
                 INNER JOIN chapters AS c ON c.novel_id = n.id
                 WHERE (n.name LIKE ? OR n.name LIKE ?)

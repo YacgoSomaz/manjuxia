@@ -1098,11 +1098,28 @@
         heading.append(name, stamp);
         const meta = document.createElement("div");
         meta.className = "sub";
-        meta.textContent = `${run.chapter_title || "输入内容"} · 运行 ${run.run_id}`;
-        const text = document.createElement("pre");
-        text.className = "stream-output";
-        text.textContent = run.input_text || "";
-        node.append(heading, meta, text);
+        const outputLabel = run.output_source === "llm_log"
+          ? "模型最终输出"
+          : run.output_source === "storyboards"
+            ? "已落库分镜输出"
+            : "未找到历史输出";
+        meta.textContent = `${run.chapter_title || "输入内容"} · 运行 ${run.run_id} · ${outputLabel}`;
+
+        const inputLabel = document.createElement("div");
+        inputLabel.className = "sub";
+        inputLabel.textContent = "历史输入";
+        const input = document.createElement("pre");
+        input.className = "stream-output";
+        input.textContent = run.input_text || "";
+
+        const outputLabelNode = document.createElement("div");
+        outputLabelNode.className = "sub";
+        outputLabelNode.textContent = "历史输出";
+        const output = document.createElement("pre");
+        output.className = "stream-output";
+        output.textContent = run.output_text || "这次运行没有可回放的输出。";
+
+        node.append(heading, meta, inputLabel, input, outputLabelNode, output);
         messages.append(node);
       });
     }
