@@ -625,6 +625,7 @@
     const $ = (id) => document.getElementById(id);
     const messages = $("messages");
     const historyMessages = $("historyMessages");
+    const qianshanOnlyExperiment = new URLSearchParams(window.location.search).get("qianshanOnly") === "1";
     const statusEl = $("status");
     const runBtn = $("runBtn");
     const batchRunBtn = $("batchRunBtn");
@@ -1103,6 +1104,15 @@
         : `千山后端未连接；DeepSeek 对照配置 ${configs.length} 个，分镜模板 ${templates.length} 个`;
     }
 
+    function lockQianshanNetworkExperiment() {
+      if (!qianshanOnlyExperiment) return;
+      const modeSelect = $("promptMode");
+      modeSelect.value = "qianshan_direct";
+      modeSelect.disabled = true;
+      const modeLabel = document.querySelector('label[for="promptMode"]');
+      if (modeLabel) modeLabel.textContent = "调用模式（实验室锁定：千山网络后端）";
+    }
+
     function renderHistory(runs) {
       historyMessages.innerHTML = "";
       if (!runs.length) {
@@ -1391,6 +1401,7 @@
       $("sourceText").value = sampleText;
     });
 
+    lockQianshanNetworkExperiment();
     loadStatus().catch((err) => {
       statusEl.textContent = err.message;
     }).finally(() => {
