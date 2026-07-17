@@ -262,6 +262,20 @@
       box-shadow: 0 20px 70px rgba(0, 0, 0, 0.42);
       overflow: hidden;
     }
+    .history-dialog {
+      width: min(1180px, 96vw);
+      height: min(860px, 92vh);
+    }
+    .history-dialog-body {
+      padding: 14px;
+      overflow: auto;
+      min-height: 0;
+      flex: 1;
+    }
+    .history-messages pre {
+      min-height: 0;
+      max-height: none;
+    }
     .template-dialog-head {
       display: flex;
       align-items: center;
@@ -595,9 +609,22 @@
     </div>
   </div>
 
+  <div id="historyModal" class="template-modal" role="dialog" aria-modal="true" aria-labelledby="historyModalTitle">
+    <div class="template-dialog history-dialog">
+      <div class="template-dialog-head">
+        <span id="historyModalTitle">历史提问与输出</span>
+        <button id="historyModalClose" class="icon-button" type="button" aria-label="关闭历史记录">×</button>
+      </div>
+      <div class="history-dialog-body">
+        <div id="historyMessages" class="messages history-messages"></div>
+      </div>
+    </div>
+  </div>
+
   <script>
     const $ = (id) => document.getElementById(id);
     const messages = $("messages");
+    const historyMessages = $("historyMessages");
     const statusEl = $("status");
     const runBtn = $("runBtn");
     const batchRunBtn = $("batchRunBtn");
@@ -1077,12 +1104,12 @@
     }
 
     function renderHistory(runs) {
-      messages.innerHTML = "";
+      historyMessages.innerHTML = "";
       if (!runs.length) {
         const empty = document.createElement("div");
         empty.className = "empty";
         empty.textContent = "还没有可显示的千山实验历史。";
-        messages.append(empty);
+        historyMessages.append(empty);
         return;
       }
       runs.forEach((run) => {
@@ -1120,11 +1147,25 @@
         output.textContent = run.output_text || "这次运行没有可回放的输出。";
 
         node.append(heading, meta, inputLabel, input, outputLabelNode, output);
-        messages.append(node);
+        historyMessages.append(node);
       });
     }
 
+    function openHistoryModal() {
+      $("historyModal").classList.add("open");
+    }
+
+    function closeHistoryModal() {
+      $("historyModal").classList.remove("open");
+    }
+
     async function loadHistory() {
+      openHistoryModal();
+      historyMessages.replaceChildren();
+      const loading = document.createElement("div");
+      loading.className = "empty";
+      loading.textContent = "正在读取历史提问与输出...";
+      historyMessages.append(loading);
       statusEl.textContent = "正在读取历史提问...";
       const response = await signedLocalFetch("/api/qianshan-lab/history?limit=100");
       const data = await response.json();
@@ -1322,6 +1363,10 @@
     $("templateModal").addEventListener("click", (event) => {
       if (event.target === $("templateModal")) closeTemplateModal();
     });
+    $("historyModalClose").addEventListener("click", closeHistoryModal);
+    $("historyModal").addEventListener("click", (event) => {
+      if (event.target === $("historyModal")) closeHistoryModal();
+    });
     $("templateSearch").addEventListener("input", (event) => {
       stateStore.templateSearch = event.target.value || "";
       renderTemplateList();
@@ -1337,7 +1382,10 @@
       renderTemplateList();
     });
     document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") closeTemplateModal();
+      if (event.key === "Escape") {
+        closeTemplateModal();
+        closeHistoryModal();
+      }
     });
     sampleBtn.addEventListener("click", () => {
       $("sourceText").value = sampleText;
