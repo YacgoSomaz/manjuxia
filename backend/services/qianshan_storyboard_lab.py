@@ -17,7 +17,9 @@ from services.template_service import get_by_id as get_template_by_id
 from database.db import get_db
 
 DEFAULT_SCRIPT_TEMPLATE_ID = 16
-DEFAULT_STORYBOARD_TEMPLATE_ID = 44
+# 千山当前分镜管理页默认选择“即梦2.0慢节奏通用版【3D】”，
+# 它在旧版运行态数据库中的本地模板 ID 为 23（远端 admin_id 为 13）。
+DEFAULT_STORYBOARD_TEMPLATE_ID = 23
 DEFAULT_LLM_CONFIG_ID = 5904
 DIRECT_STORYBOARD_MAX_TOKENS = 30000
 DIRECT_PROMPT_MODE_CLEAN = "clean"
