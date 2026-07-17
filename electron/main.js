@@ -657,7 +657,13 @@ function createWindow() {
   });
   closePackagedDevTools(mainWindow);
 
-  mainWindow.loadFile(path.join(rootDir(), "frontend", "index.html"));
+  const launchQianshanLab = process.env.WANSHAN_ENABLE_QIANSHAN_LAB === "1"
+    && process.env.WANSHAN_LAUNCH_QIANSHAN_LAB === "1";
+  if (launchQianshanLab) {
+    mainWindow.loadURL(`${backendUrl}/qianshan-storyboard-lab`);
+  } else {
+    mainWindow.loadFile(path.join(rootDir(), "frontend", "index.html"));
+  }
   mainWindow.once("ready-to-show", () => {
     if (mainWindow) mainWindow.show();
     closeSplashWindow();

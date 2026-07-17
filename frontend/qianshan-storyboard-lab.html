@@ -611,6 +611,53 @@
       templateSearch: "",
     };
 
+    function hexToBytes(hex) {
+      const bytes = new Uint8Array(hex.length / 2);
+      for (let index = 0; index < bytes.length; index += 1) {
+        bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+      }
+      return bytes;
+    }
+
+    async function sha256Hex(text) {
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+      return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    }
+
+    async function signedLocalFetch(url, options = {}) {
+      const getSessionSecret = window.electronAPI?.getSessionSecret;
+      if (typeof getSessionSecret !== "function") {
+        throw new Error("请从万山实验室桌面窗口打开，浏览器页面不能访问本机安全通道。");
+      }
+      const secretHex = await getSessionSecret();
+      if (!/^[0-9a-f]{64}$/i.test(secretHex || "")) {
+        throw new Error("本机安全通道尚未就绪，请稍后刷新实验室。");
+      }
+      const target = new URL(url, window.location.href);
+      const bodyText = options.body == null ? "" : String(options.body);
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const nonceBytes = crypto.getRandomValues(new Uint8Array(16));
+      const nonce = Array.from(nonceBytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+      const licenseLabel = "account-bridge";
+      const bodyHash = await sha256Hex(bodyText);
+      const message = `${licenseLabel}|${target.pathname}|${timestamp}|${nonce}|${bodyHash}`;
+      const key = await crypto.subtle.importKey(
+        "raw",
+        hexToBytes(secretHex),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"],
+      );
+      const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+      const token = Array.from(new Uint8Array(signature), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      const headers = new Headers(options.headers || {});
+      headers.set("X-Session-License", licenseLabel);
+      headers.set("X-Session-Nonce", nonce);
+      headers.set("X-Session-Timestamp", timestamp);
+      headers.set("X-Session-Token", token);
+      return fetch(url, { ...options, headers });
+    }
+
     const sampleText = `【外 纽约航站楼前 日】
 老旧航站楼外，人流熙攘。一辆波音747客机在跑道上缓缓滑行，轮胎摩擦地面，扬起一阵热浪。二十岁的林锐推着行李箱走出到达口，他眯起眼，看向头顶灰蒙蒙的天空，嘴角扯出一抹自嘲的弧度。
 
@@ -978,12 +1025,12 @@
     }
 
     async function loadStatus() {
-      const res = await fetch("/api/qianshan-lab/direct-status");
+      const res = await signedLocalFetch("/api/qianshan-lab/direct-status");
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "读取配置失败");
       let qianshan = null;
       try {
-        const qsRes = await fetch("/api/qianshan-lab/status");
+        const qsRes = await signedLocalFetch("/api/qianshan-lab/status");
         qianshan = await qsRes.json();
         if (!qsRes.ok) qianshan = null;
       } catch (err) {
@@ -1101,7 +1148,7 @@
 
     async function streamRequest(request, card) {
       card.push({ type: "client_request", message: "浏览器已发起请求", request });
-      const res = await fetch(request.url, {
+      const res = await signedLocalFetch(request.url, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(request.body),
