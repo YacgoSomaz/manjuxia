@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import unittest
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -9,6 +10,7 @@ from services.qianshan_storyboard_lab import (
     DIRECT_PROMPT_MODE_CLEAN,
     DIRECT_PROMPT_MODE_TWO_STEP,
     _build_clean_direct_messages,
+    get_storyboard_direct_status,
     summarize_storyboards,
 )
 
@@ -62,6 +64,48 @@ class QianshanStoryboardLabTests(unittest.TestCase):
                 {"role": "user", "content": "第二条指令"},
             ],
         )
+
+    def test_direct_status_returns_qianshan_templates_when_model_config_is_unavailable(self):
+        qianshan_template = {
+            "id": 13,
+            "admin_id": 13,
+            "name": "千山测试分镜模板",
+            "category": "storyboard_generation",
+            "content": "",
+            "is_preset": 1,
+        }
+
+        async def run_test():
+            with (
+                patch(
+                    "services.qianshan_storyboard_lab.get_qianshan_storyboard_templates_from_db",
+                    return_value=[qianshan_template],
+                ),
+                patch(
+                    "services.qianshan_storyboard_lab._get_wanshan_storyboard_templates_with_content",
+                    new=AsyncMock(return_value=[]),
+                ),
+                patch(
+                    "services.qianshan_storyboard_lab.get_qianshan_style_templates_from_db",
+                    return_value=[],
+                ),
+                patch(
+                    "services.qianshan_storyboard_lab._get_wanshan_style_templates_with_content",
+                    new=AsyncMock(return_value=[]),
+                ),
+                patch(
+                    "services.qianshan_storyboard_lab.LLMService.get_all",
+                    new=AsyncMock(side_effect=RuntimeError("模型配置暂不可用")),
+                ),
+            ):
+                return await get_storyboard_direct_status()
+
+        import asyncio
+
+        status = asyncio.run(run_test())
+
+        self.assertEqual(status["storyboard_templates"][0]["id"], 13)
+        self.assertEqual(status["llm_configs"], [])
 
 
 if __name__ == "__main__":
