@@ -14,6 +14,8 @@
 
 商业版使用手机号账号登录，产品 ID / aud 是 `comic_shrimp`，必需权益是 `comic_course`，后台显示名是“漫剧虾”。
 
+当前发布版本是 `0.1.23`。商业安装包位于 `packaging/release/installer/comic-shrimp/0.1.23/漫剧虾Setup_0.1.23.exe`，SHA-256 为 `f835706e49724eac21ae6f8a540548c268e314f29921f6004e4210024427ed15`。该包已通过发布前测试、后端冒烟测试、完整性清单签名和发布扫描；代码签名状态仍为 `NotSigned`，正式外发前必须用证书重新构建。
+
 ## 核心目录
 
 ```text
@@ -28,7 +30,7 @@ docs/         项目设计与交接说明
 ## 运行开发版
 
 ```powershell
-cd C:\Users\q2414\Desktop\万山
+cd D:\万山项目
 npm install
 python -m pip install --only-binary=:all: -r backend\requirements.txt
 npm start

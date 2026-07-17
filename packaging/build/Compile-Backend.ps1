@@ -124,7 +124,11 @@ if (Test-Path -LiteralPath $src) { Remove-Item -LiteralPath $src -Recurse -Force
 if (Test-Path -LiteralPath $backendRoot) { Remove-Item -LiteralPath $backendRoot -Recurse -Force }
 New-Item -ItemType Directory -Path $work,$src,$output -Force | Out-Null
 
-$cacheRoot = Join-Path $env:LOCALAPPDATA "万山/build-cache/backend"
+$cacheRoot = if ($env:WANSHAN_BUILD_CACHE_DIR) {
+  [System.IO.Path]::GetFullPath($env:WANSHAN_BUILD_CACHE_DIR)
+} else {
+  Join-Path $env:LOCALAPPDATA "万山/build-cache/backend"
+}
 $cacheFingerprint = Get-BackendSourceFingerprint
 $cacheDir = Join-Path $cacheRoot $cacheFingerprint
 if (-not $DisableBackendCache -and (Test-BackendCache $cacheDir $cacheFingerprint)) {

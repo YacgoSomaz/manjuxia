@@ -47,6 +47,13 @@ body,
   color: #111827 !important;
 }
 
+/* Background polling must never dim or block the workbench. */
+html.wanshan-image-generation-active .el-loading-mask,
+body.wanshan-image-generation-active .el-loading-mask {
+  display: none !important;
+  pointer-events: none !important;
+}
+
 body::before,
 body::after,
 .sidebar::before,

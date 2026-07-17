@@ -50,10 +50,8 @@ async function main() {
     await page.getByText("小说列表").waitFor({ state: "visible", timeout: 10000 });
     await page.getByText("Mock 苍穹短剧").waitFor({ state: "visible", timeout: 10000 });
     await page.getByText("导入 / 创作小说", { exact: true }).click();
-    await page.getByText("剧本/小说导入", { exact: true }).waitFor({ state: "visible", timeout: 10000 });
-    await page.getByText("AI创作", { exact: true }).waitFor({ state: "visible", timeout: 10000 });
-    await page.getByText("内容类型", { exact: true }).waitFor({ state: "visible", timeout: 10000 });
-    await page.getByText("粘贴文本", { exact: true }).waitFor({ state: "visible", timeout: 10000 });
+    await page.getByText("未开通漫剧虾会员", { exact: true }).waitFor({ state: "visible", timeout: 10000 });
+    await page.getByRole("button", { name: "知道了", exact: true }).click();
     await page.screenshot({ path: path.join(artifactDir, "frontend-mock-smoke.png"), fullPage: true });
 
     assert.equal(failures.length, 0, failures.join("\n"));

@@ -635,14 +635,14 @@ class LLMService:
         return content, input_tokens, output_tokens
 
     @staticmethod
-    async def get_all(config_type: str = None):
+    async def get_all(config_type: str = None, *, local_only: bool = False):
         """获取所有配置,按类型筛选。
         v3.59.60:云端化 — 直接拉云端;不再读本地 sqlite。
         v3.59.60 修补:catch 任何异常都返空列表 + 记日志,不让 API 5xx 冒泡。
         v3.59.75:登录失效类异常向上抛(API 层兜成 401 业务码,前端弹提示让用户重启工具)。
                  其它网络抖动 / JSON 解析错继续吞掉返空,避免误打扰。
         """
-        if not cloud_enabled():
+        if local_only or not cloud_enabled():
             return await LLMService._get_local_all(config_type)
 
         from services import cloud_llm_sync
@@ -680,11 +680,11 @@ class LLMService:
             return await LLMService._get_local_all(config_type)
 
     @staticmethod
-    async def get_by_id(config_id: int) -> Optional[Dict[str, Any]]:
+    async def get_by_id(config_id: int, *, local_only: bool = False) -> Optional[Dict[str, Any]]:
         """获取单个配置(含明文 api_key,供 LLM 调用)。
         v3.59.60:云端化 — 走 cloud_llm_sync.get_active_config(),不再读本地 sqlite。
         """
-        if not cloud_enabled():
+        if local_only or not cloud_enabled():
             return await LLMService._get_local_by_id(config_id)
 
         from services import cloud_llm_sync
@@ -731,12 +731,12 @@ class LLMService:
             )
             await db.commit()
             config_id = cursor.lastrowid
-            return await LLMService.get_by_id(config_id)
+            return await LLMService._get_local_by_id(config_id)
         finally:
             await db.close()
 
     @staticmethod
-    async def update(config_id: int, config: LLMConfigUpdate) -> Optional[Dict[str, Any]]:
+    async def update(config_id: int, config: LLMConfigUpdate, *, local_only: bool = False) -> Optional[Dict[str, Any]]:
         """更新配置"""
         db = await get_db()
         try:
@@ -794,7 +794,7 @@ class LLMService:
                 params.append(config.browser_path)
             
             if not updates:
-                return await LLMService.get_by_id(config_id)
+                return await LLMService.get_by_id(config_id, local_only=local_only)
             
             updates.append("updated_at = (datetime('now', '+8 hours'))")
             params.append(config_id)
@@ -804,7 +804,7 @@ class LLMService:
                 params
             )
             await db.commit()
-            return await LLMService.get_by_id(config_id)
+            return await LLMService.get_by_id(config_id, local_only=local_only)
         finally:
             await db.close()
 
@@ -822,9 +822,9 @@ class LLMService:
             await db.close()
 
     @staticmethod
-    async def test_connection(config_id: int) -> Dict[str, Any]:
+    async def test_connection(config_id: int, *, local_only: bool = False) -> Dict[str, Any]:
         """测试API连通性,LLM 发文本,图像模型真实生图"""
-        config = await LLMService.get_by_id(config_id)
+        config = await LLMService.get_by_id(config_id, local_only=local_only)
         if not config:
             return {"success": False, "message": "配置不存在"}
 

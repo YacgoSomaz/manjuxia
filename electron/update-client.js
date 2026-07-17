@@ -10,6 +10,8 @@ const UPDATE_KEY_ID = "update-v1";
 const DOWNLOAD_HOST = "download.anyq.site";
 const CLOCK_SKEW_SECONDS = 120;
 const MAX_RELEASE_SECONDS = 86_400;
+const REALTIME_CHECK_INTERVAL_MS = 60_000;
+const SSE_RECONNECT_DELAY_MS = 5_000;
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 const VERSION_RE = /^\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?$/;
 const SHA256_RE = /^[a-f0-9]{64}$/;
@@ -174,27 +176,126 @@ function verifyUpdateRelease(reply, { publicKey, productId = PRODUCT_ID, now = M
   }
 }
 
+async function consumeSseStream(body, onEvent) {
+  if (!body || typeof body.getReader !== "function") throw new Error("SSE响应没有可读数据流");
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let eventName = "";
+  let dataLines = [];
+
+  const dispatch = async () => {
+    if (eventName === "release") await onEvent(dataLines.join("\n"));
+    eventName = "";
+    dataLines = [];
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const rawLine of lines) {
+        const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+        if (!line) {
+          await dispatch();
+        } else if (line.startsWith(":")) {
+          // SSE keep-alive comment.
+        } else if (line.startsWith("event:")) {
+          eventName = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).replace(/^ /, ""));
+        }
+      }
+      if (done) break;
+    }
+    buffer += decoder.decode();
+    if (buffer || eventName || dataLines.length) {
+      const line = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
+      if (line.startsWith("event:")) eventName = line.slice(6).trim();
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+      await dispatch();
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 class UpdateClient {
-  constructor({ app, config, dataDir, mainWindow, fetchImpl = globalThis.fetch, now = () => Date.now() }) {
+  constructor({
+    app,
+    config,
+    dataDir,
+    mainWindow,
+    fetchImpl = globalThis.fetch,
+    sseFetchImpl = fetchImpl,
+    now = () => Date.now(),
+    setIntervalImpl = setInterval,
+    clearIntervalImpl = clearInterval,
+    setTimeoutImpl = setTimeout,
+    clearTimeoutImpl = clearTimeout,
+  }) {
     this.app = app;
     this.config = config || {};
     this.dataDir = dataDir;
     this.mainWindow = mainWindow;
     this.fetchImpl = fetchImpl;
+    this.sseFetchImpl = sseFetchImpl;
     this.now = now;
+    this.setIntervalImpl = setIntervalImpl;
+    this.clearIntervalImpl = clearIntervalImpl;
+    this.setTimeoutImpl = setTimeoutImpl;
+    this.clearTimeoutImpl = clearTimeoutImpl;
     this.currentRelease = null;
     this.abortController = null;
+    this.checkPromise = null;
+    this.monitoring = false;
+    this.pollTimer = null;
+    this.sseAbortController = null;
+    this.sseConnectionPromise = null;
+    this.sseReconnectTimer = null;
+    this.lastAnnouncedRelease = "";
+    this.listeners = new Map();
+  }
+
+  on(channel, listener) {
+    if (typeof listener !== "function") return () => {};
+    const listeners = this.listeners.get(channel) || new Set();
+    listeners.add(listener);
+    this.listeners.set(channel, listeners);
+    return () => listeners.delete(listener);
   }
 
   emit(channel, payload) {
     if (this.mainWindow && !this.mainWindow.isDestroyed()) this.mainWindow.webContents.send(channel, payload);
+    for (const listener of this.listeners.get(channel) || []) {
+      try {
+        const result = listener(payload);
+        if (result && typeof result.catch === "function") result.catch(() => {});
+      } catch (_) {
+        // A UI listener must not terminate update monitoring.
+      }
+    }
   }
 
   releaseUrl() {
     return `${UPDATE_ORIGIN}/api/v1/releases/latest?product_id=${PRODUCT_ID}`;
   }
 
+  eventsUrl() {
+    return `${UPDATE_ORIGIN}/api/v1/releases/events?product_id=${PRODUCT_ID}`;
+  }
+
   async check() {
+    if (this.checkPromise) return this.checkPromise;
+    this.checkPromise = this.checkOnce().finally(() => {
+      this.checkPromise = null;
+    });
+    return this.checkPromise;
+  }
+
+  async checkOnce() {
     const publicKey = normalizeUpdateKey(this.config.update_public_key);
     if (!publicKey) return { updateAvailable: false, reason: "update_public_key_not_configured" };
     const response = await this.fetchImpl(this.releaseUrl(), {
@@ -215,19 +316,105 @@ class UpdateClient {
     const currentVersion = this.app.getVersion();
     const minimumRequired = compareVersions(currentVersion, release.minSupportedVersion) < 0;
     if (compareVersions(release.version, currentVersion) <= 0) {
+      this.currentRelease = null;
       if (minimumRequired) throw new Error("更新发布数据无可用安装包，无法满足最低支持版本");
       return { updateAvailable: false, version: release.version, mandatory: false };
     }
     this.currentRelease = release;
+    const mandatory = release.mandatory || minimumRequired;
     const result = {
       updateAvailable: true,
+      currentVersion,
       version: release.version,
+      description: release.notes,
       notes: release.notes,
       size: release.sizeBytes,
-      mandatory: release.mandatory || minimumRequired
+      size_bytes: release.sizeBytes,
+      mandatory,
+      force_update: mandatory,
+      update_level: mandatory ? "force" : "optional"
     };
-    this.emit("update-available", result);
+    const announcementKey = `${release.version}:${result.mandatory ? "mandatory" : "optional"}`;
+    if (announcementKey !== this.lastAnnouncedRelease) {
+      this.lastAnnouncedRelease = announcementKey;
+      this.emit("update-available", result);
+    }
     return result;
+  }
+
+  startRealtimeMonitoring() {
+    if (this.monitoring) return { started: false, reason: "already_monitoring" };
+    if (!normalizeUpdateKey(this.config.update_public_key)) {
+      return { started: false, reason: "update_public_key_not_configured" };
+    }
+    this.monitoring = true;
+    this.pollTimer = this.setIntervalImpl(() => {
+      this.check().catch((error) => this.emit("update-error", { error: error.message || String(error), source: "poll" }));
+    }, REALTIME_CHECK_INTERVAL_MS);
+    void this.connectSse();
+    return { started: true };
+  }
+
+  stopRealtimeMonitoring() {
+    this.monitoring = false;
+    if (this.pollTimer !== null) {
+      this.clearIntervalImpl(this.pollTimer);
+      this.pollTimer = null;
+    }
+    if (this.sseReconnectTimer !== null) {
+      this.clearTimeoutImpl(this.sseReconnectTimer);
+      this.sseReconnectTimer = null;
+    }
+    if (this.sseAbortController) this.sseAbortController.abort();
+    this.sseAbortController = null;
+    return true;
+  }
+
+  async connectSse() {
+    if (!this.monitoring || this.sseConnectionPromise) return;
+    const controller = new AbortController();
+    this.sseAbortController = controller;
+    this.sseConnectionPromise = (async () => {
+      try {
+        const response = await this.sseFetchImpl(this.eventsUrl(), {
+          cache: "no-store",
+          redirect: "error",
+          signal: controller.signal,
+          headers: {
+            Accept: "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Product-Code": PRODUCT_ID
+          }
+        });
+        if (!response.ok || !response.body) throw new Error(`实时更新连接失败: HTTP ${response.status || 0}`);
+        this.emit("update-sse-status", { connected: true });
+        await consumeSseStream(response.body, async () => {
+          // Event data is intentionally ignored. Only the signed latest endpoint is trusted.
+          try {
+            await this.check();
+          } catch (error) {
+            this.emit("update-error", { error: error.message || String(error), source: "sse" });
+          }
+        });
+        if (this.monitoring) throw new Error("实时更新连接已断开");
+      } catch (error) {
+        if (!this.monitoring || controller.signal.aborted) return;
+        this.emit("update-sse-status", { connected: false, error: error.message || String(error) });
+      } finally {
+        if (this.sseAbortController === controller) this.sseAbortController = null;
+        this.sseConnectionPromise = null;
+        if (this.monitoring) this.scheduleSseReconnect();
+      }
+    })();
+    await this.sseConnectionPromise;
+  }
+
+  scheduleSseReconnect() {
+    if (!this.monitoring || this.sseReconnectTimer !== null) return;
+    this.sseReconnectTimer = this.setTimeoutImpl(() => {
+      this.sseReconnectTimer = null;
+      void this.connectSse();
+    }, SSE_RECONNECT_DELAY_MS);
   }
 
   async downloadAndInstall() {
@@ -287,4 +474,12 @@ class UpdateClient {
   }
 }
 
-module.exports = { PRODUCT_ID, UPDATE_KEY_ID, UpdateClient, compareVersions, verifyUpdateRelease };
+module.exports = {
+  PRODUCT_ID,
+  UPDATE_KEY_ID,
+  REALTIME_CHECK_INTERVAL_MS,
+  SSE_RECONNECT_DELAY_MS,
+  UpdateClient,
+  compareVersions,
+  verifyUpdateRelease,
+};

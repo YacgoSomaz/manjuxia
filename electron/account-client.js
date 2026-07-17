@@ -49,6 +49,27 @@ function hasActiveProduct(products, productId = DEFAULT_PRODUCT_ID, entitlement 
   return product.status === "active" && Boolean(expiresAt && Date.parse(expiresAt) > now);
 }
 
+function inactiveProductReason(products, productId = DEFAULT_PRODUCT_ID, now = Date.now()) {
+  const product = findProduct(products, productId);
+  if (!product) return "unauthorized_tool";
+  const expiresAt = activeUntil(product);
+  if (product.status === "active" && expiresAt && Date.parse(expiresAt) <= now) return "expired";
+  return "unauthorized_tool";
+}
+
+function isExplicitAuthorizationFailure(error) {
+  const status = Number(error && error.status);
+  if ([401, 403, 410].includes(status)) return true;
+  const data = error && error.data;
+  const code = String(data && (data.code || data.error || data.reason || data.status) || "").toLowerCase();
+  return /(unauthoriz|not[_-]?entitled|disabled|revoked|expired|membership|entitlement|product[_-]?stop|account[_-]?stop)/.test(code);
+}
+
+function isTransientAuthorizationFailure(error) {
+  const status = Number(error && error.status);
+  return !isExplicitAuthorizationFailure(error) && (status === 408 || status === 429 || status >= 500);
+}
+
 function decodeBase64Url(value) {
   return Buffer.from(String(value || ""), "base64url");
 }
@@ -254,7 +275,8 @@ class AccountClient {
         last_verified_at: Math.floor(this.now() / 1000)
       };
       this._writeState(state);
-      this.lastFailReason = hasActiveProduct(state.products, this.productCode, REQUIRED_ENTITLEMENT, this.now()) ? "" : "unauthorized_tool";
+      const active = hasActiveProduct(state.products, this.productCode, REQUIRED_ENTITLEMENT, this.now());
+      this.lastFailReason = active ? "" : inactiveProductReason(state.products, this.productCode, this.now());
       return { success: true, ...this._infoFromState(state) };
     } catch (error) {
       this.lastFailReason = error && error.status === 401 ? "invalid" : "network";
@@ -271,8 +293,9 @@ class AccountClient {
     try {
       const { data } = await this._request("/api/auth/me", { cookie: state.cookie });
       if (!data.user) {
+        this.clearCachedEntitlements();
         this.lastFailReason = "not_activated";
-        return { ok: false, reason: this.lastFailReason };
+        return { ok: false, authenticated: false, reason: this.lastFailReason };
       }
       const signed = this._validatedAccountFromResponse(data);
       const next = {
@@ -286,28 +309,37 @@ class AccountClient {
       };
       this._writeState(next);
       if (!hasActiveProduct(next.products, this.productCode, REQUIRED_ENTITLEMENT, this.now())) {
-        this.lastFailReason = activeUntil(findProduct(next.products, this.productCode)) ? "expired" : "unauthorized_tool";
+        this.lastFailReason = inactiveProductReason(next.products, this.productCode, this.now());
+        this.clearCachedEntitlements();
         return { ok: false, authenticated: true, reason: this.lastFailReason, user: signed.user, products: next.products };
       }
       this.lastFailReason = "";
       return { ok: true, payload: { user: next.user, products: next.products } };
     } catch (error) {
-      if (!error || !error.status) {
+      if (error && error.reason) {
+        this.clearCachedEntitlements();
+        this.lastFailReason = error.reason;
+        return { ok: false, authenticated: Boolean(state.user), reason: this.lastFailReason };
+      }
+      if (isTransientAuthorizationFailure(error) || !error || !error.status) {
         const signedState = this._validatedState(state);
         if (signedState && hasActiveProduct(signedState.products, this.productCode, REQUIRED_ENTITLEMENT, this.now())) {
           this.lastFailReason = "network";
           return { ok: true, offline: true, payload: { user: signedState.user || null, products: signedState.products || [] } };
         }
         const products = signedState ? signedState.products : [];
-        this.lastFailReason = activeUntil(findProduct(products, this.productCode)) ? "expired" : "unauthorized_tool";
+        this.lastFailReason = inactiveProductReason(products, this.productCode, this.now());
         return { ok: false, authenticated: Boolean(signedState && signedState.user), offline: true, reason: this.lastFailReason, user: signedState ? signedState.user : null, products };
       }
-      if (error.reason) {
-        this.lastFailReason = error.reason;
-        return { ok: false, reason: this.lastFailReason };
+      if (isExplicitAuthorizationFailure(error)) {
+        this.clearCachedEntitlements();
+        const data = error.data || {};
+        const code = String(data.code || data.error || data.reason || "").toLowerCase();
+        this.lastFailReason = /expired/.test(code) ? "expired" : (error.status === 401 ? "not_activated" : "unauthorized_tool");
+        return { ok: false, authenticated: Boolean(state.user), reason: this.lastFailReason };
       }
-      this.lastFailReason = error.status === 401 ? "not_activated" : "network";
-      return { ok: false, reason: this.lastFailReason };
+      this.lastFailReason = "network";
+      return { ok: false, authenticated: Boolean(state.user), reason: this.lastFailReason };
     }
   }
 
@@ -318,7 +350,7 @@ class AccountClient {
       return { ok: false, reason: this.lastFailReason };
     }
     if (!hasActiveProduct(signedState.products, this.productCode, REQUIRED_ENTITLEMENT, this.now())) {
-      this.lastFailReason = activeUntil(findProduct(signedState.products, this.productCode)) ? "expired" : "unauthorized_tool";
+      this.lastFailReason = inactiveProductReason(signedState.products, this.productCode, this.now());
       return {
         ok: false,
         authenticated: true,
@@ -383,21 +415,45 @@ class AccountClient {
     return this._infoFromState(this._readState());
   }
 
+  clearCachedEntitlements() {
+    const state = this._readState();
+    if (!state) {
+      this.lastFailReason = "not_activated";
+      return false;
+    }
+    try {
+      this._writeState({
+        ...state,
+        account_license: null,
+        products: [],
+        signed_until: null,
+        last_verified_at: Math.floor(this.now() / 1000)
+      });
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   getCloudToken() {
     return null;
   }
 
   _infoFromState(state) {
     const signedState = this._validatedState(state);
-    if (!signedState || !signedState.user) return null;
-    const product = findProduct(signedState.products, this.productCode);
+    const user = (signedState && signedState.user) || (state && state.user);
+    if (!user) return null;
+    // Product and entitlement fields are used only from the verified envelope.
+    // A cleared/revoked state may retain the user for UI display, but it has no products.
+    const products = signedState ? signedState.products : [];
+    const product = findProduct(products, this.productCode);
     const expiresAt = activeUntil(product);
-    const isActive = hasActiveProduct(signedState.products, this.productCode, REQUIRED_ENTITLEMENT, this.now());
+    const isActive = hasActiveProduct(products, this.productCode, REQUIRED_ENTITLEMENT, this.now());
     return {
       auth_mode: "account",
-      account_id: signedState.user.id,
-      phone: signedState.user.phone,
-      license_key: signedState.user.phone ? `account:${signedState.user.phone}` : `account:${signedState.user.id || "unknown"}`,
+      account_id: user.id,
+      phone: user.phone,
+      license_key: user.phone ? `account:${user.phone}` : `account:${user.id || "unknown"}`,
       license_type: isActive ? "member" : "free",
       expires_at: expiresAt,
       grace_until: expiresAt,
@@ -410,9 +466,9 @@ class AccountClient {
       membership_status: product && product.status ? product.status : (expiresAt ? "expired" : "unopened"),
       remaining_days: expiresAt ? Math.max(0, Math.ceil((Date.parse(expiresAt) - this.now()) / 86400000)) : 0,
       entitlements: product && Array.isArray(product.entitlements) ? product.entitlements : [],
-      products: Array.isArray(signedState.products) ? signedState.products : [],
-      server_time: signedState.server_time || state.server_time || null,
-      signed_until: signedState.signed_until || null,
+      products,
+      server_time: (signedState && signedState.server_time) || state.server_time || null,
+      signed_until: (signedState && signedState.signed_until) || null,
       need_recharge: !isActive,
       product_code: this.productCode,
       energy_balance: 0,

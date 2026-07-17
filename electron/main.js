@@ -37,11 +37,15 @@ let licenseClient = null;
 let commercialBuild = false;
 let releaseConfig = null;
 let updateClient = null;
+let updatePromptInFlight = false;
 let authMode = "license";
 let licenseRefreshTimer = null;
 let licenseRefreshInFlight = false;
 const BACKEND_PORT_CANDIDATES = [8000, 18472, 28800, 38765, 48899];
-const LICENSE_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
+// Revocations made in the account backend must reach an open client promptly.
+// The signed snapshot remains valid for short network outages, but an online
+// client re-checks the authoritative account endpoint once per minute.
+const LICENSE_REFRESH_INTERVAL_MS = 60 * 1000;
 
 function focusMainWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -215,7 +219,10 @@ async function enforceLicenseState(source = "timer") {
     }
     if (authMode === "account" && result && result.authenticated) {
       await clearLicenseContext();
-      return true;
+      const reason = result.reason || licenseClient.lastFailReason || "unauthorized_tool";
+      console.warn(`[license] account is authenticated but not entitled from ${source}: ${reason}`);
+      await navigateToActivation(reason);
+      return false;
     }
     const reason = (result && result.reason) || licenseClient.lastFailReason || "unknown";
     console.warn(`[license] verification failed from ${source}: ${reason}`);
@@ -253,7 +260,10 @@ function stopLicenseRefreshTimer() {
 
 async function requirePaidDesktopAction() {
   if (!commercialBuild || authMode !== "account" || !licenseClient) return { allowed: true };
-  const result = typeof licenseClient.verifyCached === "function" ? licenseClient.verifyCached() : await licenseClient.verify();
+  // Paid actions are an authorization boundary. Re-check the authoritative
+  // account endpoint instead of trusting a previously cached snapshot, so a
+  // server-side stop takes effect on the next action even before the timer.
+  const result = await licenseClient.verify();
   if (result && result.ok) {
     await syncLicenseContext();
     return { allowed: true };
@@ -280,12 +290,35 @@ async function requirePaidDesktopAction() {
   return { allowed: false, message: "请先完成手机号登录" };
 }
 
-async function checkForUpdatesOnStartup() {
-  if (!updateClient) return;
-  try {
-    const result = await updateClient.check();
-    if (!result.updateAvailable) return;
+async function downloadUpdateWithRetry(result) {
+  while (true) {
+    try {
+      const downloaded = await updateClient.downloadAndInstall();
+      if (downloaded && downloaded.success) return true;
+      throw new Error((downloaded && downloaded.error) || "安装包下载失败");
+    } catch (error) {
+      const retry = await dialog.showMessageBox(mainWindow || undefined, {
+        type: "error",
+        title: "更新失败",
+        message: error instanceof Error ? error.message : String(error),
+        detail: result.mandatory ? "必须完成签名、大小和 SHA-256 校验后才能继续使用。" : "可以稍后重试更新。",
+        buttons: result.mandatory ? ["重试", "退出"] : ["重试", "稍后"],
+        defaultId: 0,
+        cancelId: 1,
+        noLink: true
+      });
+      if (retry.response !== 0) {
+        if (result.mandatory) app.quit();
+        return false;
+      }
+    }
+  }
+}
 
+async function presentUpdate(result) {
+  if (!updateClient || !result || !result.updateAvailable || updatePromptInFlight) return;
+  updatePromptInFlight = true;
+  try {
     if (!result.mandatory) {
       const choice = await dialog.showMessageBox(mainWindow || undefined, {
         type: "info",
@@ -297,17 +330,7 @@ async function checkForUpdatesOnStartup() {
         cancelId: 0,
         noLink: true
       });
-      if (choice.response !== 1) return;
-      const downloaded = await updateClient.downloadAndInstall();
-      if (!downloaded.success) {
-        await dialog.showMessageBox(mainWindow || undefined, {
-          type: "error",
-          title: "更新失败",
-          message: downloaded.error || "安装包下载失败，请稍后重试。",
-          buttons: ["知道了"],
-          noLink: true
-        });
-      }
+      if (choice.response === 1) await downloadUpdateWithRetry(result);
       return;
     }
 
@@ -325,21 +348,19 @@ async function checkForUpdatesOnStartup() {
       app.quit();
       return;
     }
+    await downloadUpdateWithRetry(result);
+  } finally {
+    updatePromptInFlight = false;
+  }
+}
 
-    const downloaded = await updateClient.downloadAndInstall();
-    if (!downloaded.success) {
-      await dialog.showMessageBox(mainWindow || undefined, {
-        type: "error",
-        title: "更新失败",
-        message: downloaded.error || "安装包下载失败，无法继续使用当前版本。",
-        buttons: ["退出"],
-        noLink: true
-      });
-      app.quit();
-    }
+async function checkForUpdatesOnStartup() {
+  if (!updateClient) return;
+  try {
+    await updateClient.check();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    updateClient.emit("update-error", { error: message });
+    updateClient.emit("update-error", { error: message, source: "startup" });
   }
 }
 
@@ -941,9 +962,6 @@ ipcMain.handle("license:activate", async (_event, cardKey) => {
 });
 ipcMain.handle("license:verify", async () => {
   if (!commercialBuild || !licenseClient) return true;
-  if (authMode === "account" && typeof licenseClient.verifyCached === "function") {
-    return licenseClient.verifyCached().ok;
-  }
   return enforceLicenseState("ipc");
 });
 ipcMain.handle("license:logout", async () => {
@@ -976,13 +994,27 @@ ipcMain.handle("account:login", async (_event, phone, code) => {
   const result = await licenseClient.login(phone, code);
   if (result.success && result.active) {
     void syncLicenseContext().catch((error) => console.warn("[account] deferred local context sync failed:", error));
+  } else if (result.success) {
+    // A successful login can still be a free, expired, or disabled account.
+    // Never leave the previous account's local commercial context active.
+    await clearLicenseContext();
   }
   return result;
 });
 
 ipcMain.handle("account:me", async () => {
   if (!commercialBuild || authMode !== "account" || !licenseClient) return { success: true, user: null, active: true };
-  const verified = typeof licenseClient.verifyCached === "function" ? licenseClient.verifyCached() : await licenseClient.verify();
+  // This endpoint is the explicit account refresh action. It must ask the
+  // server, not replay the locally cached signed snapshot, so an admin stop
+  // or expiry is visible without restarting or manually forcing a reload.
+  const verified = await licenseClient.verify();
+  if (verified.ok) {
+    await syncLicenseContext();
+  } else {
+    // The UI refresh is also an authorization boundary. Clearing the local
+    // backend context makes a server-side stop effective immediately.
+    await clearLicenseContext();
+  }
   return { success: true, ok: verified.ok, authenticated: Boolean(verified.ok || verified.authenticated), reason: verified.reason || "", info: licenseClient.getInfo() };
 });
 
@@ -997,6 +1029,8 @@ ipcMain.handle("account:create-payment", async (_event, planId) => {
   if (!commercialBuild || authMode !== "account" || !licenseClient || typeof licenseClient.createPayment !== "function") {
     return { success: false, message: "账号支付服务未启用" };
   }
+  const access = await requirePaidDesktopAction();
+  if (!access.allowed) return { success: false, code: "membership_required", message: access.message };
   return licenseClient.createPayment(planId);
 });
 
@@ -1004,6 +1038,8 @@ ipcMain.handle("account:payment-status", async (_event, orderNo) => {
   if (!commercialBuild || authMode !== "account" || !licenseClient || typeof licenseClient.getPaymentStatus !== "function") {
     return { success: false, message: "账号支付服务未启用" };
   }
+  const access = await requirePaidDesktopAction();
+  if (!access.allowed) return { success: false, code: "membership_required", message: access.message };
   return licenseClient.getPaymentStatus(orderNo);
 });
 
@@ -1072,11 +1108,21 @@ app.whenReady().then(async () => {
   }
 
   createWindow();
-  void syncLicenseContext().catch((error) => console.error("[backend] startup synchronization failed:", error));
   backendReadyPromise = null;
+  // Verify the account before forwarding any cached entitlement to the local
+  // backend. This closes the startup window where a server-side revocation
+  // could otherwise be mistaken for the last locally cached snapshot.
+  const startupLicenseValid = await enforceLicenseState("startup");
+  if (startupLicenseValid) {
+    void syncLicenseContext().catch((error) => console.error("[backend] startup synchronization failed:", error));
+  }
   startLicenseRefreshTimer();
-  setTimeout(() => enforceLicenseState("startup").catch((error) => console.error("[license] startup verification failed:", error)), 800);
   updateClient = new UpdateClient({ app, config: releaseConfig, dataDir: dataDir(), mainWindow });
+  // The renderer already owns the update dialog and progress bar. Do not
+  // open a second native confirmation dialog here: the renderer receives
+  // update-available/update-progress/update-downloaded through preload and
+  // can show the complete state transition to the user.
+  updateClient.startRealtimeMonitoring();
   if (app.isPackaged) {
     setTimeout(() => checkForUpdatesOnStartup(), 5000);
   }
@@ -1089,5 +1135,6 @@ app.on("window-all-closed", () => {
 
 app.on("before-quit", () => {
   stopLicenseRefreshTimer();
+  if (updateClient) updateClient.stopRealtimeMonitoring();
   stopBackend();
 });

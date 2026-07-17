@@ -21,6 +21,7 @@ router = APIRouter(
 async def get_llm_configs(
     config_type: Optional[str] = Query(None, description="配置类型筛选: llm/image/video/audio"),
     force: bool = Query(False, description="是否强制绕过 30s 缓存,前端刷新按钮请传 true"),
+    local_only: bool = Query(False, description="仅读取本机配置,供桌面端本地配置管理器使用"),
 ):
     """获取所有大模型配置,支持按类型筛选。
     v3.59.64:支持 force=true 绕过云端配置 30s 缓存,适用于"用户在 web 改了立刻想在 C 端看到"。
@@ -32,7 +33,7 @@ async def get_llm_configs(
         # key_cache 整个清(用户改 key 也希望立刻生效)
         _key_cache.clear()
     try:
-        configs = await LLMService.get_all(config_type)
+        configs = await LLMService.get_all(config_type, local_only=local_only)
     except RuntimeError as e:
         msg = str(e)
         if "登录已失效" in msg or "登录已" in msg:
@@ -138,25 +139,25 @@ async def probe_models(req: ProbeModelsRequest):
 # ==================== 按 ID 操作(路径参数必须在静态路径之后) ====================
 
 @router.get("/{config_id}", response_model=LLMConfigResponse)
-async def get_llm_config(config_id: int):
+async def get_llm_config(config_id: int, local_only: bool = Query(False)):
     """获取单个大模型配置"""
-    config = await LLMService.get_by_id(config_id)
+    config = await LLMService.get_by_id(config_id, local_only=local_only)
     if not config:
         raise HTTPException(status_code=404, detail="配置不存在")
     return LLMService.to_public_config(config)
 
 
 @router.put("/{config_id}", response_model=LLMConfigResponse)
-async def update_llm_config(config_id: int, config: LLMConfigUpdate):
+async def update_llm_config(config_id: int, config: LLMConfigUpdate, local_only: bool = Query(False)):
     """更新大模型配置"""
-    updated = await LLMService.update(config_id, config)
+    updated = await LLMService.update(config_id, config, local_only=local_only)
     if not updated:
         raise HTTPException(status_code=404, detail="配置不存在")
     return LLMService.to_public_config(updated)
 
 
 @router.delete("/{config_id}")
-async def delete_llm_config(config_id: int):
+async def delete_llm_config(config_id: int, local_only: bool = Query(False)):
     """删除大模型配置"""
     deleted = await LLMService.delete(config_id)
     if not deleted:
@@ -165,7 +166,7 @@ async def delete_llm_config(config_id: int):
 
 
 @router.post("/{config_id}/test")
-async def test_llm_connection(config_id: int):
+async def test_llm_connection(config_id: int, local_only: bool = Query(False)):
     """测试大模型API连通性"""
-    result = await LLMService.test_connection(config_id)
+    result = await LLMService.test_connection(config_id, local_only=local_only)
     return result

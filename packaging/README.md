@@ -20,6 +20,8 @@ Electron `asar` 只是归档格式，不是加密。正式包不能包含 `src/`
 
 当前构建入口已接入后端 Nuitka 编译、PyInstaller 启动器、Electron 运行时组装、签名清单生成、发布扫描和 Inno Setup 安装包构建。构建时会在临时源码副本中生成提示词模板嵌入模块，正式发布目录不落地 `backend/data/wanshan_prompt_seed.json`。
 
+本机磁盘迁移：设置 `WANSHAN_BUILD_CACHE_DIR` 可将 Nuitka 后端缓存放到 D 盘；设置 `WANSHAN_DATA_DIR` 可将本机数据库、日志和生成媒体放到 D 盘。未设置时仍兼容 `%LOCALAPPDATA%` / `%APPDATA%` 默认路径。
+
 账号客户端已按 anyq.site 统一账户协议接入，客户端只检查 `products[]` 里的 `comic_shrimp` 产品和 `comic_course` 权益。服务器返回 `account_license` Ed25519 签名信封，客户端内置账号公钥验签；裸 JSON 字段被抓包篡改时不会解锁。协议边界包括：
 
 - 手机号验证码登录、账号校验和网页登录交接接口
@@ -41,7 +43,10 @@ Electron `asar` 只是归档格式，不是加密。正式包不能包含 `src/`
 - 必需权益：`comic_course`
 - 账号/充值服务器：`https://anyq.site`
 - 账号权益公钥：`CqLAEE2KnduTFtw1gVQIExS1qLRa-XI3TaWpbchMbKc`
-- 当前商业测试包：以后以 `release_config.json` 和发布目录为准
+- 当前商业包：`release/installer/comic-shrimp/0.1.23/漫剧虾Setup_0.1.23.exe`
+- 当前包 SHA-256：`f835706e49724eac21ae6f8a540548c268e314f29921f6004e4210024427ed15`
+- 当前包大小：`236800728` 字节
+- 当前 Authenticode：`NotSigned`；外发前必须使用 `-CodeSignThumbprint` 重新构建
 
 管理后台有多个产品时，漫剧虾必须使用 `comic_shrimp` 下单/发权益。不要选择直播复盘侠或运营虾，否则客户端会因产品码或权益不匹配拒绝解锁。
 
@@ -55,7 +60,7 @@ Electron `asar` 只是归档格式，不是加密。正式包不能包含 `src/`
   → 生成 integrity_manifest.json
   → 扫描发布目录
   → Inno Setup 生成安装包
-  → 生成 update.json
+  → 生成 update.json / release 记录
   → 安装到干净目录验证
   → Git LFS 上传安装包
 ```

@@ -12,7 +12,11 @@
 - 产品 ID / aud：`comic_shrimp`
 - 必需权益：`comic_course`
 - 当前工作区：账号登录版，源码运行已接入远端 `anyq.site`
-- 发布状态：发布前测试已通过，本轮文档更新尚未重新构建正式安装包
+- 发布状态：`0.1.23` 商业安装包已构建，发布前测试、后端冒烟测试和发布扫描通过
+- 当前版本：`0.1.23`
+- 安装包：`packaging/release/installer/comic-shrimp/0.1.23/漫剧虾Setup_0.1.23.exe`
+- 安装包 SHA-256：`f835706e49724eac21ae6f8a540548c268e314f29921f6004e4210024427ed15`
+- 代码签名：当前为 `NotSigned`；正式对外发布前需使用证书重新构建
 - 版本号：由 `packaging/build/Publish-ComicShrimp.ps1` 根据已有发布目录递增；不要只改 `package.json`
 
 账号登录、权益签名和产品隔离协议以统一账户契约为准；本机参考文件位于 `C:\Users\q2414\Desktop\live_watch\docs\ACCOUNT_PRODUCT_CONTRACT.md`。客户端只内置账号公钥和更新公钥，不保存服务端私钥、管理员令牌或模型 API Key。
@@ -57,7 +61,9 @@
 
 商业版使用手机号验证码登录。服务端返回 `account_license` Ed25519 签名信封，客户端校验 schema、签名、产品 ID、权益、时间范围和签发方后才建立本地授权上下文。客户端只检查 `products[]` 中的 `comic_shrimp` / `comic_course`，其他产品不能解锁漫剧虾。
 
-更新器只请求签名的产品更新接口，校验 `update-v1`、HTTPS 下载地址、版本约束、文件大小和 SHA-256。OSS 目录中新上传 EXE 不会直接触发更新。
+更新器只请求签名的产品更新接口，校验 `update-v1`、HTTPS 下载地址、版本约束、文件大小和 SHA-256。运行中会连接 `https://anyq.site/api/v1/releases/events?product_id=comic_shrimp` 监听 `release` 信号；事件内容只触发重新查询，不能直接触发安装。客户端同时每 60 秒轮询 `https://anyq.site/api/v1/releases/latest?product_id=comic_shrimp` 兜底。OSS 目录中新上传 EXE 不会直接触发更新。
+
+实时更新产品 ID 写死在客户端：漫剧虾只能使用 `comic_shrimp`；运营虾客户端应单独固定为 `operation_shrimp`，不能由网页、配置文件或用户输入切换。旧安装包没有 SSE 实时监听能力，必须重新打包并安装新版本后才会生效。普通更新只提示，签名载荷中的 `mandatory=true` 或当前版本低于 `min_supported_version` 时才会阻断使用；下载、签名、大小或 SHA-256 失败会显示错误并允许重试。
 
 ## 产品特点
 
@@ -80,7 +86,7 @@
 ### 运行桌面应用
 
 ```powershell
-cd C:\Users\q2414\Desktop\万山
+cd D:\万山项目
 npm install
 npm start
 ```
@@ -88,7 +94,7 @@ npm start
 ### 安装后端依赖
 
 ```powershell
-cd C:\Users\q2414\Desktop\万山
+cd D:\万山项目
 python -m pip install --only-binary=:all: -r backend\requirements.txt
 ```
 
@@ -121,7 +127,7 @@ docs/         设计说明、AI 接手说明和产品关键记录
 商业构建入口（只构建 `comic_shrimp`）：
 
 ```powershell
-cd C:\Users\q2414\Desktop\万山
+cd D:\万山项目
 $env:WANSHAN_MANIFEST_PRIVATE_KEY = (Get-Content "$env:LOCALAPPDATA\万山\build-keys\manifest_ed25519_private.txt" -Raw).Trim()
 pwsh -NoProfile -ExecutionPolicy Bypass -File packaging\build\Publish-ComicShrimp.ps1
 ```

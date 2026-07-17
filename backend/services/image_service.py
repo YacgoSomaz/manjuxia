@@ -2169,6 +2169,69 @@ class ImageService:
                 return await ImageService._save_base64_image(b64, f"image_{uuid.uuid4().hex[:8]}.{_ext_hint}")
         return None
 
+    @staticmethod
+    def _extract_image_payload(value: Any, key_hint: str = "") -> Optional[tuple[str, str]]:
+        """Extract an image from OpenAI-compatible and common proxy responses.
+
+        Some NewAPI/proxy deployments return ``image_url`` or a nested ``url``
+        instead of the OpenAI ``data[0].url`` shape. Keep this parser limited to
+        image-looking fields so a ``revised_prompt`` or other text is never
+        mistaken for an image result. The return value is ``(kind, value)``.
+        """
+        import re as _re
+
+        if value is None:
+            return None
+        if hasattr(value, "model_dump"):
+            try:
+                value = value.model_dump()
+            except Exception:
+                pass
+        elif hasattr(value, "to_dict"):
+            try:
+                value = value.to_dict()
+            except Exception:
+                pass
+
+        hint = (key_hint or "").lower()
+        if isinstance(value, str):
+            candidate = value.strip()
+            if candidate.startswith(("http://", "https://", "data:image/")):
+                return ("url", candidate)
+            if "content" in hint or "markdown" in hint:
+                match = _re.search(r"!\[[^\]]*\]\((https?://[^)\s]+|data:image/[^)]+)\)", candidate)
+                if match:
+                    return ("url", match.group(1))
+                match = _re.search(r"https?://\S+", candidate)
+                if match:
+                    return ("url", match.group(0).rstrip(".,)"))
+            if "base64" in hint or hint in {"b64", "b64_json", "image_data"}:
+                if len(candidate) >= 32:
+                    return ("base64", candidate)
+            return None
+        if isinstance(value, list):
+            for item in value:
+                found = ImageService._extract_image_payload(item, hint)
+                if found:
+                    return found
+            return None
+        if not isinstance(value, dict):
+            return None
+
+        priority = (
+            "url", "image_url", "imageUrl", "img_url", "imgUrl", "image",
+            "b64_json", "base64", "image_data", "data", "output", "result",
+            "images", "choices", "content",
+        )
+        for key in priority:
+            if key not in value or value[key] in (None, "", [], {}):
+                continue
+            child_hint = key.lower()
+            found = ImageService._extract_image_payload(value[key], child_hint)
+            if found:
+                return found
+        return None
+
     # v3.61.189:KKAI(mooko/kkone)OpenAI 兼容图片生成 — output_format 必需
     # v3.61.193:edits(图生图/溶图)改 multipart/form-data — 实测 JSON image 数组一律 400,只认 multipart 文件
     @staticmethod
@@ -2509,23 +2572,19 @@ class ImageService:
                         continue
                     return None
 
-                image_data = response.data[0]
-
-                # 优先处理 URL 格式
-                if hasattr(image_data, 'url') and image_data.url:
+                payload = ImageService._extract_image_payload(response.data[0])
+                if payload:
+                    kind, image_value = payload
                     if attempt > 1:
                         _logger.info(f"[images.generate] 第 {attempt} 次尝试成功 model={model}")
-                    return image_data.url
+                    if kind == "base64":
+                        import uuid
+                        return await ImageService._save_base64_image(
+                            image_value, f"image_{uuid.uuid4().hex[:8]}.png"
+                        )
+                    return image_value
 
-                # 处理 base64 格式
-                if hasattr(image_data, 'b64_json') and image_data.b64_json:
-                    import uuid
-                    filename = f"image_{uuid.uuid4().hex[:8]}.png"
-                    if attempt > 1:
-                        _logger.info(f"[images.generate] 第 {attempt} 次尝试成功(b64) model={model}")
-                    return await ImageService._save_base64_image(image_data.b64_json, filename)
-
-                _logger.warning(f"[images.generate] data[0] 既无 url 也无 b64_json model={model}")
+                _logger.warning(f"[images.generate] 返回中没有可用图片字段 model={model} attempt={attempt}/{max_attempts}")
                 if attempt < max_attempts:
                     continue
                 return None

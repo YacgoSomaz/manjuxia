@@ -371,3 +371,48 @@ test("account client rejects Unicode-escaped duplicate keys and invalid signed t
     assert.match(login.message, new RegExp(reason));
   }
 });
+
+test("account client refresh observes a server-side product stop instead of replaying cache", async () => {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  const accountPublicKey = rawPublicKey(publicKey);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "manjuxia-account-revoked-"));
+  const nowMs = 1_700_000_000_000;
+  const user = { id: 12, phone: "13400134000", role: "regular" };
+  const expiresAt = new Date(nowMs + 86400_000).toISOString();
+  const activeProducts = [{ product_id: "comic_shrimp", status: "active", expires_at: expiresAt, entitlements: ["comic_course"] }];
+  const revokedProducts = [{ product_id: "comic_shrimp", status: "disabled", expires_at: expiresAt, entitlements: ["comic_course"] }];
+  let serverProducts = activeProducts;
+  const fetchImpl = async (url) => {
+    if (url.endsWith("/api/auth/login")) {
+      return jsonResponse(
+        { ok: true, user, products: serverProducts, account_license: createSignedAccount({ privateKey, user, products: serverProducts }) },
+        { "set-cookie": "wz_session=revocation-token; Path=/; HttpOnly; Secure; SameSite=Lax" }
+      );
+    }
+    if (url.endsWith("/api/auth/me")) {
+      return jsonResponse({ ok: true, user, products: serverProducts, account_license: createSignedAccount({ privateKey, user, products: serverProducts }) });
+    }
+    throw new Error(`unexpected url ${url}`);
+  };
+  const client = new AccountClient({
+    baseUrl: "https://anyq.site",
+    publicKey: { "account-v1": accountPublicKey },
+    productCode: "comic_shrimp",
+    dataPath: path.join(tempDir, "account.dat"),
+    safeStorage: fakeStorage(),
+    fetchImpl,
+    now: () => nowMs
+  });
+
+  const login = await client.login(user.phone, "123456");
+  assert.equal(login.success, true);
+  assert.equal(client.verifyCached().ok, true);
+
+  serverProducts = revokedProducts;
+  const refreshed = await client.verify();
+  assert.equal(refreshed.ok, false);
+  assert.equal(refreshed.authenticated, true);
+  assert.equal(refreshed.reason, "unauthorized_tool");
+  assert.equal(client.verifyCached().ok, false);
+  assert.equal(client.getInfo().active, false);
+});

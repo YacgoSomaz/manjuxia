@@ -9,7 +9,7 @@
 - 千山前端包：`D:\qianshan\xiaoyangmengjuchang\resources\app.asar`
 - 千山版本：`3.61.381`
 - 千山更新源：`https://qianshan-ai.oss-cn-chengdu.aliyuncs.com/xiaoshuotool/app/3.61.381/`
-- 万山源码目录：`C:\Users\q2414\Desktop\万山`
+- 万山源码目录：`D:\万山项目`
 
 注意：千山目录里包含 `data/app.db*`、日志、缓存、`__pycache__` 和历史备份库。这些是运行数据，不应复制进万山源码或商业包。
 

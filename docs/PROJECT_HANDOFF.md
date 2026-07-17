@@ -1,6 +1,6 @@
 # 漫剧虾项目交接说明
 
-更新时间：2026-07-15
+更新时间：2026-07-17
 
 这份文档面向下一位开发者或 AI。先读本文件，再读 `PROJECT_FILE_MAP.md`，最后按 `CHANGELOG.md` 回看历史。不要凭截图猜问题，先确认运行形态、接口边界和实际日志。
 
@@ -14,6 +14,8 @@
 
 当前工作区是 `comic_shrimp` 账号登录版，不是旧的卡密激活版。开发版和商业包应保持同一产品协议。
 
+当前发布版本：`0.1.23`。安装包位于 `packaging/release/installer/comic-shrimp/0.1.23/漫剧虾Setup_0.1.23.exe`，大小 `236800728` 字节，SHA-256 为 `f835706e49724eac21ae6f8a540548c268e314f29921f6004e4210024427ed15`。本次构建的发布扫描、完整性清单签名和后端冒烟测试均通过；安装包 Authenticode 当前为 `NotSigned`，正式外发前需要证书签名。
+
 ## 2. 三层边界
 
 ### 远端账号层
@@ -25,6 +27,8 @@
 - 远端返回：`account_license` Ed25519 签名信封
 - 客户端校验：schema、typ、iss、aud、key_id、签名、时间窗口、产品和权益
 - 本地缓存：Electron `safeStorage` 加密保存 Cookie、签名权益快照和刷新所需状态
+
+权益撤销时序：启动先请求 `/api/auth/me` 并验签，确认仍有 `comic_shrimp` + `comic_course` 后才把权益同步给本地后端；运行中每 60 秒重查一次；所有付费操作再次走远端校验。服务器明确返回停用、过期或未授权时，客户端清空本地后端上下文并回到账号页。网络短暂失败才允许继续使用仍在有效期内的已验签快照。
 
 客户端只使用签名载荷中的产品信息。不能根据未签名根字段、前端状态或本地数据库直接解锁高价值功能。
 
@@ -41,6 +45,10 @@
 - 客户端只接受签名的 `update-v1` 发布载荷。
 - 下载必须是 `https://download.anyq.site/` 下的 `.exe`，无 query/hash，并校验版本、字节数和 SHA-256。
 - `mandatory=true` 或低于签名的 `min_supported_version` 才阻止启动；普通更新只提示。
+- 漫剧虾运行中固定连接 `https://anyq.site/api/v1/releases/events?product_id=comic_shrimp`，只监听 `release` 事件。SSE 事件内容一律不可信，只触发重新请求 `https://anyq.site/api/v1/releases/latest?product_id=comic_shrimp`，仍必须完整验证 schema、alg、key_id、签名、aud/product_id、时间窗口、版本、HTTPS 地址、大小和 SHA-256。
+- 客户端每 60 秒执行一次普通签名更新检查，作为 SSE 断线、代理缓存或漏事件时的兜底；SSE 断线自动重连，同一客户端只允许一个连接。
+- 应用退出时会关闭 SSE 长连接并清理重连/轮询定时器。旧安装包没有这项能力，必须重新打包并安装新版本后才会生效。
+- 运营虾不是本仓库产品；其客户端必须独立固定 `operation_shrimp`，不能复用漫剧虾的产品 ID，也不能由网页、配置文件或用户输入切换产品。
 
 ## 3. 最近已完成的关键修复
 
@@ -80,16 +88,17 @@ createSplashWindow
 ```text
 npm run check                         project ok
 python -m unittest backend/test_wanshan_prompt_seed_payload.py   3/3
-node --test tests/*.test.js           48/48
-发布前测试子集                        26/26
+node --test tests/*.test.js           53/53
+发布前测试子集                        27/27
+node tests/e2e/frontend-mock-smoke.cjs  mock_ui_visible=true, mock_network_failures=0
 ```
 
-本轮没有重新构建正式安装包。发布脚本通过后才允许进入 Nuitka/Inno 构建。
+`0.1.23` 已完成 Nuitka/Inno 正式构建。后端商业冒烟测试报告 `health OK; 22 storyboard templates; novel upload id=1`，发布目录生成了 `integrity_manifest.json`、`integrity_manifest.sig`，并通过发布扫描。后续版本仍必须在构建结束后核对安装包 SHA-256 和 Authenticode 状态。
 
 ## 5. 开发启动
 
 ```powershell
-cd C:\Users\q2414\Desktop\万山
+cd D:\万山项目
 npm install
 python -m pip install --only-binary=:all: -r backend\requirements.txt
 npm start
@@ -126,7 +135,8 @@ npm start
 | 无会员却启动即被挡 | `electron/account-client.js`、`backend/utils/commercial_guard.py` | 把登录态、会员态和功能门槛混用；登录可进工作台，具体付费动作再拦截 |
 | 启动器黑窗/启动很慢 | `electron/main.js`、`packaging/build/Build-Launcher.ps1` | 启动器窗口样式、后端握手等待或 Nuitka 后端冷启动 |
 | 覆盖安装后启动失败 | `packaging/installer/万山.iss`、`electron/release-guard.js` | 旧进程未退出、文件清单不一致、旧安装残留或清单签名不匹配 |
-| 更新器未提示 | `electron/update-client.js`、`release_config.json` | 没有签名 `update_release`、产品 ID 不对、版本未超过当前版本或下载地址不合规 |
+| 更新器未提示 | `electron/update-client.js`、`electron/main.js`、`release_config.json` | 没有签名 `update_release`、产品 ID 不对、版本未超过当前版本、SSE 尚未包含在旧包或下载地址不合规 |
+| 运行中更新未触发 | `electron/update-client.js` | SSE 只负责触发重新查询；检查 SSE 地址的产品 ID、`release` 事件、60 秒轮询和重连状态，不要直接信任事件字段 |
 
 ## 8. 禁止提交的内容
 

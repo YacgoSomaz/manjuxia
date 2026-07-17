@@ -112,8 +112,11 @@
       .wlc-list{display:flex;flex-direction:column;gap:8px;max-height:58vh;overflow:auto}
       .wlc-item{border:1px solid rgba(100,181,246,.18);border-radius:8px;padding:10px;background:rgba(255,255,255,.035);cursor:pointer}
       .wlc-item.active{border-color:#409eff;background:rgba(64,158,255,.16)}
+      .wlc-item-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
       .wlc-item-title{font-weight:650;margin-bottom:4px}
+      .wlc-item-delete{flex:0 0 auto;padding:4px 8px;font-size:12px}
       .wlc-item-meta{font-size:12px;color:rgba(220,240,255,.62);word-break:break-all}
+      .wlc-item-result{margin-top:6px;font-size:12px;white-space:pre-wrap;color:#ffb4b4}
       .wlc-empty{padding:24px 12px;text-align:center;color:rgba(220,240,255,.62);border:1px dashed rgba(100,181,246,.22);border-radius:8px}
       .wlc-form{border:1px solid rgba(100,181,246,.18);border-radius:8px;padding:14px;background:rgba(255,255,255,.025)}
       .wlc-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
@@ -169,6 +172,22 @@
 
   function typeLabel(type) {
     return (TYPES.find((item) => item[0] === type) || TYPES[0])[1];
+  }
+
+  function normalizeType(value) {
+    return TYPES.some(([type]) => type === value) ? value : "";
+  }
+
+  function detectPageType() {
+    const active = document.querySelector(
+      ".config-tabs .el-tabs__item.is-active, .settings-tabs .el-tabs__item.is-active"
+    );
+    const label = active ? (active.textContent || "") : "";
+    if (label.includes("视频")) return "video";
+    if (label.includes("图片") || label.includes("图像")) return "image";
+    if (label.includes("语音") || label.includes("音频")) return "audio";
+    if (label.includes("语言") || label.includes("大语言") || label.includes("对话")) return "llm";
+    return "";
   }
 
   function el(tag, attrs, children) {
@@ -232,7 +251,7 @@
   }
 
   async function loadConfigs() {
-    configs = await api(`/api/llm-configs/?config_type=${encodeURIComponent(currentType)}&force=true`);
+    configs = await api(`/api/llm-configs/?config_type=${encodeURIComponent(currentType)}&force=true&local_only=true`);
     configs = Array.isArray(configs) ? configs : [];
   }
 
@@ -278,7 +297,7 @@
       result.textContent = "";
       const payload = buildPayload(form);
       if (editing) {
-        await api(`/api/llm-configs/${editing.id}`, { method: "PUT", body: JSON.stringify(payload) });
+        await api(`/api/llm-configs/${editing.id}?local_only=true`, { method: "PUT", body: JSON.stringify(payload) });
       } else {
         await api("/api/llm-configs/", { method: "POST", body: JSON.stringify(payload) });
       }
@@ -294,7 +313,7 @@
   async function deleteConfig(id, result) {
     if (!confirm("确定删除这条本地模型配置吗？")) return;
     try {
-      await api(`/api/llm-configs/${id}`, { method: "DELETE" });
+      await api(`/api/llm-configs/${id}?local_only=true`, { method: "DELETE" });
       await loadConfigs();
       editing = null;
       renderModal();
@@ -307,7 +326,7 @@
   async function testConfig(id, result) {
     try {
       result.textContent = "正在测试...";
-      const data = await api(`/api/llm-configs/${id}/test`, { method: "POST" });
+      const data = await api(`/api/llm-configs/${id}/test?local_only=true`, { method: "POST" });
       result.textContent = (data && data.success ? "测试成功: " : "测试失败: ") + ((data && data.message) || JSON.stringify(data));
     } catch (error) {
       result.textContent = "测试失败: " + (error.message || error);
@@ -430,14 +449,27 @@
       document.body.appendChild(mask);
     }
     const list = configs.length
-      ? el("div", { class: "wlc-list" }, configs.map((cfg) => el("div", {
-          class: "wlc-item" + (editing && editing.id === cfg.id ? " active" : ""),
-          onclick: () => { editing = cfg; renderModal(); },
-        }, [
-          el("div", { class: "wlc-item-title", text: cfg.name || `配置#${cfg.id}` }),
-          el("div", { class: "wlc-item-meta", text: cfg.model_name || "" }),
-          el("div", { class: "wlc-item-meta", text: cfg.base_url || "" }),
-        ])))
+      ? el("div", { class: "wlc-list" }, configs.map((cfg) => {
+          const itemResult = el("div", { class: "wlc-item-result" });
+          return el("div", {
+            class: "wlc-item" + (editing && editing.id === cfg.id ? " active" : ""),
+            onclick: () => { editing = cfg; renderModal(); },
+          }, [
+            el("div", { class: "wlc-item-head" }, [
+              el("div", { class: "wlc-item-title", text: cfg.name || `配置#${cfg.id}` }),
+              el("button", {
+                class: "wlc-btn danger wlc-item-delete",
+                type: "button",
+                title: "删除此配置",
+                onclick: (event) => { event.stopPropagation(); deleteConfig(cfg.id, itemResult); },
+                text: "删除",
+              }),
+            ]),
+            el("div", { class: "wlc-item-meta", text: cfg.model_name || "" }),
+            el("div", { class: "wlc-item-meta", text: cfg.base_url || "" }),
+            itemResult,
+          ]);
+        }))
       : el("div", { class: "wlc-empty", text: loadError || `暂无${typeLabel(currentType)}配置` });
     mask.replaceChildren(el("div", { class: "wlc-dialog" }, [
       el("div", { class: "wlc-head" }, [
@@ -468,7 +500,8 @@
     if (node) node.remove();
   }
 
-  async function openModal() {
+  async function openModal(preferredType) {
+    currentType = normalizeType(preferredType) || detectPageType() || currentType || "llm";
     editing = null;
     loadError = "";
     configs = [];
@@ -515,7 +548,7 @@
         el("span", { text: " 使用本机加密配置；选厂商、填 Key 即可。" }),
       ]),
       el("div", { class: "wlc-bar-actions" }, [
-        el("button", { class: "wlc-btn primary", onclick: openModal, text: "一键本地配置" }),
+        el("button", { class: "wlc-btn primary", onclick: () => openModal(detectPageType()), text: "一键本地配置" }),
       ]),
     ]);
     anchor.insertAdjacentElement("afterend", bar);
