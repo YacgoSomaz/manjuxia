@@ -24,7 +24,7 @@ class QianshanStoryboardLabTests(unittest.TestCase):
     def test_default_storyboard_template_matches_qianshan_slow_pace_default(self):
         self.assertEqual(DEFAULT_STORYBOARD_TEMPLATE_ID, 23)
 
-    def test_history_reads_only_prior_qianshan_lab_inputs(self):
+    def test_history_reads_prior_lab_inputs_and_final_outputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "app.db"
             connection = sqlite3.connect(db_path)
@@ -32,6 +32,8 @@ class QianshanStoryboardLabTests(unittest.TestCase):
                 """
                 CREATE TABLE novels (id INTEGER PRIMARY KEY, name TEXT, created_at TEXT);
                 CREATE TABLE chapters (id INTEGER PRIMARY KEY, novel_id INTEGER, title TEXT, content TEXT, sort_order INTEGER, updated_at TEXT);
+                CREATE TABLE llm_logs (id INTEGER PRIMARY KEY, novel_id INTEGER, task_type TEXT, status TEXT, output_content TEXT, created_at TEXT);
+                CREATE TABLE storyboards (id INTEGER PRIMARY KEY, novel_id INTEGER, description TEXT, sort_order INTEGER);
                 """
             )
             connection.execute(
@@ -43,12 +45,32 @@ class QianshanStoryboardLabTests(unittest.TestCase):
                 ("普通小说", "2026-07-17 10:11:10"),
             )
             connection.execute(
+                "INSERT INTO novels VALUES (3, ?, ?)",
+                ("万山分镜实验-20260717-101212", "2026-07-17 10:12:12"),
+            )
+            connection.execute(
                 "INSERT INTO chapters VALUES (1, 1, ?, ?, 1, ?)",
                 ("直发场景", "我的历史提问", "2026-07-17 10:10:11"),
             )
             connection.execute(
                 "INSERT INTO chapters VALUES (2, 2, ?, ?, 1, ?)",
                 ("普通章节", "不应出现在实验历史", "2026-07-17 10:11:11"),
+            )
+            connection.execute(
+                "INSERT INTO chapters VALUES (3, 3, ?, ?, 1, ?)",
+                ("直发场景", "有落库输出的历史提问", "2026-07-17 10:12:13"),
+            )
+            connection.execute(
+                "INSERT INTO llm_logs VALUES (1, 1, ?, ?, ?, ?)",
+                ("storyboard_generate", "success", "模型最终输出", "2026-07-17 10:10:12"),
+            )
+            connection.execute(
+                "INSERT INTO storyboards VALUES (1, 3, ?, 2)",
+                ("落库分镜二",),
+            )
+            connection.execute(
+                "INSERT INTO storyboards VALUES (2, 3, ?, 1)",
+                ("落库分镜一",),
             )
             connection.commit()
             connection.close()
@@ -59,8 +81,13 @@ class QianshanStoryboardLabTests(unittest.TestCase):
             ):
                 history = get_qianshan_lab_history(limit=20)
 
-        self.assertEqual(history[0]["input_text"], "我的历史提问")
-        self.assertEqual(len(history), 1)
+        by_run_id = {row["run_id"]: row for row in history}
+        self.assertEqual(len(history), 2)
+        self.assertEqual(by_run_id[1]["input_text"], "我的历史提问")
+        self.assertEqual(by_run_id[1]["output_text"], "模型最终输出")
+        self.assertEqual(by_run_id[1]["output_source"], "llm_log")
+        self.assertEqual(by_run_id[3]["output_text"], "落库分镜一\n\n---\n\n落库分镜二")
+        self.assertEqual(by_run_id[3]["output_source"], "storyboards")
 
     def test_summarize_storyboards_decodes_json_fields(self):
         rows = [
