@@ -12,7 +12,9 @@ test("青山实验中 uses the Qianshan network-backend experiment route", () =>
 
   assert.match(launcher, /WANSHAN_ENABLE_QIANSHAN_LAB/);
   assert.match(launcher, /WANSHAN_LAUNCH_QIANSHAN_LAB/);
+  assert.match(launcher, /WANSHAN_QINGSHAN_EXPERIMENT/);
   assert.match(launcher, /qianshan-storyboard-lab/);
   assert.match(page, /\/api\/qianshan-lab\/storyboard-stream/);
   assert.match(page, /qianshan_direct/);
+  assert.match(page, /qianshanOnly/);
 });
