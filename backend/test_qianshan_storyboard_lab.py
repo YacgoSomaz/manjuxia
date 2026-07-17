@@ -1,6 +1,9 @@
 import json
 import os
+from pathlib import Path
+import sqlite3
 import sys
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -11,6 +14,7 @@ from services.qianshan_storyboard_lab import (
     DIRECT_PROMPT_MODE_CLEAN,
     DIRECT_PROMPT_MODE_TWO_STEP,
     _build_clean_direct_messages,
+    get_qianshan_lab_history,
     get_storyboard_direct_status,
     summarize_storyboards,
 )
@@ -19,6 +23,44 @@ from services.qianshan_storyboard_lab import (
 class QianshanStoryboardLabTests(unittest.TestCase):
     def test_default_storyboard_template_matches_qianshan_slow_pace_default(self):
         self.assertEqual(DEFAULT_STORYBOARD_TEMPLATE_ID, 23)
+
+    def test_history_reads_only_prior_qianshan_lab_inputs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "app.db"
+            connection = sqlite3.connect(db_path)
+            connection.executescript(
+                """
+                CREATE TABLE novels (id INTEGER PRIMARY KEY, name TEXT, created_at TEXT);
+                CREATE TABLE chapters (id INTEGER PRIMARY KEY, novel_id INTEGER, title TEXT, content TEXT, sort_order INTEGER, updated_at TEXT);
+                """
+            )
+            connection.execute(
+                "INSERT INTO novels VALUES (1, ?, ?)",
+                ("千山分镜直发观察-20260717-101010", "2026-07-17 10:10:10"),
+            )
+            connection.execute(
+                "INSERT INTO novels VALUES (2, ?, ?)",
+                ("普通小说", "2026-07-17 10:11:10"),
+            )
+            connection.execute(
+                "INSERT INTO chapters VALUES (1, 1, ?, ?, 1, ?)",
+                ("直发场景", "我的历史提问", "2026-07-17 10:10:11"),
+            )
+            connection.execute(
+                "INSERT INTO chapters VALUES (2, 2, ?, ?, 1, ?)",
+                ("普通章节", "不应出现在实验历史", "2026-07-17 10:11:11"),
+            )
+            connection.commit()
+            connection.close()
+
+            with patch(
+                "services.qianshan_storyboard_lab.get_qianshan_db_path",
+                return_value=db_path,
+            ):
+                history = get_qianshan_lab_history(limit=20)
+
+        self.assertEqual(history[0]["input_text"], "我的历史提问")
+        self.assertEqual(len(history), 1)
 
     def test_summarize_storyboards_decodes_json_fields(self):
         rows = [
