@@ -549,7 +549,12 @@ async def get_storyboard_direct_status() -> Dict[str, Any]:
             item["matched_wanshan_content_length"] = len(local_match.get("content") or "")
             item["content_source"] = "wanshan_same_name"
         enriched_style_templates.append(item)
-    configs = await LLMService.get_all("llm")
+    # 模板目录来自旧版千山本地库，不能因为万山模型配置暂不可用而
+    # 阻塞实验室选模板。模型下拉框允许以空列表降级，前端会保留千山默认配置。
+    try:
+        configs = await LLMService.get_all("llm")
+    except Exception:
+        configs = []
     deepseek_configs = [
         item for item in configs
         if "deepseek" in (item.get("base_url") or "").lower()
