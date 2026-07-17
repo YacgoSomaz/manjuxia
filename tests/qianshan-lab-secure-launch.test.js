@@ -22,3 +22,11 @@ test("Qianshan lab history renders both the submitted input and returned output"
   assert.match(page, /历史输入/);
   assert.match(page, /历史输出/);
 });
+
+test("Qianshan lab history opens in a closeable modal without replacing live output", () => {
+  assert.match(page, /id="historyModal"/);
+  assert.match(page, /id="historyModalClose"/);
+  assert.match(page, /function openHistoryModal\(/);
+  assert.match(page, /function closeHistoryModal\(/);
+  assert.match(page, /historyMessages/);
+});
