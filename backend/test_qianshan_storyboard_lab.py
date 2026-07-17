@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 sys.path.insert(0, os.path.dirname(__file__))
 
 from services.qianshan_storyboard_lab import (
+    DEFAULT_STORYBOARD_TEMPLATE_ID,
     DIRECT_PROMPT_MODE_CLEAN,
     DIRECT_PROMPT_MODE_TWO_STEP,
     _build_clean_direct_messages,
@@ -16,6 +17,9 @@ from services.qianshan_storyboard_lab import (
 
 
 class QianshanStoryboardLabTests(unittest.TestCase):
+    def test_default_storyboard_template_matches_qianshan_slow_pace_default(self):
+        self.assertEqual(DEFAULT_STORYBOARD_TEMPLATE_ID, 23)
+
     def test_summarize_storyboards_decodes_json_fields(self):
         rows = [
             {
