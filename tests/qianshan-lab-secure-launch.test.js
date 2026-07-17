@@ -15,3 +15,10 @@ test("Qianshan lab signs its local API requests and has an Electron launch gate"
   assert.match(main, /WANSHAN_LAUNCH_QIANSHAN_LAB/);
   assert.match(main, /qianshan-storyboard-lab/);
 });
+
+test("Qianshan lab history renders both the submitted input and returned output", () => {
+  assert.match(page, /run\.input_text/);
+  assert.match(page, /run\.output_text/);
+  assert.match(page, /历史输入/);
+  assert.match(page, /历史输出/);
+});
