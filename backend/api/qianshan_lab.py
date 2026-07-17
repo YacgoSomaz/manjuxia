@@ -1,6 +1,6 @@
 import json
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -11,6 +11,7 @@ from services.qianshan_storyboard_lab import (
     DEFAULT_STORYBOARD_TEMPLATE_ID,
     QianshanLabError,
     get_qianshan_status,
+    get_qianshan_lab_history,
     get_storyboard_direct_status,
     run_qianshan_storyboard_pipeline,
     stream_direct_storyboard_pipeline,
@@ -60,6 +61,14 @@ async def qianshan_lab_status():
 async def qianshan_lab_direct_status():
     try:
         return await get_storyboard_direct_status()
+    except QianshanLabError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/history")
+async def qianshan_lab_history(limit: int = Query(100, ge=1, le=100)):
+    try:
+        return {"runs": get_qianshan_lab_history(limit=limit)}
     except QianshanLabError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

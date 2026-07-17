@@ -559,6 +559,7 @@
       <div class="actions">
         <button id="runBtn">直发千山分镜</button>
         <button id="sampleBtn" class="secondary">填入样例</button>
+        <button id="historyBtn" class="secondary">历史提问</button>
         <div id="status" class="status">正在读取配置...</div>
       </div>
     </section>
@@ -1075,6 +1076,46 @@
         : `千山后端未连接；DeepSeek 对照配置 ${configs.length} 个，分镜模板 ${templates.length} 个`;
     }
 
+    function renderHistory(runs) {
+      messages.innerHTML = "";
+      if (!runs.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "还没有可显示的千山实验历史。";
+        messages.append(empty);
+        return;
+      }
+      runs.forEach((run) => {
+        const node = document.createElement("article");
+        node.className = "msg";
+        const heading = document.createElement("div");
+        heading.className = "msg-title";
+        const name = document.createElement("span");
+        name.textContent = run.run_name || "未命名实验";
+        const stamp = document.createElement("span");
+        stamp.className = "pill warn";
+        stamp.textContent = run.updated_at || run.run_created_at || "历史记录";
+        heading.append(name, stamp);
+        const meta = document.createElement("div");
+        meta.className = "sub";
+        meta.textContent = `${run.chapter_title || "输入内容"} · 运行 ${run.run_id}`;
+        const text = document.createElement("pre");
+        text.className = "stream-output";
+        text.textContent = run.input_text || "";
+        node.append(heading, meta, text);
+        messages.append(node);
+      });
+    }
+
+    async function loadHistory() {
+      statusEl.textContent = "正在读取历史提问...";
+      const response = await signedLocalFetch("/api/qianshan-lab/history?limit=100");
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "读取历史提问失败");
+      renderHistory(Array.isArray(data.runs) ? data.runs : []);
+      statusEl.textContent = `已加载 ${Array.isArray(data.runs) ? data.runs.length : 0} 条历史提问`;
+    }
+
     function buildRequest(overrides = {}) {
       const mode = $("promptMode").value;
       const text = $("sourceText").value.trim();
@@ -1252,6 +1293,11 @@
 
     runBtn.addEventListener("click", run);
     batchRunBtn.addEventListener("click", runBatch);
+    historyBtn.addEventListener("click", () => {
+      loadHistory().catch((err) => {
+        statusEl.textContent = err.message;
+      });
+    });
     $("promptMode").addEventListener("change", () => updateModeState(false));
     $("thinkingMode").addEventListener("change", () => updateModeState(false));
     $("templatePickerBtn").addEventListener("click", openTemplateModal);

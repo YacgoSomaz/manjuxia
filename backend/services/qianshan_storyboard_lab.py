@@ -242,6 +242,47 @@ def get_qianshan_db_path() -> Path:
     return Path(appdata) / "小洋梦剧场" / "data" / "app.db"
 
 
+def get_qianshan_lab_history(limit: int = 100) -> List[Dict[str, Any]]:
+    """Return the user's prior lab input text from the old Qianshan database.
+
+    The lab creates a dedicated novel and chapter for each Qianshan run. This
+    query is deliberately read-only and only selects those dedicated run names.
+    """
+    db_path = get_qianshan_db_path()
+    if not db_path.exists():
+        return []
+    safe_limit = max(1, min(int(limit or 100), 100))
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                """
+                SELECT
+                    n.id AS run_id,
+                    n.name AS run_name,
+                    n.created_at AS run_created_at,
+                    c.id AS chapter_id,
+                    c.title AS chapter_title,
+                    c.content AS input_text,
+                    c.sort_order,
+                    c.updated_at
+                FROM novels AS n
+                INNER JOIN chapters AS c ON c.novel_id = n.id
+                WHERE (n.name LIKE ? OR n.name LIKE ?)
+                  AND COALESCE(c.content, '') != ''
+                ORDER BY COALESCE(c.updated_at, n.created_at) DESC, n.id DESC, c.sort_order ASC
+                LIMIT ?
+                """,
+                ("千山分镜直发观察-%", "万山分镜实验-%", safe_limit),
+            ).fetchall()
+        finally:
+            con.close()
+        return [dict(row) for row in rows]
+    except Exception as exc:
+        raise QianshanLabError(f"读取千山实验历史失败: {exc}") from exc
+
+
 def get_qianshan_storyboard_templates_from_db() -> List[Dict[str, Any]]:
     db_path = get_qianshan_db_path()
     if not db_path.exists():
