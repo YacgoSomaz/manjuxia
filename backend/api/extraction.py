@@ -6,7 +6,7 @@ import base64
 import logging
 import secrets  # v3.61.202:原子写 tmp 文件名加随机 token,防并发抢同一 tmp
 from typing import Any, Literal, Optional, List
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Form
 from pydantic import BaseModel
 
 # v3.61.165: 修 create_character_variant / _safe_remove_file 等用了 logger 但模块顶部没 import 导致
@@ -55,6 +55,141 @@ async def _ensure_variant_visible(variant_id: int) -> dict:
         raise HTTPException(status_code=404, detail="马甲不存在")
     await _ensure_element_visible(variant.get("element_id"))
     return variant
+
+
+# v3.61.383: 千山同源的本地音色能力。路由放在 /{element_id} 之前，避免 voices 被当成数字 ID。
+class BindVoiceRequest(BaseModel):
+    voice_id: Optional[str] = None
+
+
+class VoicePreviewRequest(BaseModel):
+    voice_id: str
+    text: Optional[str] = None
+
+
+class PolishDescriptionRequest(BaseModel):
+    llm_config_id: Optional[int] = None
+    instruction: Optional[str] = None
+    current_description: Optional[str] = None
+
+
+async def _copy_voice_source_to_standard_audio(src_path: str, element: dict, variant: Optional[dict] = None) -> str:
+    if not src_path or not os.path.exists(src_path):
+        raise HTTPException(status_code=400, detail="音频文件不存在，请重新选择音色")
+    novel = await NovelService.get_by_id(element.get("novel_id"))
+    novel_part = ImageService._safe_name_part((novel or {}).get("name"), 24) or "未命名小说"
+    name_part = ImageService._safe_name_part(element.get("name"), 24) or f"角色{element.get('id') or 'unknown'}"
+    suffix = ""
+    if variant:
+        suffix = "_" + (ImageService._safe_name_part(variant.get("variant_name"), 24) or f"马甲{variant.get('id')}")
+    ext = os.path.splitext(src_path)[1].lower() or ".mp3"
+    rel_name = f"{novel_part}/音频/音频_{name_part}{suffix}{ext}"
+    dest = os.path.join(media_subdir("images"), rel_name.replace("/", os.sep))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.abspath(src_path) != os.path.abspath(dest):
+        import shutil
+        shutil.copyfile(src_path, dest)
+    return f"/data/images/{rel_name}"
+
+
+@router.get("/voices")
+async def get_voices(element_id: Optional[int] = Query(None)):
+    from services import voice_service
+    return {"voices": await voice_service.list_voices(element_id=element_id)}
+
+
+@router.post("/voices/custom-audio")
+async def add_custom_audio_voice(element_id: int = Form(...), label: str = Form(...), file: UploadFile = File(...)):
+    from services import voice_service
+    element = await _ensure_element_visible(element_id)
+    if element.get("element_type") != "character":
+        raise HTTPException(status_code=400, detail="只有人物类型支持导入音色")
+    label = (label or "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="请填写音色名称")
+    ext = _get_audio_extension(file.filename or "voice.mp3")
+    if ext not in ALLOWED_AUDIO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="不支持的音频格式")
+    content = await file.read()
+    if not content or len(content) > MAX_AUDIO_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="音频为空或超过 50MB 限制")
+    label_part = ImageService._safe_name_part(label, 32) or "未命名音色"
+    rel_name = f"音色_{label_part}{ext}"
+    path = os.path.join(media_subdir("audios"), rel_name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(content)
+    voice = await voice_service.save_custom_audio_voice(label=label, audio_file=f"/data/audios/{rel_name}")
+    return {"success": True, "voice": voice, "voices": await voice_service.list_voices(element_id=element_id)}
+
+
+@router.delete("/voices/custom")
+async def remove_custom_voice(voice_id: str = Query(...)):
+    from services import voice_service
+    deleted = await voice_service.delete_custom_voice(voice_id)
+    return {"success": True, "deleted": deleted, "voices": await voice_service.list_voices()}
+
+
+@router.post("/voices/preview")
+async def voice_preview_standalone(req: VoicePreviewRequest):
+    from services import voice_service
+    result = await voice_service.synthesize_preview(element_id=0, voice_id=req.voice_id, novel_id=None,
+                                                    novel_name=None, character_name=None,
+                                                    text=req.text or voice_service.DEMO_TEXT)
+    if not result.get("success"):
+        raise HTTPException(status_code=502, detail=result.get("message") or "语音合成失败")
+    return result
+
+
+@router.post("/element/{element_id}/voice")
+async def bind_voice(element_id: int, req: BindVoiceRequest):
+    from services import voice_service
+    element = await _ensure_element_visible(element_id)
+    if element.get("element_type") != "character":
+        raise HTTPException(status_code=400, detail="只有人物类型支持音色")
+    audio_file = None
+    if req.voice_id:
+        source = await voice_service.resolve_voice_audio_source_path(req.voice_id)
+        audio_file = await _copy_voice_source_to_standard_audio(source, element)
+    elif element.get("audio_file"):
+        _safe_remove_file(element.get("audio_file"))
+    updated = await ExtractionService.update_element_audio(element_id, audio_file)
+    updated = await ExtractionService.update_element_voice(element_id, req.voice_id) or updated
+    return {"success": True, "voice_id": req.voice_id, "audio_file": audio_file, "updated_at": (updated or {}).get("updated_at")}
+
+
+@router.post("/variant/{variant_id}/voice")
+async def bind_variant_voice(variant_id: int, req: BindVoiceRequest):
+    from services import voice_service
+    variant = await _ensure_variant_visible(variant_id)
+    element = await _ensure_element_visible(variant.get("element_id"))
+    if element.get("element_type") != "character":
+        raise HTTPException(status_code=400, detail="只有人物马甲支持音色")
+    audio_file = None
+    if req.voice_id:
+        source = await voice_service.resolve_voice_audio_source_path(req.voice_id)
+        audio_file = await _copy_voice_source_to_standard_audio(source, element, variant)
+    elif variant.get("audio_file"):
+        _safe_remove_file(variant.get("audio_file"))
+    updated = await ExtractionService.update_variant(variant_id, audio_file=audio_file)
+    return {"success": True, "voice_id": req.voice_id, "audio_file": audio_file, "updated_at": (updated or {}).get("updated_at")}
+
+
+@router.post("/element/{element_id}/voice-preview")
+async def voice_preview(element_id: int, req: VoicePreviewRequest):
+    from services import voice_service
+    element = await _ensure_element_visible(element_id)
+    if element.get("element_type") != "character":
+        raise HTTPException(status_code=400, detail="只有人物类型支持音色")
+    novel = await NovelService.get_by_id(element.get("novel_id"))
+    result = await voice_service.synthesize_preview(element_id=element_id, voice_id=req.voice_id,
+                                                    novel_id=element.get("novel_id"),
+                                                    novel_name=(novel or {}).get("name"),
+                                                    character_name=element.get("name"),
+                                                    text=req.text or voice_service.DEMO_TEXT)
+    if not result.get("success"):
+        raise HTTPException(status_code=502, detail=result.get("message") or "语音合成失败")
+    return result
 
 
 _extraction_batch_jobs: dict[str, dict[str, Any]] = {}
@@ -351,6 +486,21 @@ def _ensure_scene_no_human(prompt: str, element_type: str) -> str:
     return f"{SCENE_NO_HUMAN_CONSTRAINT}\n\n{prompt}"
 
 
+def _clean_polished_description(text: str) -> str:
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    for prefix in ("润色后：", "润色后:", "优化后：", "优化后:", "人物描述：", "人物描述:"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
+    return cleaned.strip().strip('"').strip("'").strip()
+
+
 @router.get("/element/{element_id}/full-prompt")
 async def get_element_full_prompt(element_id: int, variant_id: Optional[int] = None):
     """返回拼好的完整提示词。
@@ -407,6 +557,82 @@ async def extract_elements(request: ExtractionRequest):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/element/{element_id}/polish-description")
+async def polish_character_description(element_id: int, request: PolishDescriptionRequest):
+    """Use the active LLM config to polish a character description without saving it."""
+    element = await _ensure_element_visible(element_id)
+    if element.get("element_type") != "character":
+        raise HTTPException(status_code=400, detail="只有人物描述支持 AI 润色")
+
+    description = (
+        request.current_description
+        if request.current_description is not None
+        else element.get("description")
+    )
+    description = (description or "").strip()
+    if not description:
+        raise HTTPException(status_code=400, detail="人物描述为空，无法润色")
+
+    instruction = (request.instruction or "").strip()
+    try:
+        from services import cloud_llm_sync
+        from services.llm_service import LLMService
+
+        cfg = await cloud_llm_sync.get_active_config(
+            config_id=request.llm_config_id,
+            config_type="llm",
+        )
+        if not cfg:
+            raise HTTPException(status_code=400, detail="未找到可用的大语言模型配置，请先在大模型配置中配置默认 LLM")
+
+        character_name = (element.get("name") or "").strip()
+        user_instruction = instruction or "在不改变角色身份、年龄段、时代背景和核心设定的前提下，让人物形象描述更适合 AI 生图。"
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是影视角色视觉设定助手。任务是润色人物提示词描述，供 AI 生成人物图使用。\n"
+                    "要求：\n"
+                    "1. 只输出润色后的最终人物描述，不要解释、不要标题、不要 Markdown。\n"
+                    "2. 保留角色姓名、性别、年龄段、身份、时代背景、服装类型和核心气质，不要改成人设。\n"
+                    "3. 根据用户补充要求增强外貌、身材、气质、服装质感、五官、发型、姿态等视觉细节。\n"
+                    "4. 不要加入情色、裸露、未成年人性化、血腥暴力或与原设定冲突的内容。\n"
+                    "5. 输出应是中文自然段或逗号分隔短句，适合作为人物描述字段保存。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"角色名：{character_name or '未命名人物'}\n\n"
+                    f"当前人物描述：\n{description}\n\n"
+                    f"用户润色要求：\n{user_instruction}\n\n"
+                    "请输出润色后的完整人物描述。"
+                ),
+            },
+        ]
+        result = await LLMService.call_llm(
+            config_id=int(cfg["id"]),
+            messages=messages,
+            temperature=0.45,
+            max_tokens=1000,
+            timeout=120,
+            task_type="character_description_polish",
+            novel_id=element.get("novel_id"),
+            chapter_title=f"{character_name or '人物'} AI润色",
+            source_id=element_id,
+            source_type="extraction_character",
+        )
+        polished = _clean_polished_description(result)
+        if not polished:
+            raise HTTPException(status_code=500, detail="AI 润色结果为空，请重试")
+        return {"success": True, "description": polished}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("AI 润色人物描述失败 element_id=%s", element_id)
+        raise HTTPException(status_code=500, detail=f"AI 润色失败: {e}")
 
 
 @router.get("/novel/{novel_id}", response_model=List[ExtractedElementResponse])

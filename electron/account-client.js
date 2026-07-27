@@ -49,6 +49,40 @@ function hasActiveProduct(products, productId = DEFAULT_PRODUCT_ID, entitlement 
   return product.status === "active" && Boolean(expiresAt && Date.parse(expiresAt) > now);
 }
 
+function normalizeCreditBalances(payload) {
+  const source = payload && (payload.credits || payload.credit_balances || payload.balances);
+  const empty = { language: null, image: null, video: null };
+  if (!source || typeof source !== "object" || Array.isArray(source)) return empty;
+  const read = (keys) => {
+    for (const key of keys) {
+      let value = source[key];
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        value = value.remaining ?? value.balance ?? value.amount ?? value.available;
+      }
+      if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+      if (typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value.trim())) return Number(value.trim());
+    }
+    return null;
+  };
+  return {
+    total: read(["total", "points", "credit", "balance"]),
+    language: read(["language", "llm", "text"]),
+    image: read(["image", "images", "picture"]),
+    video: read(["video", "videos"])
+  };
+}
+
+function normalizeOfficialCatalogBalance(data) {
+  const raw = data && (data.balance ?? data.points ?? data.credits ?? (data.data && (data.data.balance ?? data.data.points)));
+  let value = raw;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    value = value.remaining ?? value.balance ?? value.amount ?? value.available ?? value.total;
+  }
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return { total: value };
+  if (typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value.trim())) return { total: Number(value.trim()) };
+  return { total: null };
+}
+
 function inactiveProductReason(products, productId = DEFAULT_PRODUCT_ID, now = Date.now()) {
   const product = findProduct(products, productId);
   if (!product) return "unauthorized_tool";
@@ -200,10 +234,12 @@ class AccountClient {
     fs.renameSync(tempPath, this.dataPath);
   }
 
-  async _request(pathname, { method = "GET", body, cookie } = {}) {
+  async _request(pathname, { method = "GET", body, cookie, baseUrl = this.baseUrl } = {}) {
     if (typeof this.fetchImpl !== "function") throw Object.assign(new Error("当前运行环境不支持 HTTPS 请求"), { code: "network" });
     const headers = {
       Accept: "application/json",
+      "Cache-Control": "no-cache",
+      Pragma: "no-cache",
       "X-Product-Code": this.productCode,
       "X-Device-Hash": this.deviceHash,
       "X-App-Version": this.appVersion
@@ -214,8 +250,9 @@ class AccountClient {
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     let response;
     try {
-      response = await this.fetchImpl(`${this.baseUrl}${pathname}`, {
+      response = await this.fetchImpl(`${baseUrl}${pathname}`, {
         method,
+        cache: "no-store",
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: controller.signal
@@ -224,7 +261,7 @@ class AccountClient {
       if (controller.signal.aborted) throw new Error("账号服务响应超时，请检查网络后重试");
       if (error && typeof error === "object") {
         error.accountRequestPath = pathname;
-        error.accountRequestUrl = `${this.baseUrl}${pathname}`;
+        error.accountRequestUrl = `${baseUrl}${pathname}`;
       }
       throw error;
     } finally {
@@ -264,6 +301,7 @@ class AccountClient {
       const cookie = cookiePair(setCookie);
       if (!cookie) throw new Error("登录成功但服务端未返回会话 Cookie");
       const signed = this._validatedAccountFromResponse(data);
+      const officialCredits = await this._fetchOfficialCredits(cookie);
       const state = {
         cookie,
         user: signed.user,
@@ -271,6 +309,8 @@ class AccountClient {
         account_license: data.account_license,
         server_time: data.server_time || null,
         signed_until: signed.signed_until,
+        credits: signed.credits,
+        official_credits: officialCredits === undefined ? null : officialCredits,
         session_expires_at: data.expiresAt || null,
         last_verified_at: Math.floor(this.now() / 1000)
       };
@@ -293,11 +333,12 @@ class AccountClient {
     try {
       const { data } = await this._request("/api/auth/me", { cookie: state.cookie });
       if (!data.user) {
-        this.clearCachedEntitlements();
+        this.clearCachedEntitlements("not_activated");
         this.lastFailReason = "not_activated";
         return { ok: false, authenticated: false, reason: this.lastFailReason };
       }
       const signed = this._validatedAccountFromResponse(data);
+      const officialCredits = await this._fetchOfficialCredits(state.cookie);
       const next = {
         ...state,
         user: signed.user,
@@ -305,37 +346,44 @@ class AccountClient {
         account_license: data.account_license,
         server_time: data.server_time || null,
         signed_until: signed.signed_until,
+        credits: signed.credits,
+        official_credits: officialCredits === undefined ? (state.official_credits || null) : officialCredits,
         last_verified_at: Math.floor(this.now() / 1000)
       };
       this._writeState(next);
       if (!hasActiveProduct(next.products, this.productCode, REQUIRED_ENTITLEMENT, this.now())) {
         this.lastFailReason = inactiveProductReason(next.products, this.productCode, this.now());
-        this.clearCachedEntitlements();
+        this.clearCachedEntitlements(this.lastFailReason);
         return { ok: false, authenticated: true, reason: this.lastFailReason, user: signed.user, products: next.products };
       }
       this.lastFailReason = "";
-      return { ok: true, payload: { user: next.user, products: next.products } };
+      return { ok: true, payload: { user: next.user, products: next.products, credits: next.credits } };
     } catch (error) {
       if (error && error.reason) {
-        this.clearCachedEntitlements();
+        this.clearCachedEntitlements(error.reason);
         this.lastFailReason = error.reason;
         return { ok: false, authenticated: Boolean(state.user), reason: this.lastFailReason };
       }
       if (isTransientAuthorizationFailure(error) || !error || !error.status) {
+        if (this._isCachedSnapshotExpired(state)) {
+          this.clearCachedEntitlements("signature_expired");
+          this.lastFailReason = "signature_expired";
+          return { ok: false, authenticated: Boolean(state.user), offline: true, reason: this.lastFailReason };
+        }
         const signedState = this._validatedState(state);
         if (signedState && hasActiveProduct(signedState.products, this.productCode, REQUIRED_ENTITLEMENT, this.now())) {
           this.lastFailReason = "network";
-          return { ok: true, offline: true, payload: { user: signedState.user || null, products: signedState.products || [] } };
+          return { ok: true, offline: true, payload: { user: signedState.user || null, products: signedState.products || [], credits: signedState.credits } };
         }
         const products = signedState ? signedState.products : [];
         this.lastFailReason = inactiveProductReason(products, this.productCode, this.now());
         return { ok: false, authenticated: Boolean(signedState && signedState.user), offline: true, reason: this.lastFailReason, user: signedState ? signedState.user : null, products };
       }
       if (isExplicitAuthorizationFailure(error)) {
-        this.clearCachedEntitlements();
         const data = error.data || {};
         const code = String(data.code || data.error || data.reason || "").toLowerCase();
         this.lastFailReason = /expired/.test(code) ? "expired" : (error.status === 401 ? "not_activated" : "unauthorized_tool");
+        this.clearCachedEntitlements(this.lastFailReason);
         return { ok: false, authenticated: Boolean(state.user), reason: this.lastFailReason };
       }
       this.lastFailReason = "network";
@@ -344,7 +392,17 @@ class AccountClient {
   }
 
   verifyCached() {
-    const signedState = this._validatedState(this._readState());
+    const state = this._readState();
+    if (state && !state.account_license && state.last_account_state === "signature_expired") {
+      this.lastFailReason = "signature_expired";
+      return { ok: false, authenticated: Boolean(state.user), cached: true, reason: this.lastFailReason };
+    }
+    if (this._isCachedSnapshotExpired(state)) {
+      this.clearCachedEntitlements("signature_expired");
+      this.lastFailReason = "signature_expired";
+      return { ok: false, authenticated: Boolean(state && state.user), cached: true, reason: this.lastFailReason };
+    }
+    const signedState = this._validatedState(state);
     if (!signedState || !signedState.user) {
       this.lastFailReason = "not_activated";
       return { ok: false, reason: this.lastFailReason };
@@ -364,7 +422,7 @@ class AccountClient {
     return {
       ok: true,
       cached: true,
-      payload: { user: signedState.user, products: signedState.products }
+      payload: { user: signedState.user, products: signedState.products, credits: signedState.credits }
     };
   }
 
@@ -396,6 +454,29 @@ class AccountClient {
     }
   }
 
+  // Used only by the main-process official AI bridge. The cookie never crosses
+  // IPC and the renderer receives only the sanitized result from the bridge.
+  async requestOfficialAi(pathname, options = {}) {
+    const state = this._readState();
+    if (!state || !state.cookie) {
+      const error = new Error("请先登录漫剧虾");
+      error.status = 401;
+      error.data = { code: "membership_required" };
+      throw error;
+    }
+    const pathValue = String(pathname || "");
+    if (!pathValue.startsWith("/api/v1/ai/")) {
+      const error = new Error("官方算力请求路径无效");
+      error.status = 400;
+      throw error;
+    }
+    const result = await this._request(pathValue, { ...options, cookie: state.cookie, baseUrl: this.baseUrl });
+    if (!result || !result.data || typeof result.data !== "object" || Array.isArray(result.data)) return result && result.data;
+    // Status is non-sensitive protocol metadata used to decide whether an async
+    // official job may be polled. Cookies and response headers never cross IPC.
+    return { ...result.data, http_status: result.response && result.response.status };
+  }
+
   async createWebHandoff() {
     const state = this._readState();
     if (!state || !state.cookie) return { success: false, message: "请先登录", continueUrl: `${this.baseUrl}/` };
@@ -415,7 +496,17 @@ class AccountClient {
     return this._infoFromState(this._readState());
   }
 
-  clearCachedEntitlements() {
+  getAccountLicense() {
+    const state = this._readState();
+    return state && state.account_license && typeof state.account_license === "object" ? state.account_license : null;
+  }
+
+  hasSession() {
+    const state = this._readState();
+    return Boolean(state && state.cookie);
+  }
+
+  clearCachedEntitlements(reason = "not_activated") {
     const state = this._readState();
     if (!state) {
       this.lastFailReason = "not_activated";
@@ -426,7 +517,10 @@ class AccountClient {
         ...state,
         account_license: null,
         products: [],
+        credits: { total: null, language: null, image: null, video: null },
+        official_credits: null,
         signed_until: null,
+        last_account_state: String(reason || "not_activated"),
         last_verified_at: Math.floor(this.now() / 1000)
       });
       return true;
@@ -467,12 +561,16 @@ class AccountClient {
       remaining_days: expiresAt ? Math.max(0, Math.ceil((Date.parse(expiresAt) - this.now()) / 86400000)) : 0,
       entitlements: product && Array.isArray(product.entitlements) ? product.entitlements : [],
       products,
+      credits: state && state.official_credits ? state.official_credits : (signedState ? signedState.credits : { total: null, language: null, image: null, video: null }),
       server_time: (signedState && signedState.server_time) || state.server_time || null,
       signed_until: (signedState && signedState.signed_until) || null,
       need_recharge: !isActive,
       product_code: this.productCode,
       energy_balance: 0,
       membership_plan: product && product.name ? product.name : null,
+      account_state: this.lastFailReason === "network"
+        ? "offline_grace"
+        : (this.lastFailReason === "signature_expired" ? "signature_expired" : (isActive ? "active" : "server_unauthorized")),
       active: isActive
     };
   }
@@ -492,6 +590,7 @@ class AccountClient {
     return {
       user: result.payload.user,
       products: result.payload.products,
+      credits: normalizeCreditBalances(result.payload),
       server_time: result.payload.server_time || null,
       signed_until: result.payload.signed_until || null
     };
@@ -509,8 +608,26 @@ class AccountClient {
       ...state,
       user: result.payload.user,
       products: result.payload.products,
+      credits: normalizeCreditBalances(result.payload),
       signed_until: result.payload.signed_until || null
     };
+  }
+
+  _isCachedSnapshotExpired(state) {
+    if (!state || !state.account_license) return false;
+    const signedUntil = Number(state.signed_until || 0);
+    return Number.isSafeInteger(signedUntil) && signedUntil > 0 && Math.floor(this.now() / 1000) >= signedUntil;
+  }
+
+  async _fetchOfficialCredits(cookie) {
+    try {
+      const { data } = await this._request(`/api/v1/ai/catalog?product_id=${encodeURIComponent(this.productCode)}`, { cookie });
+      return normalizeOfficialCatalogBalance(data);
+    } catch (_) {
+      // The catalog is display-only. Account authentication and entitlement
+      // remain determined by the verified account_license response.
+      return undefined;
+    }
   }
 
   async logoutRemote() {

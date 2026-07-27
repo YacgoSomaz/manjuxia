@@ -154,6 +154,10 @@ if os.getenv("WANSHAN_ENABLE_QIANSHAN_LAB", "").strip() == "1":
 from api.cover import router as cover_router
 # v3.61.92: 其他功能 (溶图)
 from api.extra import router as extra_router
+# v3.61.x: 俯视人物调度图首尾链路，与千山同源的独立后端模块。
+from api.topview_demo import router as topview_demo_router
+# v3.61.383: 补镜视频任务与首尾帧链路。
+from api.supplement_video import router as supplement_video_router
 from services import subtitle_removal_service
 from services.log_service import LogService
 
@@ -368,6 +372,8 @@ if qianshan_lab_router is not None:
 app.include_router(cover_router)
 # v3.61.92: 其他功能 (溶图)
 app.include_router(extra_router)
+app.include_router(topview_demo_router)
+app.include_router(supplement_video_router)
 
 # ★ v3.59.46:媒体路径动态化
 # 老版本用 app.mount(StaticFiles(directory=...))在启动时绑死路径,
@@ -385,6 +391,33 @@ logger.info(f"媒体目录(图片/视频/音频,启动时):{get_media_dir()}")
 # 启动时把当前媒体子目录都建好(避免空目录用户找不到)
 for _cat in ("images", "audios", "videos", "subtitle_removed"):
     os.makedirs(os.path.join(get_media_dir(), _cat), exist_ok=True)
+
+
+def _public_asset_dir() -> str:
+    """Resolve bundled read-only assets in source and packaged layouts."""
+    candidates = [
+        os.environ.get("WANSHAN_PUBLIC_DIR", ""),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "public"),
+        os.path.join(os.getcwd(), "public"),
+        os.path.abspath(os.path.join(os.getcwd(), "..", "..", "public")),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "resources", "public"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isdir(candidate):
+            return os.path.abspath(candidate)
+    return os.path.abspath(candidates[1])
+
+
+@app.get("/public/{filename:path}")
+async def _serve_public_asset(filename: str):
+    """Serve bundled voice previews without exposing the install tree."""
+    safe_filename = filename.replace("\\", "/").lstrip("/")
+    if ".." in safe_filename.split("/"):
+        raise _HTTPException(403, "非法路径")
+    full = os.path.join(_public_asset_dir(), safe_filename)
+    if not os.path.isfile(full):
+        raise _HTTPException(404, f"公共资源不存在: {safe_filename}")
+    return FileResponse(full)
 
 
 def _serve_media(category: str, filename: str):

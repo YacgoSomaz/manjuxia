@@ -1,5 +1,9 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
+function isMandatoryUpdate(payload) {
+  return !!(payload && (payload.update_level === "force" || payload.force_update === true || payload.mandatory === true));
+}
+
 const electronAPI = {
   getBackendUrl: () => ipcRenderer.invoke("get-backend-url"),
   getSessionSecret: () => ipcRenderer.invoke("get-session-secret"),
@@ -36,15 +40,33 @@ const electronAPI = {
     sendCode: (phone) => ipcRenderer.invoke("account:send-code", phone),
     login: (phone, code) => ipcRenderer.invoke("account:login", phone, code),
     me: () => ipcRenderer.invoke("account:me"),
+    onStateChange: (listener) => {
+      if (typeof listener !== "function") return () => {};
+      const handler = (_event, state) => listener(state);
+      ipcRenderer.on("account-state", handler);
+      return () => ipcRenderer.removeListener("account-state", handler);
+    },
     logout: () => ipcRenderer.invoke("account:logout"),
     createPayment: (planId) => ipcRenderer.invoke("account:create-payment", planId),
     paymentStatus: (orderNo) => ipcRenderer.invoke("account:payment-status", orderNo),
     rechargeUrl: () => ipcRenderer.invoke("account:recharge-url")
   },
+  officialAi: {
+    catalog: () => ipcRenderer.invoke("official-ai:catalog"),
+    createJob: (inputText, idempotencyKey, taskType) => ipcRenderer.invoke("official-ai:create-job", inputText, idempotencyKey, taskType),
+    getJob: (jobId) => ipcRenderer.invoke("official-ai:get-job", jobId),
+    saveAsset: (url, suggestedName) => ipcRenderer.invoke("official-ai:save-asset", url, suggestedName)
+  },
   onLicenseInvalid: () => {},
   update: {
     check: () => ipcRenderer.invoke("check-for-updates"),
-    onUpdateAvailable: (callback) => ipcRenderer.on("update-available", (_event, payload) => callback(payload)),
+    // The existing modal is reserved for verified mandatory updates.
+    onUpdateAvailable: (callback) => ipcRenderer.on("update-available", (_event, payload) => {
+      if (isMandatoryUpdate(payload)) callback(payload);
+    }),
+    onOptionalUpdateAvailable: (callback) => ipcRenderer.on("update-available", (_event, payload) => {
+      if (!isMandatoryUpdate(payload)) callback(payload);
+    }),
     onUpdateProgress: (callback) => ipcRenderer.on("update-progress", (_event, payload) => callback(payload)),
     onUpdateDownloaded: (callback) => ipcRenderer.on("update-downloaded", () => callback()),
     onUpdateError: (callback) => ipcRenderer.on("update-error", (_event, payload) => callback(payload)),

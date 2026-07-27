@@ -38,7 +38,7 @@ test("Electron waits for its exact backend handshake before loading the workbenc
   assert.match(electronMain, /const backendReady = await backendReadyPromise/);
   assert.match(electronMain, /BACKEND_SMOKE_OK templates=/);
   assert.match(electronMain, /Array\.isArray\(templates\)/);
-  assert.ok(electronMain.indexOf("const backendReady = await backendReadyPromise") < electronMain.indexOf("createWindow();"));
+  assert.ok(electronMain.indexOf("const backendReady = await backendReadyPromise") < electronMain.indexOf("createWindow(hasStoredAccountSession"));
 });
 
 test("packaged Electron launches the nested Nuitka backend directly", () => {

@@ -165,12 +165,18 @@
       .manjuxia-account-footer { margin: 8px 0 6px; padding: 9px 10px; border: 1px solid rgba(100,181,246,.28); border-radius: 8px; text-align: left; background: rgba(15,23,42,.42); color: #dcecff; }
       .manjuxia-account-footer__phone { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 700; }
       .manjuxia-account-footer__status { margin-top: 4px; color: #9fb7cc; font-size: 11px; line-height: 1.5; }
+      .manjuxia-account-footer__credits { margin-top: 8px; font-size: 11px; color: #b9d0e8; }
+      .manjuxia-account-footer__credit { padding: 5px 7px; border: 1px solid rgba(148,163,184,.2); border-radius: 5px; text-align: left; }
       .manjuxia-account-footer__action { margin-top: 7px; padding: 0; border: 0; background: transparent; color: #4fd1c5; font-size: 11px; font-weight: 700; cursor: pointer; }
+      .manjuxia-account-footer__login { width: 100%; height: 29px; margin-top: 9px; border: 1px solid #38bdf8; border-radius: 6px; background: #0ea5e9; color: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }
       .manjuxia-account-footer__logout { width: 100%; height: 29px; margin-top: 9px; border: 1px solid #ef4444; border-radius: 6px; background: transparent; color: #f87171; font-size: 12px; font-weight: 700; cursor: pointer; }
       .manjuxia-account-footer__logout:hover { background: rgba(239,68,68,.12); border-color: #fb7185; color: #fda4af; }
       body.manjuxia-light-theme .manjuxia-account-footer { border-color: #d9e2ec; background: #f8fafc; color: #1f2937; }
       body.manjuxia-light-theme .manjuxia-account-footer__status { color: #64748b; }
+      body.manjuxia-light-theme .manjuxia-account-footer__credits { color: #475569; }
+      body.manjuxia-light-theme .manjuxia-account-footer__credit { border-color: #cbd5e1; }
       body.manjuxia-light-theme .manjuxia-account-footer__action { color: #0f766e; }
+      body.manjuxia-light-theme .manjuxia-account-footer__login { color: #fff; }
       body.manjuxia-light-theme .manjuxia-account-footer__logout { color: #dc2626; border-color: #dc2626; }
     `;
     document.head.appendChild(style);
@@ -188,6 +194,27 @@
     if (window.electronAPI && typeof window.electronAPI.openExternal === "function") await window.electronAPI.openExternal(url);
   }
 
+  function openAccountLogin() {
+    window.location.hash = "#/activation";
+  }
+
+  async function syncFooterVersion() {
+    const versionText = document.querySelector(".version-text");
+    const native = window.electronAPI;
+    if (!versionText || !native || typeof native.getAppVersion !== "function") return;
+    try {
+      const version = await native.getAppVersion();
+      if (version) setText(versionText, `v${String(version).replace(/^v/i, "")}`);
+    } catch (_) {
+      // Keep the existing text if the native version bridge is unavailable.
+    }
+  }
+
+  function formatCreditBalance(credits) {
+    const value = credits && credits.total;
+    return value === null || value === undefined || value === "" ? "-" : String(value);
+  }
+
   function ensureAccountFooter() {
     installAccountFooterStyle();
     document.querySelectorAll(".sidebar-footer .price-compare-btn, .sidebar-footer .training-btn, .sidebar-footer .license-info").forEach((node) => node.remove());
@@ -200,26 +227,46 @@
       const logout = footer.querySelector(".logout-btn");
       footer.insertBefore(accountFooter, logout || footer.querySelector(".version-text") || null);
     }
-    const license = window.electronAPI && window.electronAPI.license;
-    if (!license || typeof license.getInfo !== "function" || accountFooter.dataset.loading === "1" || accountFooter.dataset.ready === "1") return;
+    const account = window.electronAPI && window.electronAPI.account;
+    if (!account || typeof account.me !== "function" || accountFooter.dataset.loading === "1" || accountFooter.dataset.ready === "1") return;
     accountFooter.dataset.loading = "1";
-    license.getInfo().then((info) => {
+    account.me().then((result) => {
+      const info = result && result.info ? result.info : null;
       window.__manjuxiaAccountInfo = info || null;
-      const active = Boolean(info && info.active);
+      // A retained account id can remain in the signed display snapshot after
+      // the session has been cleared. The phone is the actual login identity
+      // exposed by the account flow, so only it may enable logout actions.
+      const loggedIn = Boolean(info && info.phone);
+      const active = loggedIn && Boolean(info.active);
       const expires = info && info.expires_at ? formatDateTime(info.expires_at) : "未开通";
+      const credits = info && info.credits ? info.credits : {};
       accountFooter.innerHTML = `
         <div class="manjuxia-account-footer__phone">账号：${maskPhone(info && info.phone)}</div>
-        <div class="manjuxia-account-footer__status">${active ? `漫剧虾会员 · 有效至 ${expires}` : "普通用户 · 开通后可使用生成、编辑与导出"}</div>
-        ${active ? "" : '<button type="button" class="manjuxia-account-footer__action">去官网开通</button>'}
-        <button type="button" class="manjuxia-account-footer__logout">退出登录</button>`;
+        <div class="manjuxia-account-footer__status">${!loggedIn ? "未登录 · 登录后使用账号功能" : active ? `漫剧虾会员 · 有效至 ${expires}` : "普通用户 · 开通后可使用生成、编辑与导出"}</div>
+        <div class="manjuxia-account-footer__credits" aria-label="官方算力剩余积分">
+          <span class="manjuxia-account-footer__credit">积分余额：${formatCreditBalance(credits)}</span>
+        </div>
+        ${!loggedIn ? '<button type="button" class="manjuxia-account-footer__login">登录</button>' : active ? "" : '<button type="button" class="manjuxia-account-footer__action">去官网开通</button>'}
+        ${loggedIn ? '<button type="button" class="manjuxia-account-footer__logout">退出登录</button>' : ""}`;
       const action = accountFooter.querySelector(".manjuxia-account-footer__action");
       if (action) action.addEventListener("click", openRechargePage);
+      const login = accountFooter.querySelector(".manjuxia-account-footer__login");
+      if (login) login.addEventListener("click", openAccountLogin);
     }).catch(() => {
       accountFooter.textContent = "账号信息暂不可用";
     }).finally(() => {
       accountFooter.dataset.loading = "";
       accountFooter.dataset.ready = "1";
+      accountFooter.dataset.credits = "1";
     });
+    if (account && typeof account.onStateChange === "function" && !window.__manjuxiaAccountFooterSubscription) {
+      window.__manjuxiaAccountFooterSubscription = account.onStateChange((state) => {
+        if (!state || !state.info) return;
+        window.__manjuxiaAccountInfo = state.info;
+        accountFooter.dataset.ready = "";
+        ensureAccountFooter();
+      });
+    }
   }
 
   function patchLegacyLogoutDialog() {
@@ -253,9 +300,15 @@
       if (!document.querySelector(".main-layout")) return;
       const button = event.target && event.target.closest ? event.target.closest("button") : null;
       if (!button) return;
-      if (button.closest(".manjuxia-membership-dialog") || button.matches(".manjuxia-theme-toggle, .manjuxia-account-footer__logout, .manjuxia-account-footer__action, .el-dialog__headerbtn")) return;
+      if (button.closest(".manjuxia-membership-dialog") || button.matches(".manjuxia-theme-toggle, .manjuxia-account-footer__login, .manjuxia-account-footer__logout, .manjuxia-account-footer__action, .manjuxia-login, .manjuxia-send-code, .manjuxia-open-recharge-top, .el-dialog__headerbtn")) return;
       if (isGuestReadOnlyButton(button)) return;
       const info = window.__manjuxiaAccountInfo;
+      if (!info || !info.phone) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        openAccountLogin();
+        return;
+      }
       if (info && info.active) return;
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -558,7 +611,7 @@
         <div>权限状态：${isActive ? "会员有效" : "普通用户，暂无软件使用权限"}</div>
         <div>会员到期：${formatDateTime(info.expires_at)}</div>
         <div>剩余额度：${info.energy_balance || 0}</div>
-        ${reason && !isActive ? `<div>提示：${reason === "expired" ? "会员已过期，请到官网续费后继续使用。" : "该账号尚未开通会员权限，请到官网选择套餐开通。"}</div>` : ""}
+        ${reason && !isActive ? `<div>提示：${reason === "offline" ? "网络暂不可用，当前已验签权益快照仍在有效期内。" : reason === "signature_expired" ? "权益快照已过期，请重新连接服务器验证。" : reason === "expired" ? "会员已过期，请到官网续费后继续使用。" : "该账号尚未开通或已停用漫剧虾会员权限，请到官网选择套餐开通。"}</div>` : ""}
         ${!isActive ? `<div class="manjuxia-renew-actions">
           <button class="manjuxia-open-recharge" type="button">去官网充值续费</button>
           <button class="secondary manjuxia-refresh-account" type="button">我已支付，刷新权限</button>
@@ -575,7 +628,7 @@
           setMessage("正在刷新账号权限...", "");
           const me = await account.me();
           refreshButton.disabled = false;
-          if (me && me.info) renderInfo(me.info, me.reason || "");
+          if (me && me.info) renderInfo(me.info, me.reason || (me.offline ? "offline" : ""));
           else setMessage("刷新失败，请确认已登录", "error");
         });
       }
@@ -626,8 +679,14 @@
     });
 
     account.me().then((result) => {
-      if (result && result.info) renderInfo(result.info, result.reason || "");
+      if (result && result.info) renderInfo(result.info, result.reason || (result.offline ? "offline" : ""));
     }).catch(() => {});
+    if (account && typeof account.onStateChange === "function") {
+      account.onStateChange((state) => {
+        if (!state || !state.info) return;
+        renderInfo(state.info, state.reason || (state.offline ? "offline" : ""));
+      });
+    }
   }
 
   function run() {
@@ -635,6 +694,7 @@
     patchTextNodes(document.body);
     patchLogoText();
     ensureThemeToggle();
+    void syncFooterVersion();
     ensureAccountFooter();
     installAccountLogoutGuard();
     installMemberButtonGate();
@@ -779,6 +839,11 @@
   }
 
   function showMembershipRequired() {
+    const info = window.__manjuxiaAccountInfo;
+    if (!info || !info.phone) {
+      openAccountLogin();
+      return;
+    }
     if (document.getElementById("manjuxia-membership-required")) return;
     const mask = document.createElement("div");
     mask.id = "manjuxia-membership-required";

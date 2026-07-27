@@ -7,10 +7,11 @@ Provider 类型:
 - volcengine_ark: 火山方舟 HTTP API 模式 (API Key,token 后付费)
 - cool: Cool API 中转 (mjapi.cc.cd) — Seedance 2 系列,文件走 multipart 上传 → URL
 - xinglian: 星链云 (vjimeng.vip) — SD2 系列,文件走 base64 data URL 直接进 payload
+- pippit_cli: 小云雀 CLI (pippit-tool-cli),Access Key 由 CLI 自己管理
 
 入口:
     from services.video_providers import get_provider
-    provider = get_provider("jimeng" or "volcengine_ark" or "cool" or "xinglian", config_dict)
+    provider = get_provider("jimeng" or "volcengine_ark" or "cool" or "xinglian" or "pippit_cli", config_dict)
     result = await provider.submit(...)
 """
 from .base import VideoProviderBase, ProviderType, SubmitResult, QueryResult
@@ -39,6 +40,10 @@ def get_provider(provider_type: str, config: dict = None):
     if pt in ("xinglian", "vjimeng") or "xinglian" in pt or "vjimeng" in pt:
         from .xinglian import XinglianVideoProvider
         return XinglianVideoProvider(cfg)
+    # 小云雀 CLI
+    if pt in ("pippit", "pippit_cli", "xiaoyunque") or "pippit" in pt or "小云雀" in pt:
+        from .pippit import PippitCliProvider
+        return PippitCliProvider(cfg)
     # ARK
     if pt in ("volcengine_ark", "ark", "volcengine") or "ark" in pt or "volces" in pt:
         from .volcengine_ark import VolcengineArkProvider
@@ -54,6 +59,10 @@ def get_provider(provider_type: str, config: dict = None):
     if "vjimeng.vip" in bu or "vjimeng" in bu or "vjimeng" in name or mn.startswith("sd2-"):
         from .xinglian import XinglianVideoProvider
         return XinglianVideoProvider(cfg)
+
+    if "pippit" in bu or "pippit" in name or "小云雀" in name:
+        from .pippit import PippitCliProvider
+        return PippitCliProvider(cfg)
 
     # ARK — model_name 用全名 "doubao-seedance" 而不是 "seedance"(防误伤 cool 的 seedance_2 / seedance_2_fast)
     if (

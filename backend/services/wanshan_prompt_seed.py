@@ -189,6 +189,24 @@ async def seed_prompt_templates() -> int:
     db = await get_db()
     changed = 0
     try:
+        storyboard_names = {
+            (tpl.get("name") or "").strip()
+            for tpl in templates
+            if (tpl.get("category") or "").strip() == "storyboard_generation"
+            and (tpl.get("content") or "").strip()
+        }
+        # 清理旧预置分镜：不触碰用户自建模板，只移除不再属于当前
+        # 千山 ID 清洗版的 preset 行，避免旧行在数据库中继续污染选择器。
+        if storyboard_names:
+            placeholders = ",".join("?" for _ in storyboard_names)
+            cursor = await db.execute(
+                f"DELETE FROM prompt_templates WHERE category = 'storyboard_generation' "
+                f"AND is_preset = 1 AND name NOT IN ({placeholders})",
+                tuple(sorted(storyboard_names)),
+            )
+            if cursor.rowcount:
+                changed += cursor.rowcount
+
         for name, category in suppressed_fallbacks:
             if not name:
                 continue
@@ -208,24 +226,48 @@ async def seed_prompt_templates() -> int:
 
             variables = tpl.get("variables") or "[]"
             genres = tpl.get("genres") or "[]"
+            tags = tpl.get("tags") or "[]"
+            screen_mode = tpl.get("screen_mode") or ""
+            admin_id = tpl.get("admin_id")
             description = tpl.get("description") or ""
             now = now_beijing_str()
 
+            if isinstance(variables, (list, tuple, dict)):
+                variables = json.dumps(variables, ensure_ascii=False)
+            if isinstance(genres, (list, tuple, dict)):
+                genres = json.dumps(genres, ensure_ascii=False)
+            if isinstance(tags, (list, tuple, dict)):
+                tags = json.dumps(tags, ensure_ascii=False)
+
             cursor = await db.execute(
-                "SELECT id, content FROM prompt_templates WHERE name = ? AND category = ? LIMIT 1",
+                "SELECT id, content, admin_id, tags, screen_mode, qianshan_id, source, sort_order "
+                "FROM prompt_templates WHERE name = ? AND category = ? LIMIT 1",
                 (name, category),
             )
             row = await cursor.fetchone()
             if row:
-                if row["content"] != content:
+                if (
+                    row["content"] != content
+                    or row["admin_id"] != admin_id
+                    or (row["tags"] or "[]") != tags
+                    or (row["screen_mode"] or "") != screen_mode
+                    or row["qianshan_id"] != tpl.get("qianshan_id")
+                    or (row["source"] or "") != (tpl.get("source") or "")
+                    or (row["sort_order"] or 10000) != int(tpl.get("sort_order") or 10000)
+                ):
                     await db.execute(
                         """
                         UPDATE prompt_templates
                         SET content = ?, variables = ?, description = ?, is_preset = 1,
-                            genres = ?, updated_at = ?
+                            genres = ?, tags = ?, screen_mode = ?, admin_id = ?,
+                            qianshan_id = ?, source = ?, sort_order = ?, updated_at = ?
                         WHERE id = ?
                         """,
-                        (content, variables, description, genres, now, row["id"]),
+                        (
+                            content, variables, description, genres, tags, screen_mode, admin_id,
+                            tpl.get("qianshan_id"), tpl.get("source") or "",
+                            int(tpl.get("sort_order") or 10000), now, row["id"],
+                        ),
                     )
                     changed += 1
                 continue
@@ -233,10 +275,15 @@ async def seed_prompt_templates() -> int:
             await db.execute(
                 """
                 INSERT INTO prompt_templates
-                    (name, category, content, variables, description, is_preset, genres, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    (name, category, content, variables, description, is_preset, genres, tags, screen_mode,
+                     admin_id, qianshan_id, source, sort_order, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (name, category, content, variables, description, genres, now, now),
+                (
+                    name, category, content, variables, description, genres, tags, screen_mode, admin_id,
+                    tpl.get("qianshan_id"), tpl.get("source") or "",
+                    int(tpl.get("sort_order") or 10000), now, now,
+                ),
             )
             changed += 1
 

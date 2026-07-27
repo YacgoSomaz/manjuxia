@@ -1,6 +1,6 @@
 {
   "name": "wanshan",
-  "version": "0.1.0",
+  "version": "0.1.30",
   "description": "漫剧虾 - local-first AI video story studio",
   "main": "electron/main.js",
   "private": true,
@@ -12,8 +12,13 @@
     "test:security": "node --test tests/license-client.test.js tests/release-guard.test.js"
   },
   "devDependencies": {
+    "@babel/core": "^8.0.1",
+    "@babel/plugin-transform-arrow-functions": "^8.0.1",
+    "@electron/asar": "^4.2.1",
     "@playwright/test": "^1.61.1",
+    "bytenode": "^1.6.0",
     "electron": "^43.1.0",
+    "javascript-obfuscator": "^5.5.0",
     "rcedit": "^4.0.1"
   }
 }

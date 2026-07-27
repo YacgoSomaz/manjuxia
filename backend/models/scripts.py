@@ -54,6 +54,14 @@ class ScriptUpdateRequest(BaseModel):
     content: str
 
 
+class OfficialScriptResultRequest(BaseModel):
+    """由客户端官方算力任务完成后落库的剧本正文。"""
+    novel_id: int
+    chapter_id: int
+    content: str
+    template_id: Optional[int] = None
+
+
 class ScriptConvertResult(BaseModel):
     """单个章节转换结果"""
     chapter_id: int

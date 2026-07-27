@@ -27,9 +27,17 @@ function decodeBase64Url(value, label, maximumBytes) {
 }
 
 function publicKeyFromRaw(rawPublicKey) {
-  const raw = decodeBase64Url(rawPublicKey, "public_key", 64);
-  if (raw.length !== 32) throw new Error("public_key_invalid");
-  return crypto.createPublicKey({ key: Buffer.concat([ED25519_SPKI_PREFIX, raw]), format: "der", type: "spki" });
+  // Release configuration historically used a base64url SPKI value, while
+  // tests and some build systems supplied the 32-byte Ed25519 public value.
+  // Accept only those two exact encodings; never accept arbitrary DER data.
+  const encoded = decodeBase64Url(rawPublicKey, "public_key", 128);
+  if (encoded.length === 32) {
+    return crypto.createPublicKey({ key: Buffer.concat([ED25519_SPKI_PREFIX, encoded]), format: "der", type: "spki" });
+  }
+  if (encoded.length === ED25519_SPKI_PREFIX.length + 32 && encoded.subarray(0, ED25519_SPKI_PREFIX.length).equals(ED25519_SPKI_PREFIX)) {
+    return crypto.createPublicKey({ key: encoded, format: "der", type: "spki" });
+  }
+  throw new Error("public_key_invalid");
 }
 
 function compareVersions(a, b) {
@@ -45,6 +53,24 @@ function compareVersions(a, b) {
 
 function sha256(filePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
+
+function installerArgsForCurrentApp(app) {
+  const args = ["/NORESTART"];
+  if (!app || typeof app.getPath !== "function") return args;
+  let exePath = "";
+  try {
+    exePath = String(app.getPath("exe") || "");
+  } catch (_) {
+    return args;
+  }
+  if (!exePath) return args;
+  const appDir = path.dirname(exePath);
+  const exeName = path.basename(exePath).toLowerCase();
+  if (exeName === "漫剧虾.exe".toLowerCase() && appDir) {
+    args.push(`/DIR=${appDir}`);
+  }
+  return args;
 }
 
 function hasDuplicateJsonObjectKeys(json) {
@@ -462,7 +488,7 @@ class UpdateClient {
     }
 
     this.emit("update-downloaded", { path: target, version: release.version });
-    require("node:child_process").spawn(target, ["/NORESTART"], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+    require("node:child_process").spawn(target, installerArgsForCurrentApp(this.app), { detached: true, stdio: "ignore", windowsHide: true }).unref();
     setTimeout(() => this.app.quit(), 500);
     return { success: true, path: target };
   }
@@ -481,5 +507,6 @@ module.exports = {
   SSE_RECONNECT_DELAY_MS,
   UpdateClient,
   compareVersions,
+  installerArgsForCurrentApp,
   verifyUpdateRelease,
 };

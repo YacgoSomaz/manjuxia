@@ -1,6 +1,6 @@
 # 千山源码结构、功能实现与万山缺口图
 
-更新时间：2026-07-13
+更新时间：2026-07-17
 
 ## 结论先说
 
@@ -118,6 +118,15 @@ api.supplement_video    补镜视频
 | `storyboards` | 分镜，含 TopView/首尾帧字段 | 基础字段已补 |
 | `video_task_queue` | 全局视频生成队列 | 活跃态幂等已补 |
 | `llm_logs` | LLM 调用日志 | 已有 |
+
+## 2026-07-17 漫剧虾补齐记录
+
+本轮只补功能层差异，不修改千山安装目录，不启用短剧同步、团队剧本同步和团队资产同步。
+
+- 人物描述润色：`backend/api/extraction.py` 新增千山原版 `POST /api/extraction/element/{element_id}/polish-description`，使用漫剧虾本地语言模型配置调用 LLM，返回原版 `description` 字段，不自动写回 `extracted_elements.description`。
+- 分镜链路恢复：`backend/api/video.py` 新增 `POST /api/video/recover-chain`，用于把同脚本后续 `chain_aborted` 分镜恢复为可重新生成状态，并清理仍占用的旧队列任务。
+- 前端入口：`frontend/wanshan-recovery-tools.js` 以增强脚本方式挂入已编译前端，信息提取页显示“润色描述”，分镜/视频相关页面显示“恢复链路”。
+- 回归约束：`tests/qianshan-feature-migration-contract.test.js` 已覆盖补镜、TopView、Pippit、音色、卡死中止、描述润色、链路恢复和本地模型配置边界。
 | `app_settings` | KV 设置 | 已有 |
 | `image_style_settings` | 图片风格设置 | 已有 |
 | `novel_writing_context` | 小说创作上下文 | 已有 |
@@ -276,7 +285,7 @@ WHERE status IN ('queued','generating')
 - 视频素材保序第一阶段已补。
 - TopView 素材字段和视频链路部分已补。
 - Pippit provider 未补。
-- TopView fuse 接口和 UI 未补。
+- TopView fuse 接口和独立 UI 已补；原生编译页面尚未深度融合。
 
 ### api/queue.py
 
@@ -324,8 +333,8 @@ WHERE status IN ('queued','generating')
 
 - 字段已补。
 - 视频参考素材识别 TopView 已补。
-- `/api/topview-demo/storyboard/{id}/fuse` 未补。
-- 前端 TopView 面板未补。
+- 已迁入 `backend/api/topview_demo.py`，并在 `backend/main.py` 注册 `/api/topview-demo`。
+- 已接入 `frontend/wanshan-topview.js`：小说/分镜选择、图片模型/语言模型选择、生成、预览和删除。
 
 ### api/supplement_video.py
 
@@ -538,7 +547,6 @@ resources/public
 
 ```text
 api/supplement_video.py
-api/topview_demo.py
 services/supplement_video_service.py
 services/video_providers/pippit.py
 services/voice_service.py
@@ -546,6 +554,8 @@ FINAL_INVESTIGATION_REPORT.py
 test_find_best_match.py
 test_topview_paths.py
 ```
+
+注：`api/topview_demo.py` 和 `test_topview_paths.py` 已在本轮迁入漫剧虾，不再属于“万山没有”。
 
 万山有而千山没有，属于二开新增：
 
@@ -591,17 +601,17 @@ test_video_asset_priority.py
 
 ### 2. TopView fuse 接口和 UI
 
-缺：
-
-- `api/topview_demo.py`
-- 前端 TopView 熔图按钮/状态/删除入口
-- TopView 生成过程测试
-
 已补：
 
-- 数据库字段。
-- 视频素材保序对 TopView 的识别。
-- TopView 作为视频参考图的标签格式。
+- `backend/api/topview_demo.py`
+- `frontend/wanshan-topview.js` 俯视调度入口、模型选择、生成、预览和删除
+- `backend/test_topview_paths.py`
+- `tests/topview-frontend-contract.test.js`
+
+当前状态：
+
+- 数据库字段、视频素材保序识别、TopView fuse 接口和独立浮层均已补。
+- 仍需配置图片/语言模型做一次真实端到端生成验证；本轮未构建安装包。
 
 可实现能力：
 
@@ -678,7 +688,7 @@ test_video_asset_priority.py
 ## 建议下一步移植顺序
 
 1. 补镜视频后端表、服务、API，先不做复杂 UI。
-2. TopView fuse 接口，接到现有分镜/视频页面或先做独立浮层。
+2. TopView 原生页面深度融合；当前独立浮层已可用，后续再替换为编译前端组件。
 3. 语音音色服务，先支持本地音频绑定和内置试听，再接外部 TTS。
 4. Pippit provider，等确认账号/凭证/产品策略后再接。
 5. 前端深度复刻，把浮层入口逐步改成原生页面组件。
@@ -692,3 +702,15 @@ test_video_asset_priority.py
 - 涉及远端云同步、团队、Pippit、TTS 的功能，默认视为有外部数据流，必须先确认万山产品策略。
 - 万山商业授权、完整性校验、本地模型配置是二开核心，不要被千山文件覆盖掉。
 - 后端源码可参考千山逐模块迁移；前端只能参考编译产物行为，不能假设有原 Vue 源码。
+
+## 2026-07-17 功能迁移增量
+
+本轮已将以下千山功能以漫剧虾本地架构重新接入：
+
+- 语音音色：`backend/services/voice_service.py`、音色列表/试听/绑定/自定义音频接口，以及 `frontend/wanshan-voice.js`。
+- 预置试听资源：只复制 `public/voice-previews`，通过受限 `/public/{filename}` 路由提供，不暴露安装目录。
+- 补镜视频：`supplement_video_tasks` 本地表、任务/素材/首尾帧/分镜生成/视频生成/轮询 API，以及 `frontend/wanshan-supplement-video.js`。
+- 小云雀：`services/video_providers/pippit.py`、本地 Access Key 配置、检测、提交、统一轮询和本地归档；配置入口为 `frontend/wanshan-pippit.js`。
+- 卡住任务处理：新增 `/api/video/abort-stuck-video`，只解除本地占用，不假设上游任务已取消。
+
+边界保持不变：模型配置仍从漫剧虾本地配置读取；小云雀 Access Key 只存本机 `app_settings`；没有复制千山 Cookie、数据库、日志、缓存或远端配置。真实 Pippit CLI/凭证端到端测试仍待具备测试凭证后执行。

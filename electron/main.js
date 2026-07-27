@@ -3,12 +3,14 @@ const childProcess = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
+const https = require("node:https");
 const os = require("node:os");
 const path = require("node:path");
 const { isTrustedExternalUrl, isTrustedJimengUrl } = require("./trusted-origins");
 const { verifyPackagedRelease } = require("./release-guard");
 const { LicenseClient } = require("./license-client");
 const { AccountClient } = require("./account-client");
+const { OfficialAiClient, OFFICIAL_AI_PRODUCT_ID, OFFICIAL_AI_TASK_TYPE } = require("./official-ai-client");
 const { UpdateClient } = require("./update-client");
 const { readReleaseConfig } = require("./release-config");
 const { removeApplicationMenu } = require("./shell-hardening");
@@ -41,11 +43,12 @@ let updatePromptInFlight = false;
 let authMode = "license";
 let licenseRefreshTimer = null;
 let licenseRefreshInFlight = false;
+let officialAiClient = null;
 const BACKEND_PORT_CANDIDATES = [8000, 18472, 28800, 38765, 48899];
 // Revocations made in the account backend must reach an open client promptly.
-// The signed snapshot remains valid for short network outages, but an online
-// client re-checks the authoritative account endpoint once per minute.
-const LICENSE_REFRESH_INTERVAL_MS = 60 * 1000;
+// Only stored account sessions poll; logged-out clients never create this
+// network traffic. The signed snapshot remains the offline safety boundary.
+const LICENSE_REFRESH_INTERVAL_MS = 10 * 1000;
 
 function focusMainWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -60,12 +63,16 @@ if (isPrimaryInstance) {
   });
 }
 
-function rootDir() {
-  return app.isPackaged ? process.resourcesPath : path.resolve(__dirname, "..");
+function appRootDir() {
+  return app.isPackaged ? app.getAppPath() : path.resolve(__dirname, "..");
+}
+
+function resourceDir() {
+  return app.isPackaged ? process.resourcesPath : appRootDir();
 }
 
 function appIconPath() {
-  return path.join(rootDir(), "frontend", "assets", "manjuxia-app-icon.ico");
+  return path.join(appRootDir(), "frontend", "assets", "manjuxia-app-icon.ico");
 }
 
 function createSplashWindow() {
@@ -115,7 +122,7 @@ function getMachineId() {
 }
 
 function initializeLicenseClient() {
-  const config = readReleaseConfig({ rootDir: rootDir(), isPackaged: app.isPackaged, env: process.env });
+  const config = readReleaseConfig({ rootDir: resourceDir(), isPackaged: app.isPackaged, env: process.env });
   releaseConfig = config;
   commercialBuild = Boolean(config.commercial);
   authMode = String(config.auth_mode || process.env.WANSHAN_AUTH_MODE || (commercialBuild ? "account" : "license")).toLowerCase();
@@ -129,8 +136,13 @@ function initializeLicenseClient() {
       dataPath: path.join(dataDir(), "account.dat"),
       safeStorage
     });
+    officialAiClient = new OfficialAiClient({
+      request: (pathname, options) => licenseClient.requestOfficialAi(pathname, options),
+      verifyAccess: async () => requirePaidDesktopAction()
+    });
     return;
   }
+  officialAiClient = null;
   licenseClient = new LicenseClient({
     baseUrl: config.license_server_url || process.env.WANSHAN_LICENSE_SERVER_URL || "",
     publicKey: config.license_public_key || process.env.WANSHAN_LICENSE_PUBLIC_KEY || "",
@@ -146,17 +158,16 @@ async function syncLicenseContext() {
   if (!commercialBuild || !licenseClient) return;
   const info = licenseClient.getInfo();
   if (!info || !info.active || !backendUrl) return;
+  const accountLicense = authMode === "account" && typeof licenseClient.getAccountLicense === "function"
+    ? licenseClient.getAccountLicense()
+    : null;
+  if (authMode === "account" && !accountLicense) return;
   try {
     await requestBackend("/api/license/context/set", {
       method: "POST",
       body: {
-        license_key: info.license_key,
         machine_id: getMachineId(),
-        source: "account",
-        product_id: info.product_id,
-        entitlement: "comic_course",
-        expires_at: info.expires_at,
-        signed_until: info.signed_until
+        account_license: accountLicense
       }
     });
   } catch (_) {
@@ -188,6 +199,26 @@ function shouldLogoutForLicenseFailure(reason) {
   return String(reason || "") !== "network";
 }
 
+function publishAccountState(result, source) {
+  if (authMode !== "account" || !mainWindow || mainWindow.isDestroyed()) return;
+  const info = licenseClient && typeof licenseClient.getInfo === "function" ? licenseClient.getInfo() : null;
+  mainWindow.webContents.send("account-state", {
+    source: String(source || "refresh"),
+    reason: String((result && result.reason) || (licenseClient && licenseClient.lastFailReason) || ""),
+    offline: Boolean(result && result.offline),
+    authenticated: Boolean(result && result.authenticated),
+    active: Boolean(result && result.ok),
+    info: info ? {
+      active: Boolean(info.active),
+      product_id: info.product_id,
+      membership_status: info.membership_status,
+      signed_until: info.signed_until || null,
+      account_state: info.account_state || null,
+      credits: info.credits || { total: null, language: null, image: null, video: null }
+    } : null
+  });
+}
+
 async function navigateToActivation(reason) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const hash = activationHash(reason);
@@ -200,7 +231,7 @@ async function navigateToActivation(reason) {
     );
   } catch (_) {
     try {
-      await mainWindow.loadFile(path.join(rootDir(), "frontend", "index.html"), { hash });
+      await mainWindow.loadFile(path.join(appRootDir(), "frontend", "index.html"), { hash });
     } catch (error) {
       console.error("[license] failed to navigate to activation:", error);
     }
@@ -215,16 +246,19 @@ async function enforceLicenseState(source = "timer") {
     const result = await licenseClient.verify();
     if (result && result.ok) {
       await syncLicenseContext();
+      publishAccountState(result, source);
       return true;
     }
     if (authMode === "account" && result && result.authenticated) {
       await clearLicenseContext();
       const reason = result.reason || licenseClient.lastFailReason || "unauthorized_tool";
+      publishAccountState({ ...result, reason }, source);
       console.warn(`[license] account is authenticated but not entitled from ${source}: ${reason}`);
       await navigateToActivation(reason);
       return false;
     }
     const reason = (result && result.reason) || licenseClient.lastFailReason || "unknown";
+    publishAccountState({ ...(result || {}), reason }, source);
     console.warn(`[license] verification failed from ${source}: ${reason}`);
     if (shouldLogoutForLicenseFailure(reason)) {
       licenseClient.logout();
@@ -244,12 +278,13 @@ async function enforceLicenseState(source = "timer") {
 function startLicenseRefreshTimer() {
   if (!commercialBuild || !licenseClient || licenseRefreshTimer) return;
   licenseRefreshTimer = setInterval(() => {
+    if (authMode === "account" && (!licenseClient.hasSession || !licenseClient.hasSession())) return;
     enforceLicenseState("interval").catch((error) => {
       console.error("[license] interval refresh failed:", error);
     });
   }, LICENSE_REFRESH_INTERVAL_MS);
   if (typeof licenseRefreshTimer.unref === "function") licenseRefreshTimer.unref();
-  console.log(`[license] periodic refresh enabled: ${LICENSE_REFRESH_INTERVAL_MS / 60000} minutes`);
+  console.log(`[license] periodic refresh enabled: ${LICENSE_REFRESH_INTERVAL_MS / 1000} seconds`);
 }
 
 function stopLicenseRefreshTimer() {
@@ -519,8 +554,8 @@ async function ensureBackendSecureReady() {
 }
 
 function startBackend() {
-  const backendMain = path.join(rootDir(), "backend", "main.py");
-  const backendDist = path.join(rootDir(), "backend-dist");
+  const backendMain = path.join(appRootDir(), "backend", "main.py");
+  const backendDist = path.join(resourceDir(), "backend-dist");
   const packagedBackend = path.join(backendDist, "backend-server", "backend-server.exe");
   const legacyPackagedBackend = path.join(backendDist, "backend-server.exe");
   let command = process.env.WANSHAN_PYTHON || "python";
@@ -637,7 +672,7 @@ function closePackagedDevTools(window) {
   });
 }
 
-function createWindow() {
+function createWindow(initialHash = "") {
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -657,7 +692,8 @@ function createWindow() {
   });
   closePackagedDevTools(mainWindow);
 
-  mainWindow.loadFile(path.join(rootDir(), "frontend", "index.html"));
+  const frontendPath = path.join(appRootDir(), "frontend", "index.html");
+  mainWindow.loadFile(frontendPath, initialHash ? { hash: initialHash } : undefined);
   mainWindow.once("ready-to-show", () => {
     if (mainWindow) mainWindow.show();
     closeSplashWindow();
@@ -832,7 +868,7 @@ ipcMain.handle("open-external", async (_event, url) => {
 });
 
 ipcMain.handle("open-local-file", async (_event, relativePath) => {
-  const frontendDir = path.join(rootDir(), "frontend");
+  const frontendDir = path.join(appRootDir(), "frontend");
   const target = ensureInside(frontendDir, path.join(frontendDir, String(relativePath || "")));
   const result = await shell.openPath(target);
   return result ? { success: false, error: result, path: target } : { success: true, path: target };
@@ -944,7 +980,7 @@ ipcMain.handle("app:info", () => ({
   name: APP_NAME,
   backendUrl,
   dataDir: dataDir(),
-  rootDir: rootDir()
+  rootDir: appRootDir()
 }));
 ipcMain.handle("backend:url", () => backendUrl);
 ipcMain.handle("backend:health", async () => ({ ok: await requestHealth(backendUrl), url: backendUrl }));
@@ -992,6 +1028,7 @@ ipcMain.handle("account:login", async (_event, phone, code) => {
     return { success: false, message: "账号登录服务未启用" };
   }
   const result = await licenseClient.login(phone, code);
+  publishAccountState({ ...result, authenticated: Boolean(result && result.success), reason: result.success && result.active ? "" : "unauthorized_tool" }, "login");
   if (result.success && result.active) {
     void syncLicenseContext().catch((error) => console.warn("[account] deferred local context sync failed:", error));
   } else if (result.success) {
@@ -1015,7 +1052,8 @@ ipcMain.handle("account:me", async () => {
     // backend context makes a server-side stop effective immediately.
     await clearLicenseContext();
   }
-  return { success: true, ok: verified.ok, authenticated: Boolean(verified.ok || verified.authenticated), reason: verified.reason || "", info: licenseClient.getInfo() };
+  publishAccountState(verified, "manual");
+  return { success: true, ok: verified.ok, authenticated: Boolean(verified.ok || verified.authenticated), offline: Boolean(verified.offline), reason: verified.reason || "", info: licenseClient.getInfo() };
 });
 
 ipcMain.handle("account:logout", async () => {
@@ -1050,6 +1088,85 @@ ipcMain.handle("account:recharge-url", async () => {
   return licenseClient.createWebHandoff();
 });
 
+ipcMain.handle("official-ai:catalog", async () => {
+  if (!officialAiClient || PRODUCT_ID !== OFFICIAL_AI_PRODUCT_ID) {
+    return { ok: false, code: "membership_required", message: "官方算力仅支持漫剧虾账号" };
+  }
+  return officialAiClient.getCatalog();
+});
+
+ipcMain.handle("official-ai:create-job", async (_event, inputText, idempotencyKey, taskType) => {
+  if (!officialAiClient || PRODUCT_ID !== OFFICIAL_AI_PRODUCT_ID) {
+    return { ok: false, code: "membership_required", message: "官方算力仅支持漫剧虾账号" };
+  }
+  return officialAiClient.createJob(inputText, idempotencyKey, taskType);
+});
+
+ipcMain.handle("official-ai:get-job", async (_event, jobId) => {
+  if (!officialAiClient || PRODUCT_ID !== OFFICIAL_AI_PRODUCT_ID) {
+    return { ok: false, code: "membership_required", message: "官方算力仅支持漫剧虾账号" };
+  }
+  return officialAiClient.getJob(jobId);
+});
+
+function safeAssetName(value) {
+  const fallback = `漫剧虾-官方图片-${Date.now()}.png`;
+  const name = String(value || fallback).replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim();
+  return name.slice(0, 180) || fallback;
+}
+
+function downloadHttpsAsset(url, destination, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try { parsed = new URL(url); } catch (_) { reject(new Error("图片地址无效")); return; }
+    if (parsed.protocol !== "https:") { reject(new Error("图片地址必须使用 HTTPS")); return; }
+    if (redirects > 3) { reject(new Error("图片地址重定向次数过多")); return; }
+    const request = https.get(parsed, { headers: { Accept: "image/*" } }, (response) => {
+      if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
+        response.resume();
+        downloadHttpsAsset(new URL(response.headers.location, parsed).toString(), destination, redirects + 1).then(resolve, reject);
+        return;
+      }
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        response.resume();
+        reject(new Error(`图片下载失败（HTTP ${response.statusCode || 0}）`));
+        return;
+      }
+      const stream = fs.createWriteStream(destination);
+      response.pipe(stream);
+      stream.on("finish", () => stream.close(() => resolve(true)));
+      stream.on("error", (error) => { stream.destroy(); reject(error); });
+    });
+    request.setTimeout(30000, () => request.destroy(new Error("图片下载超时")));
+    request.on("error", reject);
+  });
+}
+
+ipcMain.handle("official-ai:save-asset", async (_event, url, suggestedName) => {
+  try {
+    let parsed;
+    try { parsed = new URL(String(url || "")); } catch (_) { return { ok: false, code: "invalid_asset_url", message: "图片地址无效" }; }
+    if (parsed.protocol !== "https:") return { ok: false, code: "invalid_asset_url", message: "图片地址必须使用 HTTPS" };
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: "保存官方图片",
+      defaultPath: safeAssetName(suggestedName || path.basename(parsed.pathname) || undefined),
+      filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp"] }]
+    });
+    if (result.canceled || !result.filePath) return { ok: false, code: "cancelled", message: "已取消保存" };
+    const temporary = `${result.filePath}.part-${process.pid}-${Date.now()}`;
+    try {
+      await downloadHttpsAsset(parsed.toString(), temporary);
+      await fs.promises.rename(temporary, result.filePath);
+      return { ok: true, filePath: result.filePath };
+    } catch (error) {
+      await fs.promises.rm(temporary, { force: true }).catch(() => {});
+      return { ok: false, code: "asset_download_failed", message: error.message || "图片保存失败" };
+    }
+  } catch (error) {
+    return { ok: false, code: "asset_download_failed", message: error.message || "图片保存失败" };
+  }
+});
+
 app.whenReady().then(async () => {
   app.setName(APP_NAME);
   removeApplicationMenu(Menu);
@@ -1065,7 +1182,7 @@ app.whenReady().then(async () => {
   }
   initializeLicenseClient();
   if (app.isPackaged) {
-    const releaseCheck = verifyPackagedRelease(path.dirname(rootDir()));
+    const releaseCheck = verifyPackagedRelease(path.dirname(resourceDir()));
     if (!releaseCheck.ok) {
       dialog.showErrorBox(`${APP_NAME}启动失败`, `安装包完整性校验失败：${releaseCheck.reason}`);
       closeSplashWindow();
@@ -1107,7 +1224,11 @@ app.whenReady().then(async () => {
     return;
   }
 
-  createWindow();
+  // With no persisted account session there is nothing to verify remotely.
+  // Open the login page directly instead of briefly exposing the workspace
+  // as an anonymous "non-member" and correcting it on the next refresh.
+  const hasStoredAccountSession = authMode !== "account" || (licenseClient && typeof licenseClient.hasSession === "function" && licenseClient.hasSession());
+  createWindow(hasStoredAccountSession ? "" : activationHash("not_activated"));
   backendReadyPromise = null;
   // Verify the account before forwarding any cached entitlement to the local
   // backend. This closes the startup window where a server-side revocation

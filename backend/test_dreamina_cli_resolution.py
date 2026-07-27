@@ -18,6 +18,25 @@ class DreaminaCliResolutionTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {"DREAMINA_PATH": cli}):
                 self.assertEqual(service._get_dreamina_path(), cli)
 
+    def test_packaged_nuitka_backend_finds_bundled_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backend_dir = os.path.join(tmp, "resources", "backend-dist", "backend-server")
+            dreamina_dir = os.path.join(tmp, "resources", "backend-dist", "dreamina")
+            os.makedirs(backend_dir, exist_ok=True)
+            os.makedirs(dreamina_dir, exist_ok=True)
+            backend_exe = os.path.join(backend_dir, "backend-server.exe")
+            bundled_cli = os.path.join(dreamina_dir, "dreamina.exe")
+            with open(backend_exe, "wb") as f:
+                f.write(b"backend")
+            with open(bundled_cli, "wb") as f:
+                f.write(b"dreamina")
+
+            service = VideoService()
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch("services.video_service.sys.executable", backend_exe), \
+                 mock.patch("services.video_service.shutil.which", return_value=None):
+                self.assertEqual(service._get_dreamina_path(), bundled_cli)
+
     def test_missing_cli_returns_actionable_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             service = VideoService()

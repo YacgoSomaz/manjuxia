@@ -26,6 +26,8 @@ test('one-click commercial publisher keeps the comic product and hardening check
   assert.match(publisher, /node --test/);
   assert.match(publisher, /test_wanshan_prompt_seed_payload\.py/);
   assert.match(publisher, /packaged-backend-smoke-gate\.test\.js/);
+  assert.match(publisher, /official-ai-client\.test\.js/);
+  assert.match(publisher, /official-ai-frontend\.test\.js/);
   assert.match(publisher, /Scan-Release\.ps1/);
   assert.match(publisher, /Get-NextComicShrimpVersion/);
   assert.match(publisher, /ManJuXiaComicShrimpBuild/);

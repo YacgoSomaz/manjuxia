@@ -9,13 +9,15 @@ from models.scripts import (
     ScriptUpdateRequest,
     ScriptConvertResponse,
     SingleScriptConvertRequest,
-    ScriptConvertResult
+    ScriptConvertResult,
+    OfficialScriptResultRequest
 )
 from services.script_service import ScriptService
 from services.log_service import check_novel_running
 import io
 from openpyxl import Workbook, load_workbook
 from urllib.parse import quote
+from utils.timezone import now_beijing_str
 
 router = APIRouter(prefix="/api/scripts", tags=["scripts"])
 
@@ -77,6 +79,46 @@ async def convert_single_script(request: SingleScriptConvertRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"转换失败: {str(e)}")
+
+
+@router.post("/official-result", response_model=ScriptResponse)
+async def save_official_script_result(request: OfficialScriptResultRequest):
+    """保存已由 anyq.site 官方语言算力生成的正文，不在本地再次调用模型。"""
+    content = str(request.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="官方任务没有返回可保存的剧本正文")
+    db = await get_db()
+    try:
+        chapter_cursor = await db.execute(
+            "SELECT id FROM chapters WHERE id=? AND novel_id=?",
+            (request.chapter_id, request.novel_id)
+        )
+        if not await chapter_cursor.fetchone():
+            raise HTTPException(status_code=404, detail="章节不存在或不属于当前小说")
+        cursor = await db.execute(
+            "SELECT id FROM scripts WHERE novel_id=? AND chapter_id=? ORDER BY id LIMIT 1",
+            (request.novel_id, request.chapter_id)
+        )
+        existing = await cursor.fetchone()
+        if existing:
+            await db.execute(
+                "UPDATE scripts SET content=?, template_id=COALESCE(?, template_id), remote_version=-1 WHERE id=?",
+                (content, request.template_id, existing["id"])
+            )
+            script_id = existing["id"]
+        else:
+            cursor = await db.execute(
+                "INSERT INTO scripts (novel_id, chapter_id, content, template_id, remote_version, created_at) VALUES (?, ?, ?, ?, -1, ?)",
+                (request.novel_id, request.chapter_id, content, request.template_id, now_beijing_str())
+            )
+            script_id = cursor.lastrowid
+        await db.commit()
+    finally:
+        await db.close()
+    result = await ScriptService.get_script(script_id)
+    if not result:
+        raise HTTPException(status_code=500, detail="剧本保存后读取失败")
+    return result
 
 
 # 注意：精确路径路由（/export, /import, /all）必须放在通配路由 /novel/{novel_id} 之前

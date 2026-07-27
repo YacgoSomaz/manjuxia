@@ -16,7 +16,10 @@ DefaultDirName={autopf}\漫剧虾
 DefaultGroupName=漫剧虾
 OutputDir={#InstallerOutputDir}
 OutputBaseFilename=漫剧虾Setup_{#MyAppVersion}
-SetupIconFile={#ReleaseDir}\resources\frontend\assets\manjuxia-app-icon.ico
+SetupIconFile={#SourcePath}\漫剧虾.ico
+UsePreviousAppDir=yes
+DisableDirPage=no
+AlwaysShowDirOnReadyPage=yes
 Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=admin
@@ -37,6 +40,10 @@ Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 [InstallDelete]
 ; A release is self-contained. Remove prior runtime trees before copying a new
 ; signed manifest so stale Electron/backend files cannot break the next launch.
+Type: files; Name: "{autodesktop}\漫剧虾.lnk"
+Type: files; Name: "{userdesktop}\漫剧虾.lnk"
+Type: files; Name: "{autodesktop}\万山.lnk"
+Type: files; Name: "{userdesktop}\万山.lnk"
 Type: filesandordirs; Name: "{app}\resources"
 Type: filesandordirs; Name: "{app}\locales"
 Type: filesandordirs; Name: "{app}\backend-dist"
@@ -68,11 +75,8 @@ Type: files; Name: "{app}\version"
 Source: "{#ReleaseDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\漫剧虾"; Filename: "{app}\漫剧虾.exe"; IconFilename: "{app}\resources\frontend\assets\manjuxia-app-icon.ico"
-Name: "{autodesktop}\漫剧虾"; Filename: "{app}\漫剧虾.exe"; IconFilename: "{app}\resources\frontend\assets\manjuxia-app-icon.ico"; Tasks: desktopicon
-
-[Tasks]
-Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标："
+Name: "{autoprograms}\漫剧虾"; Filename: "{app}\漫剧虾.exe"; IconFilename: "{app}\漫剧虾.exe"
+Name: "{autodesktop}\漫剧虾"; Filename: "{app}\漫剧虾.exe"; WorkingDir: "{app}"; IconFilename: "{app}\漫剧虾.exe"
 
 [Run]
 Filename: "{app}\漫剧虾.exe"; Description: "启动漫剧虾"; Flags: nowait postinstall skipifsilent
@@ -91,6 +95,18 @@ begin
   Result := RegQueryStringValue(HKLM64, UninstallRegistryKey, ValueName, Value);
   if not Result then
     Result := RegQueryStringValue(HKLM32, UninstallRegistryKey, ValueName, Value);
+end;
+
+function InstalledAppDir(var InstallLocation: String): Boolean;
+begin
+  Result := False;
+  InstallLocation := '';
+  if not ReadInstalledValue('InstallLocation', InstallLocation) then
+    exit;
+  InstallLocation := RemoveBackslashUnlessRoot(InstallLocation);
+  if (InstallLocation = '') or (not DirExists(InstallLocation)) then
+    exit;
+  Result := True;
 end;
 
 function VersionPart(const Version: String; const PartIndex: Integer): Integer;
@@ -144,7 +160,7 @@ var
   ResultCode: Integer;
 begin
   Result := False;
-  if not ReadInstalledValue('InstallLocation', InstallLocation) then
+  if not InstalledAppDir(InstallLocation) then
     exit;
   ExePath := AddBackslash(InstallLocation) + '漫剧虾.exe';
   if not FileExists(ExePath) then
@@ -167,6 +183,16 @@ begin
       Result := False;
       exit;
     end;
+  end;
+end;
+
+procedure InitializeWizard();
+var
+  InstallLocation: String;
+begin
+  if InstalledAppDir(InstallLocation) then begin
+    { Keep upgrades anchored to the directory that owns the current uninstall record. }
+    WizardForm.DirEdit.Text := InstallLocation;
   end;
 end;
 

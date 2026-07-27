@@ -14,7 +14,25 @@
 
 商业版使用手机号账号登录，产品 ID / aud 是 `comic_shrimp`，必需权益是 `comic_course`，后台显示名是“漫剧虾”。
 
-当前发布版本是 `0.1.23`。商业安装包位于 `packaging/release/installer/comic-shrimp/0.1.23/漫剧虾Setup_0.1.23.exe`，SHA-256 为 `f835706e49724eac21ae6f8a540548c268e314f29921f6004e4210024427ed15`。该包已通过发布前测试、后端冒烟测试、完整性清单签名和发布扫描；代码签名状态仍为 `NotSigned`，正式外发前必须用证书重新构建。
+当前发布版本是 `0.1.28`。商业安装包位于 `packaging/release/installer/comic-shrimp/0.1.28/漫剧虾Setup_0.1.28.exe`，SHA-256 为 `a53d92eb0ad67cfeb13ea6c29262eedc33f465e8aa34421a4000327d013b6d16`。该包已通过发布前测试、后端冒烟测试、完整性清单签名和发布扫描；代码签名状态仍为 `NotSigned`，正式外发前必须用证书重新构建。
+
+账号权益快照：服务端 `/api/auth/me` 每次基于 `user_products` 重新签发最多 600 秒的 Ed25519 `account_license`，响应禁止缓存且不返回 ETag。Electron 端每 10 秒单飞刷新，所有账号请求显式禁缓存；网络失败只允许未过期的已验签快照，过期返回 `signature_expired` 并阻止付费功能。线上诊断日志只保留产品、权益状态、签发/到期时间和结果码。
+
+## 商业包代码保护（2026-07-24）
+
+- 构建顺序固定为：阶段化复制 -> JavaScript 混淆 -> Electron 主进程 V8 `.jsc` 字节码 -> `app.asar` -> 签名完整性清单。不要跳过或调换顺序。
+- `scripts/Compile-ElectronV8Bytecode.cjs` 只处理 Electron **主进程**模块：`main`、账号、更新、完整性、官方算力和本地桥接。`main.js` 在成品中只有两行加载器，真实代码为 `main.jsc`；其他主进程业务 `.js` 会被删除。
+- `electron/preload.js` 与前端脚本必须保留为混淆 JS。Electron 43 的 preload 属于隔离渲染 V8 上下文，加载主进程生成的 `.jsc` 会报 `cachedDataRejected`，强行编译会导致桥接失效或白屏。
+- V8 字节码和 ASAR 都是提高逆向/篡改成本，不是授权根。真正的会员裁决由 Nuitka 后端再次验证 anyq.site 的 Ed25519 `account_license`；篡改 Electron UI 或本地缓存不能伪造新的有效服务器签名。
+
+官方 AI 算力：本地 `custom` 配置继续由用户自己填写并直连；`official` 只由 Electron 主进程访问 anyq.site，固定 `comic_shrimp` / `comic_course`。官方目录同时满足 `enabled=true`、`available=true` 的任务才会注入现有语言/图片下拉菜单。官方任务请求体只有固定产品、目录任务类型、用户输入和 UUID 幂等键，不包含上游密钥、模型地址、供应商或系统提示词。图片结果优先使用 `result_assets[].display_url`，兼容 `download_url`，保存由主进程完成；语言结果通过本地 `/api/scripts/official-result` 落库，不在本地再次调用模型。未修改 anyq.site 服务端。
+
+## 最近变更：官方来源、积分和历史成片（2026-07-23）
+
+- 官方算力入口在 `frontend/official-ai.js`，只把已通过官方目录筛选的语言/图片任务注入现有下拉菜单；本地 custom 与 official 来源分开，视频和语音未开放时不生成假入口。
+- `electron/account-client.js`、`electron/main.js` 和 `frontend/manjuxia-brand.js` 组成积分显示链路：会员与产品权益只来自已验签 `account_license.payload`；官方算力余额按统一协议从已登录会话的 `/api/v1/ai/catalog?product_id=comic_shrimp` 读取，仅用于展示，不参与授权判定。每次账号刷新会同步更新余额，目录请求失败时保留上次显示值或显示 `-`。
+- `backend/api/video.py` 的 `/api/video/history` 与 `frontend/wanshan-history.js` 组成历史成片页，按本地完成记录展示视频，文件不存在时显示缺失状态。
+- 本轮只改客户端和本地后端；没有改 anyq.site、支付回调、数据库协议或签名私钥，也没有构建安装包。
 
 ## 核心目录
 
@@ -76,6 +94,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File packaging\build\build_release.ps1 
 商业包规则：
 
 - 后端业务必须通过 Nuitka 进入 `backend-server.exe`。
+- Electron 主进程业务在正式包中必须为 `.jsc`，并保留 `node_modules/bytenode` 运行时；不得把 `electron/account-client.js`、`update-client.js`、`release-guard.js` 等明文重新复制进包。
 - 正式包不包含 `.py`、`.env`、`.map`、`.db`、Cookie、日志、测试文件、源码目录、prompt 原始目录。
 - `backend/data/wanshan_prompt_seed.json` 会嵌入编译临时模块，不直接落地到安装目录。
 - `frontend/qianshan-storyboard-lab.html` 是内部实验台，默认不进正式包。只有设置 `WANSHAN_ENABLE_QIANSHAN_LAB=1` 才会带入。

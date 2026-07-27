@@ -52,12 +52,29 @@ _STYLE_ORDER_HINTS = [
     "3D国漫通用风格",
 ]
 
+_EXTRACTION_ORDER_HINTS = [
+    "角色提取模板【千人千面】【3D真人】",
+    "搭配火山5.0生图模型",
+    "适配gtp-image2",
+    "角色提取模板【千人千面】【3D国漫】",
+    "角色提取模板【千人千面】【2D国漫】",
+]
+
 _STORYBOARD_LEGACY_MARKERS = (
     "旧版勿用",
     "旧版备份差异版",
     "测试勿使用",
     "差异版-",
 )
+
+# 本地漫剧虾发行版使用清洗后的千山模板正文。这个顺序标识只负责
+# 复刻千山选择器的 ID 顺序，不把 admin_id 当成本地模板的远端授权 ID。
+_LOCAL_STORYBOARD_ORDER = {
+    23: 0, 24: 1, 25: 2, 26: 3, 27: 4, 28: 5, 29: 6, 30: 7,
+    31: 8, 32: 9, 33: 10, 34: 11, 35: 12, 36: 13, 37: 14, 38: 15,
+    39: 16, 40: 17, 41: 18, 42: 19, 43: 20, 44: 21, 45: 22,
+    46: 23, 47: 24, 48: 25, 49: 26, 50: 27, 51: 28, 62: 29,
+}
 
 
 def _is_protected_template(category: Optional[str], is_preset) -> bool:
@@ -82,6 +99,8 @@ def _storyboard_order_index(name: str) -> int:
 
 
 def _is_storyboard_legacy_row(row: Dict[str, Any]) -> bool:
+    if row.get("qianshan_id") is not None:
+        return False
     name = row.get("name") or ""
     if any(marker in name for marker in _STORYBOARD_LEGACY_MARKERS):
         return True
@@ -100,6 +119,8 @@ def _sort_product_templates(rows: List[Dict[str, Any]], category: Optional[str])
         return sorted(
             rows,
             key=lambda row: (
+                _LOCAL_STORYBOARD_ORDER.get(int(row["qianshan_id"]), 10_000)
+                if row.get("qianshan_id") is not None else 9_000,
                 _storyboard_order_index(row.get("name") or ""),
                 row.get("admin_id") or 10_000,
                 row.get("id") or 10_000,
@@ -110,6 +131,15 @@ def _sort_product_templates(rows: List[Dict[str, Any]], category: Optional[str])
             rows,
             key=lambda row: (
                 _order_index(row.get("name") or "", _STYLE_ORDER_HINTS),
+                row.get("admin_id") or 10_000,
+                row.get("id") or 10_000,
+            ),
+        )
+    if category == "character_extraction":
+        return sorted(
+            rows,
+            key=lambda row: (
+                _order_index(row.get("name") or "", _EXTRACTION_ORDER_HINTS),
                 row.get("admin_id") or 10_000,
                 row.get("id") or 10_000,
             ),

@@ -118,7 +118,12 @@ async def init_db():
                 description TEXT DEFAULT '',
                 is_preset INTEGER DEFAULT 0,
                 genres TEXT DEFAULT '[]',
+                tags TEXT DEFAULT '[]',
+                screen_mode TEXT DEFAULT '',
                 admin_id INTEGER DEFAULT NULL,
+                qianshan_id INTEGER DEFAULT NULL,
+                source TEXT DEFAULT '',
+                sort_order INTEGER DEFAULT 10000,
                 created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
                 updated_at TIMESTAMP DEFAULT (datetime('now', '+8 hours'))
             )
@@ -617,6 +622,52 @@ async def init_db():
         """
         await db.execute(create_fusion_history)
         await auto_migrate_table(db, "fusion_history", create_fusion_history)
+
+        # v3.61.383: 补镜视频任务链路，任务状态独立于页面生命周期。
+        logger.info("创建表: supplement_video_tasks")
+        create_supplement_video_tasks = """
+            CREATE TABLE IF NOT EXISTS supplement_video_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                novel_id INTEGER DEFAULT NULL,
+                chapter_id INTEGER DEFAULT NULL,
+                anchor_storyboard_id INTEGER DEFAULT NULL,
+                anchor_position TEXT DEFAULT 'after',
+                title TEXT DEFAULT '',
+                script_text TEXT DEFAULT '',
+                storyboard_text TEXT DEFAULT '',
+                video_prompt TEXT DEFAULT '',
+                characters_json TEXT DEFAULT '[]',
+                scenes_json TEXT DEFAULT '[]',
+                props_json TEXT DEFAULT '[]',
+                materials_json TEXT DEFAULT '{}',
+                missing_assets_json TEXT DEFAULT '[]',
+                first_frame_path TEXT DEFAULT NULL,
+                last_frame_path TEXT DEFAULT NULL,
+                provider TEXT DEFAULT 'jimeng',
+                video_config_id INTEGER DEFAULT NULL,
+                model_name TEXT DEFAULT '',
+                ratio TEXT DEFAULT '9:16',
+                resolution TEXT DEFAULT '720P',
+                duration INTEGER DEFAULT 8,
+                generation_mode TEXT DEFAULT 'multimodal2video',
+                params_json TEXT DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'draft',
+                submit_id TEXT DEFAULT NULL,
+                output_video_path TEXT DEFAULT NULL,
+                output_remote_url TEXT DEFAULT NULL,
+                output_last_frame_path TEXT DEFAULT NULL,
+                error_message TEXT DEFAULT NULL,
+                created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
+                updated_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
+                finished_at TIMESTAMP DEFAULT NULL
+            )
+        """
+        await db.execute(create_supplement_video_tasks)
+        await auto_migrate_table(db, "supplement_video_tasks", create_supplement_video_tasks)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_supplement_video_tasks_updated "
+            "ON supplement_video_tasks(updated_at DESC)"
+        )
 
         # v3.61.261: 封面多比例 — 一本小说可有多个比例(3:4/4:3/1:1...)各一张封面
         # novel_id + ratio 唯一(同比例重新生成则覆盖该行);is_primary=1 的那张同步到 novels.cover_url

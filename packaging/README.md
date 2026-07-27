@@ -32,7 +32,7 @@ Electron `asar` 只是归档格式，不是加密。正式包不能包含 `src/`
 
 真实值只通过本地参数或 CI Secret 注入，禁止写入 Git。
 
-`Generate-IntegrityManifest.py` 要求通过 `WANSHAN_MANIFEST_PRIVATE_KEY` 或 `--private-key` 提供构建机上的 Ed25519 清单签名私钥，输出 `integrity_manifest.json` 和 `integrity_manifest.sig`。私钥只存在构建机/CI，`release_config.json` 只写 `integrity_public_key`。启动时会校验签名、哈希以及清单外新增文件。
+`Generate-IntegrityManifest.py` 要求通过 `WANSHAN_MANIFEST_PRIVATE_KEY` 或 `--private-key` 提供构建机上的 Ed25519 清单签名私钥，输出 `integrity_manifest.json` 和 `integrity_manifest.sig`。私钥只存在构建机/CI，`release_config.json` 只写 `integrity_public_key`。清单使用 `version=2`、`scope=core`，只记录主 EXE、固定的 Electron 启动/鉴权/本地桥接/更新文件、发布配置和 `backend-server.exe`。Python 运行库、DLL、用户生成的图片、视频、音频、数据库、缓存及其他运行时文件不参与启动硬校验，也不要求登记。启动时仍校验签名清单中的核心文件哈希，但不再以“清单外新增文件”阻断启动。
 
 更新器使用 `release_config.json` 里的 `update_feed_url` 和 `update_public_key`。客户端先校验 `update.json` 的 Ed25519 签名，再按安装包 SHA-256 校验下载文件，最后启动安装器。发布新版本时上传安装包和对应 `update.json` 即可。
 

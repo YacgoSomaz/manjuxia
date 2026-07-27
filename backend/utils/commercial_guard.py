@@ -68,7 +68,7 @@ def require_active_commercial_context() -> None:
         return
 
     context = license_context.get_context()
-    if not context.get("authorized"):
+    if not context.get("authorized") or not context.get("verified_envelope"):
         raise HTTPException(status_code=401, detail="account_required")
 
     expected_product = os.environ.get("WANSHAN_REQUIRED_PRODUCT_ID", "comic_shrimp")

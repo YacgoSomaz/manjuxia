@@ -20,17 +20,44 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def core_files(root: Path) -> list[Path]:
+    """Return stable executable/authentication files only.
+
+    User-created media and runtime caches are intentionally outside this list.
+    The signed manifest protects the code paths that determine startup,
+    authentication, local API access, updates, and the compiled backend.
+    """
+    relative_files = [
+        Path("漫剧虾.exe"),
+        Path("resources/release_config.json"),
+        Path("resources/app.asar"),
+    ]
+
+    backend_dir = root / "resources" / "backend-dist" / "backend-server"
+    if not backend_dir.is_dir():
+        raise SystemExit(f"core backend directory not found: {backend_dir}")
+    # The compiled application is the stable backend boundary. Python runtime
+    # modules and DLLs are dependencies, not business/authentication logic.
+    relative_files.append(Path("resources/backend-dist/backend-server/backend-server.exe"))
+
+    resolved = []
+    for relative in relative_files:
+        path = root / relative
+        if not path.is_file():
+            raise SystemExit(f"core integrity file missing: {relative.as_posix()}")
+        resolved.append(path)
+    return resolved
+
+
 def build_manifest(root: Path, output_name: str, signature_name: str) -> dict:
     files = {}
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.name in {output_name, signature_name}:
-            continue
+    for path in core_files(root):
         relative = path.relative_to(root).as_posix()
         files[relative] = {
             "sha256": sha256(path),
             "size": path.stat().st_size,
         }
-    return {"version": 1, "algorithm": "sha256", "files": files}
+    return {"version": 2, "algorithm": "sha256", "scope": "core", "files": files}
 
 
 def main() -> int:

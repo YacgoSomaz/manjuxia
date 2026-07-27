@@ -146,15 +146,23 @@ class VideoService:
         if env_path:
             candidates.append(env_path)
 
+        # 打包环境：兼容 PyInstaller one-folder 与当前 Nuitka backend-dist/backend-server 结构。
+        # 即使 frozen 探测失效，也从 sys.executable 倒推一次，避免误落到 ~/bin/dreamina.exe。
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable or ""))
+        if exe_dir:
+            backend_dist_dir = os.path.dirname(exe_dir)
+            resources_dir = os.path.dirname(backend_dist_dir)
+            candidates.extend([
+                os.path.join(exe_dir, "dreamina", "dreamina.exe"),
+                os.path.join(backend_dist_dir, "dreamina", "dreamina.exe"),
+                os.path.join(resources_dir, "backend-dist", "dreamina", "dreamina.exe"),
+            ])
+        if is_frozen():
+            logger.debug("[dreamina-cli] running in packaged backend, executable=%s", sys.executable)
+
         # 开发环境: backend/services/video_service.py -> project root
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         candidates.append(os.path.join(project_root, "build", "dreamina", "dreamina.exe"))
-
-        # 打包环境：兼容 PyInstaller one-folder 与当前 Nuitka flat backend-dist 两种结构。
-        if is_frozen():
-            exe_dir = os.path.dirname(sys.executable)  # backend-dist/backend-server/
-            candidates.append(os.path.join(exe_dir, "dreamina", "dreamina.exe"))
-            candidates.append(os.path.join(os.path.dirname(exe_dir), "dreamina", "dreamina.exe"))
             
         path = shutil.which("dreamina")
         if path:

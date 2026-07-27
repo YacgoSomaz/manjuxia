@@ -1,6 +1,6 @@
 # 千山 3.61.381 源码阅读与万山差异清单
 
-更新时间：2026-07-13
+更新时间：2026-07-17
 
 ## 来源
 
@@ -25,6 +25,16 @@
 - `3.61.365+`：TopView/俯视调度图、场景 A/B 调度、视频素材链路多轮优化。
 
 ## 本次已移植到万山的内容
+
+### TopView 俯视人物调度图（本轮新增）
+
+- 从千山 `resources/backend/api/topview_demo.py` 迁入漫剧虾 `backend/api/topview_demo.py`，继续使用漫剧虾本地 `ImageService`、`LLMService`、媒体路径和数据库。
+- 在 `backend/main.py` 注册 `POST/DELETE /api/topview-demo/storyboard/{storyboard_id}/fuse`。
+- 新增 `frontend/wanshan-topview.js`：选择小说、分镜、图片模型和语言模型，生成/预览/删除俯视调度图。
+- 新增 `tests/topview-frontend-contract.test.js` 和 `backend/test_topview_paths.py`。
+- 未迁移千山 Cookie、账号态、数据库、日志、缓存和远端接口。
+
+当前边界：前端使用独立浮层，不覆盖漫剧虾现有编译产物；真实生图需用户在漫剧虾本地配置图片模型后测试。
 
 ### 小说标签
 
@@ -114,10 +124,15 @@
 - `api/topview_demo.py`
 - `test_topview_paths.py`
 
-主要接口：
+主要接口（千山旧记录）：
 
 - `POST /api/topview/storyboard/{storyboard_id}/fuse`
 - `DELETE /api/topview/storyboard/{storyboard_id}/fuse`
+
+漫剧虾适配后的实际接口：
+
+- `POST /api/topview-demo/storyboard/{storyboard_id}/fuse`
+- `DELETE /api/topview-demo/storyboard/{storyboard_id}/fuse`
 
 数据库字段：
 
@@ -133,7 +148,7 @@
 
 - 已补齐上述数据库字段和 `StoryboardUpdate` / `StoryboardResponse` 兼容字段。
 - 已让视频参考图链路识别 `topview_dispatch`，并在素材超过上限时按千山优先级保留 TopView A/B。
-- 尚未移植 `/api/topview/storyboard/{storyboard_id}/fuse` 和前端 TopView 操作面板。
+- 已移植为漫剧虾本地 `/api/topview-demo/storyboard/{storyboard_id}/fuse`，并增加独立 TopView 操作面板。
 
 移植风险：
 
@@ -316,16 +331,14 @@
 
 ## 新增/差异文件清单
 
-千山有、万山没有的源码文件：
+千山有、万山仍没有的源码文件：
 
 - `api/supplement_video.py`
-- `api/topview_demo.py`
 - `services/supplement_video_service.py`
 - `services/video_providers/pippit.py`
 - `services/voice_service.py`
 - `FINAL_INVESTIGATION_REPORT.py`
 - `test_find_best_match.py`
-- `test_topview_paths.py`
 
 万山有、千山没有的万山专用文件：
 
@@ -368,3 +381,10 @@
 - 涉及远端账号、团队、云端模型配置的功能必须先确认产品策略。
 - 本地优先功能不得在用户无感知情况下上传小说正文、剧本、素材或 API Key。
 - 每移植一块，都要补 `CHANGELOG.md` 和本文件，避免后续遗忘。
+
+## 本轮完成情况（2026-07-17）
+
+- 已补入语音服务、预置试听资源、补镜视频任务链路、小云雀本地 CLI 通道和主动中止卡住任务。
+- 已用 Playwright 对千山登录后的正常工作台页面做控件/请求路径对照；只保存页面结构与接口路径，不保存 Cookie、会话令牌、小说正文或账号数据。
+- 漫剧虾仍保持本地模型配置边界，未修改千山、anyq.site、支付回调、数据库或签名私钥。
+- 尚未构建正式安装包；下一步应先通过 Node/Python 静态检查，再用带测试数据的漫剧虾本地进程验证 UI 与接口。

@@ -7,6 +7,20 @@ from services import license_context
 from utils.commercial_guard import require_active_commercial_context, requires_membership
 
 
+def set_verified_context(**overrides):
+    claims = {
+        "account_id": "7",
+        "license_key": "account:7",
+        "product_id": "comic_shrimp",
+        "entitlement": "comic_course",
+        "expires_at": "2099-01-01T00:00:00.000Z",
+        "signed_until": 4102444800,
+        "issued_at": 4102444200,
+    }
+    claims.update(overrides)
+    license_context.set_verified_context(claims, "diagnostic-only")
+
+
 class CommercialGuardTests(unittest.TestCase):
     def setUp(self):
         self._previous = os.environ.get("WANSHAN_REQUIRE_ACCOUNT_AUTH")
@@ -27,40 +41,16 @@ class CommercialGuardTests(unittest.TestCase):
         self.assertEqual(error.exception.detail, "account_required")
 
     def test_allows_only_the_current_product_and_entitlement_before_expiry(self):
-        license_context.set_context(
-            license_key="account:13800138000",
-            machine_id="diagnostic-only",
-            source="account",
-            product_id="comic_shrimp",
-            entitlement="comic_course",
-            expires_at="2099-01-01T00:00:00.000Z",
-            signed_until=4102444800,
-        )
+        set_verified_context()
         require_active_commercial_context()
 
     def test_rejects_cross_product_or_expired_context(self):
-        license_context.set_context(
-            license_key="account:13800138000",
-            machine_id="diagnostic-only",
-            source="account",
-            product_id="replay_shrimp",
-            entitlement="livewatch",
-            expires_at="2099-01-01T00:00:00.000Z",
-            signed_until=4102444800,
-        )
+        set_verified_context(product_id="replay_shrimp", entitlement="livewatch")
         with self.assertRaises(HTTPException) as cross_product:
             require_active_commercial_context()
         self.assertEqual(cross_product.exception.status_code, 403)
 
-        license_context.set_context(
-            license_key="account:13800138000",
-            machine_id="diagnostic-only",
-            source="account",
-            product_id="comic_shrimp",
-            entitlement="comic_course",
-            expires_at="2099-01-01T00:00:00.000Z",
-            signed_until=1,
-        )
+        set_verified_context(signed_until=1)
         with self.assertRaises(HTTPException) as expired:
             require_active_commercial_context()
         self.assertEqual(expired.exception.status_code, 401)

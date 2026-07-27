@@ -31,7 +31,7 @@ test("keeps the startup status window until the local backend is ready", () => {
   const main = fs.readFileSync(path.join(__dirname, "..", "electron", "main.js"), "utf8");
   const startBackend = main.lastIndexOf("\n  startBackend();");
   const waitForBackend = main.indexOf("backendReadyPromise = waitForBackend()", startBackend);
-  const createWindow = main.indexOf("\n  createWindow();", waitForBackend);
+  const createWindow = main.indexOf("\n  createWindow(", waitForBackend);
   assert.ok(startBackend >= 0 && waitForBackend > startBackend && createWindow > waitForBackend);
 });
 
@@ -41,4 +41,11 @@ test("shows a startup status window until the workspace is ready", () => {
   assert.match(main, /正在检查应用文件/);
   assert.match(main, /正在启动本地创作引擎/);
   assert.match(main, /closeSplashWindow\(\)/);
+});
+
+test("opens the login route immediately when no account session is stored and polls only stored sessions", () => {
+  const main = fs.readFileSync(path.join(__dirname, "..", "electron", "main.js"), "utf8");
+  assert.match(main, /const LICENSE_REFRESH_INTERVAL_MS = 10 \* 1000/);
+  assert.match(main, /licenseClient\.hasSession\(\)/);
+  assert.match(main, /createWindow\(hasStoredAccountSession \? "" : activationHash\("not_activated"\)\)/);
 });

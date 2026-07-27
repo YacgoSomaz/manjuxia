@@ -5,12 +5,13 @@ v3.59.60 新增 cloud_token 相关 endpoints — verify 成功后 Electron 把�
 backend 拿来调 qianshanai.cn 的 LLM 配置接口。
 """
 import logging
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Any
 
 from services import license_context as _lc
 from services import cloud_token_service as _cts
+from utils.account_license import AccountLicenseError, verify_account_license
 from utils.local_signature import require_local_signature
 
 logger = logging.getLogger(__name__)
@@ -23,26 +24,18 @@ router = APIRouter(
 
 
 class SetContextRequest(BaseModel):
-    license_key: str
     machine_id: str
-    source: Optional[str] = None  # 'qianshan' / 'thirdparty'
-    product_id: str
-    entitlement: str
-    expires_at: str
-    signed_until: int
+    account_license: dict[str, Any]
 
 
 @router.post("/set")
 async def set_license_context(req: SetContextRequest):
-    _lc.set_context(
-        req.license_key,
-        req.machine_id,
-        req.source,
-        req.product_id,
-        req.entitlement,
-        req.expires_at,
-        req.signed_until,
-    )
+    try:
+        claims = verify_account_license(req.account_license)
+    except AccountLicenseError:
+        # Do not expose parsing or signature details to a local caller.
+        raise HTTPException(status_code=403, detail="account_license_invalid")
+    _lc.set_verified_context(claims, req.machine_id)
     return {"success": True}
 
 

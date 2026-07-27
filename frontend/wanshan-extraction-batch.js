@@ -24,8 +24,7 @@
   };
 
   function isExtractionPage() {
-    const text = `${window.location.href || ""} ${window.location.hash || ""} ${document.title || ""}`;
-    return /extraction|信息提取/.test(text);
+    return window.wanshanRoute?.is("extraction") === true;
   }
 
   async function backendBase() {
@@ -75,7 +74,7 @@
     const style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `
-      .web-float{position:fixed;right:22px;bottom:74px;z-index:99990;border:1px solid rgba(34,211,238,.45);background:linear-gradient(135deg,#1d9bf0,#18b7a7);color:#fff;border-radius:8px;padding:10px 14px;cursor:pointer;box-shadow:0 10px 28px rgba(0,0,0,.35);font-weight:650}
+      .web-float{position:fixed;right:22px;bottom:28px;z-index:99990;border:1px solid rgba(34,211,238,.45);background:linear-gradient(135deg,#1d9bf0,#18b7a7);color:#fff;border-radius:8px;padding:10px 14px;cursor:pointer;box-shadow:0 10px 28px rgba(0,0,0,.35);font-weight:650}
       .web-float:hover{filter:brightness(1.08)}
       .web-mask{position:fixed;inset:0;z-index:99999;background:rgba(2,8,24,.72);display:flex;align-items:center;justify-content:center;padding:22px}
       .web-dialog{width:min(1160px,96vw);max-height:92vh;overflow:hidden;background:#111a32;border:1px solid rgba(100,181,246,.28);border-radius:10px;box-shadow:0 24px 70px rgba(0,0,0,.45);color:#e8f7ff;display:flex;flex-direction:column}
@@ -427,5 +426,9 @@
   setInterval(ensureButton, 1200);
   window.addEventListener("hashchange", ensureButton);
   window.addEventListener("popstate", ensureButton);
+  window.wanshanRoute?.watch(() => {
+    closeModal();
+    ensureButton();
+  });
   setTimeout(ensureButton, 800);
 })();

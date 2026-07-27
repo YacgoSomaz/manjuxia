@@ -2,12 +2,16 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 
-const { UpdateClient, compareVersions, verifyUpdateRelease } = require("../electron/update-client");
+const { UpdateClient, compareVersions, installerArgsForCurrentApp, verifyUpdateRelease } = require("../electron/update-client");
 
 const NOW = 1_780_000_000;
 
 function publicKeyText(publicKey) {
   return publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("base64url");
+}
+
+function publicKeySpkiText(publicKey) {
+  return publicKey.export({ format: "der", type: "spki" }).toString("base64url");
 }
 
 function payload(overrides = {}) {
@@ -61,6 +65,15 @@ test("accepts only a valid signed update_release for comic_shrimp", () => {
   assert.equal(result.ok, true);
   assert.equal(result.release.version, "0.1.14");
   assert.equal(result.release.installerUrl, "https://download.anyq.site/comic-shrimp/0.1.14/ComicShrimpSetup_0.1.14.exe");
+});
+
+test("accepts the exact Ed25519 SPKI encoding used by release configuration", () => {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
+  const result = verifyUpdateRelease(signedReply(payload(), privateKey), {
+    publicKey: publicKeySpkiText(publicKey), productId: "comic_shrimp", now: NOW
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.release.version, "0.1.14");
 });
 
 test("ignores all unsigned root fields and rejects cross-product or stale signatures", () => {
@@ -133,4 +146,16 @@ test("uses the fixed account endpoint and only blocks for signed mandatory or mi
     now: () => NOW * 1000
   });
   assert.equal((await requiredClient.check()).mandatory, true);
+});
+
+test("passes the current installed directory to the Inno updater", () => {
+  const args = installerArgsForCurrentApp({
+    getPath(name) {
+      assert.equal(name, "exe");
+      return "D:\\Apps\\ManJuXia\\漫剧虾.exe";
+    }
+  });
+  assert.deepEqual(args, ["/NORESTART", "/DIR=D:\\Apps\\ManJuXia"]);
+
+  assert.deepEqual(installerArgsForCurrentApp({ getPath: () => "D:\\Tools\\electron.exe" }), ["/NORESTART"]);
 });

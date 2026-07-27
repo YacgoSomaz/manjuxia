@@ -124,11 +124,14 @@ test("account client logs in, stores cookie, and verifies active membership", as
     now: () => nowMs
   });
 
+  assert.equal(client.hasSession(), false);
   assert.equal((await client.sendCode("13800138000")).success, true);
   assert.equal(calls[0].init.headers["X-Product-Code"], "comic_shrimp");
   const login = await client.login("13800138000", "123456");
   assert.equal(login.success, true);
   assert.equal(login.active, true);
+  assert.equal(client.hasSession(), true);
+  assert.equal(client.getAccountLicense().schema, "anyq.account-license.v1");
   assert.equal(fs.existsSync(path.join(tempDir, "account.dat")), true);
   const verified = await client.verify();
   assert.equal(verified.ok, true);
@@ -415,4 +418,105 @@ test("account client refresh observes a server-side product stop instead of repl
   assert.equal(refreshed.reason, "unauthorized_tool");
   assert.equal(client.verifyCached().ok, false);
   assert.equal(client.getInfo().active, false);
+});
+
+test("account client renews the signed snapshot every 60 seconds across 600 seconds", async () => {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  const accountPublicKey = rawPublicKey(publicKey);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "manjuxia-account-renewal-"));
+  const baseMs = 1_700_000_000_000;
+  let nowMs = baseMs;
+  const user = { id: 13, phone: "13300133000", role: "regular" };
+  const products = [{
+    product_id: "comic_shrimp",
+    status: "active",
+    expires_at: new Date(baseMs + 86400_000).toISOString(),
+    entitlements: ["comic_course"]
+  }];
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url, init });
+    if (url.endsWith("/api/auth/login") || url.endsWith("/api/auth/me")) {
+      const issuedAt = Math.floor(nowMs / 1000);
+      return jsonResponse({
+        ok: true,
+        user,
+        products,
+        account_license: createSignedAccount({ privateKey, user, products, now: issuedAt, signedUntil: issuedAt + 600 })
+      }, url.endsWith("/api/auth/login") ? { "set-cookie": "wz_session=renewal-token; Path=/; HttpOnly" } : {});
+    }
+    throw new Error(`unexpected url ${url}`);
+  };
+  const client = new AccountClient({
+    baseUrl: "https://anyq.site",
+    publicKey: { "account-v1": accountPublicKey },
+    productCode: "comic_shrimp",
+    deviceHash: "device-renewal",
+    appVersion: "0.1.28",
+    dataPath: path.join(tempDir, "account.dat"),
+    safeStorage: fakeStorage(),
+    fetchImpl,
+    now: () => nowMs
+  });
+
+  assert.equal((await client.login(user.phone, "123456")).success, true);
+  const issued = [];
+  for (let minute = 1; minute <= 10; minute += 1) {
+    nowMs = baseMs + minute * 60_000;
+    const refreshed = await client.verify();
+    assert.equal(refreshed.ok, true);
+    issued.push(client.getInfo().signed_until);
+    assert.equal(client.getInfo().active, true);
+  }
+  assert.equal(new Set(issued).size, 10);
+  assert.ok(issued[9] > Math.floor(nowMs / 1000));
+  for (const call of calls) {
+    assert.equal(call.init.cache, "no-store");
+    assert.equal(call.init.headers["Cache-Control"], "no-cache");
+    assert.equal(call.init.headers.Pragma, "no-cache");
+  }
+});
+
+test("expired signed snapshot cannot authorize after a network failure", async () => {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  const accountPublicKey = rawPublicKey(publicKey);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "manjuxia-account-offline-expiry-"));
+  const baseMs = 1_700_000_000_000;
+  let nowMs = baseMs;
+  const user = { id: 14, phone: "13200132000", role: "regular" };
+  const products = [{ product_id: "comic_shrimp", status: "active", expires_at: new Date(baseMs + 86400_000).toISOString(), entitlements: ["comic_course"] }];
+  let online = true;
+  const fetchImpl = async (url) => {
+    if (!online) throw new Error("offline");
+    if (url.endsWith("/api/auth/login") || url.endsWith("/api/auth/me")) {
+      const issuedAt = Math.floor(nowMs / 1000);
+      return jsonResponse({
+        ok: true,
+        user,
+        products,
+        account_license: createSignedAccount({ privateKey, user, products, now: issuedAt, signedUntil: issuedAt + 600 })
+      }, url.endsWith("/api/auth/login") ? { "set-cookie": "wz_session=expiry-token; Path=/; HttpOnly" } : {});
+    }
+    throw new Error(`unexpected url ${url}`);
+  };
+  const client = new AccountClient({
+    baseUrl: "https://anyq.site",
+    publicKey: { "account-v1": accountPublicKey },
+    productCode: "comic_shrimp",
+    dataPath: path.join(tempDir, "account.dat"),
+    safeStorage: fakeStorage(),
+    fetchImpl,
+    now: () => nowMs
+  });
+  assert.equal((await client.login(user.phone, "123456")).success, true);
+  nowMs = baseMs + 300_000;
+  online = false;
+  assert.equal((await client.verify()).ok, true);
+  assert.equal((await client.verify()).offline, true);
+  nowMs = baseMs + 601_000;
+  const expired = await client.verify();
+  assert.equal(expired.ok, false);
+  assert.equal(expired.reason, "signature_expired");
+  assert.equal(client.verifyCached().ok, false);
+  assert.equal(client.verifyCached().reason, "signature_expired");
 });

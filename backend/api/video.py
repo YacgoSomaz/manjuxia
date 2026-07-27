@@ -10,6 +10,7 @@ import os
 import uuid
 import re
 import aiofiles
+import shutil
 from utils.ssl_helper import get_aiohttp_connector
 
 from services.video_service import VideoService
@@ -21,6 +22,70 @@ from utils.timezone import now_beijing
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/video", tags=["video"])
 video_service = VideoService()
+
+# 千山同源的本地小云雀 CLI 适配。漫剧虾仍以本地模型配置为主，
+# 这里的 Access Key 只存本机 app_settings，不参与云端模型配置同步。
+CONFIG_VIDEO_PROVIDERS = ("volcengine_ark", "cool", "xinglian")
+UNIFIED_VIDEO_PROVIDERS = CONFIG_VIDEO_PROVIDERS + ("pippit_cli",)
+PROVIDER_FRIENDLY = {
+    "cool": "Cool API",
+    "volcengine_ark": "火山方舟",
+    "xinglian": "星链云",
+    "pippit_cli": "小云雀 CLI",
+}
+PIPPIT_ACCESS_KEY_SETTING = "pippit.access_key"
+
+
+def _mask_secret(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if len(text) <= 8:
+        return "***"
+    return f"{text[:4]}***{text[-4:]}"
+
+
+async def _get_app_setting(key: str, default: str = "") -> str:
+    db = await get_db()
+    try:
+        cur = await db.execute("SELECT value FROM app_settings WHERE key = ?", (key,))
+        row = await cur.fetchone()
+        return str(row["value"] if row and row["value"] is not None else default)
+    finally:
+        await db.close()
+
+
+async def _set_app_setting(key: str, value: str) -> None:
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now', '+8 hours')) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, value),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+def _env_pippit_access_key() -> str:
+    for name in (
+        "PIPPIT_ACCESS_KEY", "PIPPIT_API_KEY", "PIPPIT_TOOL_ACCESS_KEY",
+        "XIAOYUNQUE_ACCESS_KEY", "XIAOYUNQUE_API_KEY",
+    ):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return ""
+
+
+async def _get_pippit_access_key() -> str:
+    return _env_pippit_access_key() or (await _get_app_setting(PIPPIT_ACCESS_KEY_SETTING)).strip()
+
+
+async def _pippit_provider_config() -> Dict[str, Any]:
+    access_key = await _get_pippit_access_key()
+    return {"access_key": access_key} if access_key else {}
 
 
 def _strip_llm_metadata(prompt: str) -> str:
@@ -1513,6 +1578,137 @@ async def relogin_jimeng():
     return result
 
 
+class PippitSubmitRequest(BaseModel):
+    storyboard_id: int
+    prompt: str
+    params: Optional[dict] = None
+    use_chain_frame: bool = False
+
+
+class PippitConfigSaveRequest(BaseModel):
+    access_key: str = ""
+
+
+@router.get("/pippit/config")
+async def get_pippit_config():
+    env_key = _env_pippit_access_key()
+    local_key = (await _get_app_setting(PIPPIT_ACCESS_KEY_SETTING)).strip()
+    active_key = env_key or local_key
+    return {
+        "success": True,
+        "has_access_key": bool(active_key),
+        "has_env_access_key": bool(env_key),
+        "has_local_access_key": bool(local_key),
+        "access_key_masked": _mask_secret(active_key),
+    }
+
+
+@router.post("/pippit/config")
+async def save_pippit_config(req: PippitConfigSaveRequest):
+    access_key = (req.access_key or "").strip()
+    await _set_app_setting(PIPPIT_ACCESS_KEY_SETTING, access_key)
+    return {
+        "success": True,
+        "message": "小云雀 Access Key 已保存" if access_key else "小云雀 Access Key 已清空",
+        "has_access_key": bool(access_key or _env_pippit_access_key()),
+        "has_env_access_key": bool(_env_pippit_access_key()),
+        "has_local_access_key": bool(access_key),
+        "access_key_masked": _mask_secret(_env_pippit_access_key() or access_key),
+    }
+
+
+@router.post("/pippit/check")
+async def check_pippit_cli():
+    from services.video_providers import get_provider
+
+    provider = get_provider("pippit_cli", await _pippit_provider_config())
+    result = await provider.check_login()
+    access_key = await _get_pippit_access_key()
+    return {
+        "success": bool(result.get("success")),
+        "message": result.get("message") or result.get("error") or "",
+        "cli_found": bool(result.get("cli_found")),
+        "logged_in": bool(result.get("logged_in")),
+        "has_access_key": bool(access_key),
+        "access_key_masked": _mask_secret(access_key),
+    }
+
+
+@router.post("/pippit/submit")
+async def pippit_submit(request: PippitSubmitRequest):
+    """小云雀 CLI 单条提交，按统一 provider 轮询。"""
+    from services.video_providers import get_provider
+
+    sb_id = request.storyboard_id
+    claim = await _try_claim_storyboard_for_submit(sb_id, provider="pippit_cli")
+    if not claim["claimed"]:
+        if claim.get("not_found"):
+            return {"success": False, "message": "分镜不存在"}
+        return {
+            "success": False,
+            "duplicate": True,
+            "message": f"该分镜已有任务在生成({claim.get('blocked_minutes', -1)} 分钟前),拒绝重复提交",
+        }
+
+    video_log_id = None
+    try:
+        await _apply_speaker_filter_to_storyboard(sb_id, request.prompt or "")
+        images, audios, image_labels, audio_labels = await _collect_storyboard_assets_for_ark(
+            sb_id, use_chain_frame=request.use_chain_frame, provider_type="pippit_cli"
+        )
+        final_prompt = await _build_final_video_prompt(
+            storyboard_id=sb_id,
+            raw_prompt=request.prompt or "",
+            image_items=image_labels[:9],
+            audio_items=audio_labels[:3],
+            with_file_refs=True,
+            log_prefix="pippit/submit",
+        )
+        final_params = dict(request.params or {})
+        duration = _extract_section_duration(request.prompt or "")
+        if duration is not None:
+            final_params["duration"] = duration
+        video_log_id = await _log_video_submit_start(
+            storyboard_id=sb_id, provider="pippit_cli", provider_code="pippit_cli",
+            model=final_params.get("model") or final_params.get("model_version") or "",
+            config_name="小云雀 CLI", base_url="", final_prompt=final_prompt,
+            images=images, audios=audios, params=final_params,
+        )
+        provider = get_provider("pippit_cli", await _pippit_provider_config())
+        sub_res = await provider.submit(prompt=final_prompt, images=images, audios=audios, params=final_params)
+        if not sub_res.success:
+            await _log_video_submit_end(video_log_id, success=False, fail_reason=sub_res.fail_reason,
+                                        sanitized_payload=sub_res.sanitized_payload)
+            await storyboard_service.update_video_status(sb_id, "failed", fail_reason=sub_res.fail_reason or "小云雀 CLI 提交失败")
+            return {"success": False, "message": sub_res.fail_reason or "小云雀 CLI 提交失败", "error_code": sub_res.error_code}
+
+        await _log_video_submitted(video_log_id, provider="pippit_cli", submit_id=sub_res.submit_id)
+        db = await get_db()
+        try:
+            await db.execute(
+                "UPDATE storyboards SET submit_id = ?, video_status = 'generating', video_submit_time = ?, "
+                "video_provider = ?, video_config_id = NULL, video_url = NULL, last_frame_path = NULL, "
+                "last_frame_orig_path = NULL, video_fail_reason = NULL WHERE id = ?",
+                (sub_res.submit_id, _now_str_simple(), "pippit_cli", sb_id),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+        return {"success": True, "submit_id": sub_res.submit_id, "message": "已提交小云雀 CLI"}
+    except Exception as e:
+        logger.exception("[pippit/submit] sb=%s 异常: %s", sb_id, e)
+        try:
+            await storyboard_service.update_video_status(sb_id, "failed", fail_reason=f"小云雀提交异常: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        if video_log_id:
+            try:
+                await _log_video_submit_end(video_log_id, success=False, fail_reason=f"{type(e).__name__}: {e}")
+            except Exception:
+                pass
+        return {"success": False, "message": f"小云雀提交异常: {type(e).__name__}: {e}"}
+
+
 # v3.61.6 火山方舟单条提交(非队列路径)— 跟 /generate 对等,但走 VolcengineArkProvider
 class ArkSubmitRequest(BaseModel):
     storyboard_id: int
@@ -1993,7 +2189,7 @@ def _cloud_timeout_minutes(provider: Optional[str]) -> int:
       - None / jimeng  = 30  不该走云端路径,兜底
     """
     p = (provider or "").lower()
-    if p == "volcengine_ark":
+    if p in ("volcengine_ark", "pippit_cli"):
         return 5
     if p == "xinglian":
         return 180
@@ -3098,49 +3294,51 @@ async def _poll_storyboard_via_cloud(
     from services.cloud_llm_sync import get_active_config
     from utils.paths import media_subdir
 
-    _provider_friendly = {"cool": "Cool API", "volcengine_ark": "火山方舟", "xinglian": "星链云"}.get(provider_type, provider_type)
+    _provider_friendly = PROVIDER_FRIENDLY.get(provider_type, provider_type)
 
     # 1. 取分镜对应的视频配置(api_key)
     # v3.61.171 优先:storyboards.video_config_id(submit 时写的真值)
     #   兜底:video_task_queue.video_config_id(队列路径,老逻辑)
     # 老 bug:直 submit 路径不入队 → SQL LIMIT 1 拿到的是 sb 历史其他 provider 的 cfg_id
     #   实测 sb=2478 cool 提交后查到的是 1072(ARK 配置)→ 用 ARK sk-volc 调 cool 上游 → 401
-    db = await get_db()
-    try:
-        cur = await db.execute(
-            "SELECT video_config_id FROM storyboards WHERE id = ?",
-            (sid,),
-        )
-        srow = await cur.fetchone()
-        cfg_id = srow["video_config_id"] if srow and srow["video_config_id"] else None
-        if not cfg_id:
-            # 兜底:队列路径(老逻辑)
+    if provider_type == "pippit_cli":
+        provider = get_provider("pippit_cli", await _pippit_provider_config())
+    else:
+        db = await get_db()
+        try:
             cur = await db.execute(
-                "SELECT video_config_id FROM video_task_queue WHERE storyboard_id = ? "
-                "AND provider IN ('volcengine_ark', 'cool', 'xinglian') ORDER BY id DESC LIMIT 1",
+                "SELECT video_config_id FROM storyboards WHERE id = ?",
                 (sid,),
             )
-            qrow = await cur.fetchone()
-            cfg_id = qrow["video_config_id"] if qrow else None
-    finally:
-        await db.close()
+            srow = await cur.fetchone()
+            cfg_id = srow["video_config_id"] if srow and srow["video_config_id"] else None
+            if not cfg_id:
+                cur = await db.execute(
+                    "SELECT video_config_id FROM video_task_queue WHERE storyboard_id = ? "
+                    "AND provider IN ('volcengine_ark', 'cool', 'xinglian') ORDER BY id DESC LIMIT 1",
+                    (sid,),
+                )
+                qrow = await cur.fetchone()
+                cfg_id = qrow["video_config_id"] if qrow else None
+        finally:
+            await db.close()
 
-    try:
-        cloud_cfg = await get_active_config(config_id=cfg_id, config_type="video")
-    except Exception as e:
-        return {
-            "id": sid,
-            "video_status": "generating",
-            "video_url": None,
-            "fail_reason": f"{_provider_friendly} 配置失效: {e}",
-        }
-    if not cloud_cfg:
-        return {
-            "id": sid,
-            "video_status": "generating",
-            "video_url": None,
-            "fail_reason": f"未找到 {_provider_friendly} 配置",
-        }
+        try:
+            cloud_cfg = await get_active_config(config_id=cfg_id, config_type="video")
+        except Exception as e:
+            return {
+                "id": sid,
+                "video_status": "generating",
+                "video_url": None,
+                "fail_reason": f"{_provider_friendly} 配置失效: {e}",
+            }
+        if not cloud_cfg:
+            return {
+                "id": sid,
+                "video_status": "generating",
+                "video_url": None,
+                "fail_reason": f"未找到 {_provider_friendly} 配置",
+            }
 
     # v3.61.107: 企业本地 APIKey 覆盖,跟 submit 同源
     # v3.61.169: ★ 关键防御 — local_api_key 是企业"火山方舟" AK/SK 解密的 sk-volc 格式
@@ -3154,7 +3352,7 @@ async def _poll_storyboard_via_cloud(
         _final_api_key = (cloud_cfg.get("apiKey") or "").strip()
     else:
         _final_api_key = _local_key or (cloud_cfg.get("apiKey") or "").strip()
-    provider = get_provider(provider_type, {
+        provider = get_provider(provider_type, {
         "id": cloud_cfg.get("id"),
         "name": cloud_cfg.get("name"),
         "base_url": cloud_cfg.get("baseUrl"),
@@ -3225,6 +3423,38 @@ async def _poll_storyboard_via_cloud(
 
     # 3. status = success → 下载视频到本地
     if qres.status == "success":
+        if provider_type == "pippit_cli":
+            local_video_path = None
+            if isinstance(qres.raw, dict):
+                local_video_path = qres.raw.get("_local_video_path")
+            if not local_video_path and qres.video_url and not str(qres.video_url).startswith(("http://", "https://")):
+                local_video_path = qres.video_url
+            if local_video_path and os.path.isfile(local_video_path):
+                if await _is_stale():
+                    return {"id": sid, "video_status": "generating", "video_url": None, "stale_poll": True}
+                videos_dir = os.path.normpath(media_subdir("videos"))
+                os.makedirs(videos_dir, exist_ok=True)
+                ext = os.path.splitext(local_video_path)[1] or ".mp4"
+                path_info = await _build_friendly_video_path(sid, ext)
+                if not path_info:
+                    path_info = ("", f"storyboard_{sid}{ext}")
+                subdir, fname = path_info
+                target_dir = os.path.join(videos_dir, subdir)
+                os.makedirs(target_dir, exist_ok=True)
+                target_path = os.path.abspath(os.path.join(target_dir, fname))
+                source_path = os.path.abspath(local_video_path)
+                if source_path != target_path:
+                    shutil.copy2(source_path, target_path)
+                local_url = f"/data/videos/{subdir}/{fname}" if subdir else f"/data/videos/{fname}"
+                await storyboard_service.update_video_status(sid, "done", local_url)
+                await _finalize_video_log_success(
+                    storyboard_id=sid, submit_id=submit_id, provider=provider_type,
+                    video_url=local_url, actual_duration=qres.duration or None,
+                )
+                return {"id": sid, "video_status": "done", "video_url": local_url, "last_frame_path": None}
+            if qres.video_url and not str(qres.video_url).startswith(("http://", "https://")):
+                qres.video_url = None
+
         if not qres.video_url:
             if await _is_stale():
                 return {"id": sid, "video_status": "generating", "video_url": None, "stale_poll": True}
@@ -3479,6 +3709,78 @@ async def list_video_tasks(status: str = None):
     """查询视频任务列表"""
     result = await video_service.list_tasks(status=status)
     return result
+
+
+@router.get("/history")
+async def list_video_history(limit: int = 100, offset: int = 0):
+    """返回本地已完成成片，供独立的历史成片页展示。
+
+    这里只读取已经落库到 storyboards.video_url 的完成记录，不重新查询
+    第三方平台，也不把远端任务列表当成本地历史。视频文件是否仍存在
+    另行返回 exists，旧记录因此仍可保留并给用户明确提示。
+    """
+    limit = max(1, min(int(limit or 100), 200))
+    offset = max(0, int(offset or 0))
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """
+            SELECT sb.id, sb.novel_id, sb.script_id, sb.scene_number,
+                   sb.scene_index, sb.section_number, sb.description,
+                   sb.video_url, sb.video_provider, sb.video_submit_time,
+                   sb.created_at, n.name AS novel_name, c.title AS chapter_title
+            FROM storyboards sb
+            LEFT JOIN novels n ON n.id = sb.novel_id
+            LEFT JOIN scripts s ON s.id = sb.script_id
+            LEFT JOIN chapters c ON c.id = s.chapter_id
+            WHERE sb.video_status = 'done'
+              AND sb.video_url IS NOT NULL
+              AND TRIM(sb.video_url) != ''
+            ORDER BY COALESCE(sb.video_submit_time, sb.created_at) DESC, sb.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        rows = await cursor.fetchall()
+        count_cursor = await db.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM storyboards
+            WHERE video_status = 'done'
+              AND video_url IS NOT NULL
+              AND TRIM(video_url) != ''
+            """
+        )
+        count_row = await count_cursor.fetchone()
+    finally:
+        await db.close()
+
+    items = []
+    for row in rows:
+        video_url = str(row["video_url"] or "")
+        local_path = None
+        if video_url.startswith("/data/"):
+            try:
+                local_path = resolve_db_path(video_url)
+            except Exception:
+                local_path = None
+        items.append({
+            "id": row["id"],
+            "novel_id": row["novel_id"],
+            "script_id": row["script_id"],
+            "scene_number": row["scene_number"],
+            "scene_index": row["scene_index"],
+            "section_number": row["section_number"],
+            "description": row["description"] or "",
+            "video_url": video_url,
+            "video_provider": row["video_provider"] or "",
+            "video_submit_time": row["video_submit_time"],
+            "created_at": row["created_at"],
+            "novel_name": row["novel_name"] or "未命名小说",
+            "chapter_title": row["chapter_title"] or "未分章",
+            "exists": bool(local_path and os.path.isfile(local_path)),
+        })
+    return {"success": True, "items": items, "total": int((count_row or {"total": 0})["total"] or 0), "limit": limit, "offset": offset}
 
 
 @router.get("/storyboard-elements/{storyboard_id}")
@@ -3862,7 +4164,7 @@ async def poll_video_status(request: PollStatusRequest):
                     # 按 provider 决定阈值
                     _sb_prov_to_threshold = (row['video_provider'] if 'video_provider' in row.keys() else None) or 'jimeng'
                     # v3.61.175: cloud provider (ark/cool/xinglian) 走 helper,jimeng CLI 走旧常量
-                    if _sb_prov_to_threshold in ('volcengine_ark', 'cool', 'xinglian'):
+                    if _sb_prov_to_threshold in ('volcengine_ark', 'cool', 'xinglian', 'pippit_cli'):
                         _timeout_min = _cloud_timeout_minutes(_sb_prov_to_threshold)
                     else:
                         _timeout_min = TIMEOUT_MINUTES_JIMENG
@@ -3908,7 +4210,7 @@ async def poll_video_status(request: PollStatusRequest):
                         # ★ v3.61.121:按 provider 路由 — 火山方舟/Cool 走 cloud HTTP API 查询,即梦走 CLI
                         # v3.61.168: cool 跟 ark 复用 _poll_storyboard_via_cloud(provider_type 透传)
                         _sb_provider_to = (row['video_provider'] if 'video_provider' in row.keys() else None) or 'jimeng'
-                        if _sb_provider_to in ('volcengine_ark', 'cool', 'xinglian'):
+                        if _sb_provider_to in ('volcengine_ark', 'cool', 'xinglian', 'pippit_cli'):
                             # 云端 HTTP 超时强查 — 复用 _poll_storyboard_via_cloud(query + 下载 + 状态写回 + 抽尾帧 hook)
                             try:
                                 _ark_to = await _poll_storyboard_via_cloud(
@@ -4196,7 +4498,7 @@ async def poll_video_status(request: PollStatusRequest):
             _allow_failed_force_retry = (
                 request.force
                 and row['submit_id']
-                and _sb_prov_for_failed in ('volcengine_ark', 'cool', 'xinglian')
+                and _sb_prov_for_failed in ('volcengine_ark', 'cool', 'xinglian', 'pippit_cli')
             )
             if row['video_status'] == 'failed':
                 if not _allow_failed_force_retry:
@@ -4222,7 +4524,7 @@ async def poll_video_status(request: PollStatusRequest):
             # storyboard.video_provider 标记了用哪个 provider 提交的
             # v3.61.168: cool 跟 ark 都走 _poll_storyboard_via_cloud,provider_type 透传
             sb_provider = (row['video_provider'] if 'video_provider' in row.keys() else None) or 'jimeng'
-            if sb_provider in ('volcengine_ark', 'cool', 'xinglian'):
+            if sb_provider in ('volcengine_ark', 'cool', 'xinglian', 'pippit_cli'):
                 # 云端 HTTP API 查询
                 ark_result = await _poll_storyboard_via_cloud(
                     sid, submit_id,
@@ -4998,6 +5300,117 @@ async def get_storyboard_chain_prev(storyboard_id: int):
 
 
 # ============================================================
+# v3.61.383: 用户可主动解除卡住的本地视频任务占用。
+class AbortStuckVideoRequest(BaseModel):
+    storyboard_ids: List[int]
+    reason: Optional[str] = None
+
+
+class RecoverChainRequest(BaseModel):
+    storyboard_id: int
+    storyboard_ids: Optional[List[int]] = None
+
+
+@router.post("/abort-stuck-video")
+async def abort_stuck_video(request: AbortStuckVideoRequest):
+    """将指定的 generating/queued 任务标记失败，允许用户重新生成。
+
+    这里只解除本地占用，不宣称取消上游任务；部分 provider 没有可靠的取消接口。
+    """
+    if not request.storyboard_ids:
+        return {"success": True, "aborted": 0, "aborted_ids": []}
+    reason = request.reason or "已手动中止生成，可重新勾选生成"
+    db = await get_db()
+    aborted_ids: list = []
+    try:
+        placeholder = ",".join(["?"] * len(request.storyboard_ids))
+        cursor = await db.execute(
+            f"SELECT id FROM storyboards WHERE id IN ({placeholder}) AND video_status IN ('generating','queued')",
+            request.storyboard_ids,
+        )
+        targets = [r["id"] for r in await cursor.fetchall()]
+        for tid in targets:
+            await db.execute(
+                "UPDATE storyboards SET video_status = ?, video_fail_reason = ?, "
+                "submit_id = CASE WHEN COALESCE(video_provider, 'jimeng') = 'jimeng' THEN NULL ELSE submit_id END "
+                "WHERE id = ?",
+                ("failed", reason, tid),
+            )
+            await db.execute(
+                "UPDATE video_task_queue SET status = 'aborted', finished_at = ?, "
+                "error_code = 'USER_ABORTED', error_message = ? "
+                "WHERE storyboard_id = ? AND status IN ('queued','generating')",
+                (_now_str_simple(), reason, tid),
+            )
+            aborted_ids.append(tid)
+        await db.commit()
+        return {"success": True, "aborted": len(aborted_ids), "aborted_ids": aborted_ids}
+    finally:
+        await db.close()
+
+
+@router.post("/recover-chain")
+async def recover_chain(request: RecoverChainRequest):
+    """恢复串行尾帧模式下被 chain_aborted 阻断的后续分镜。
+
+    只解除本地链路中断状态，不取消或改写上游已提交任务。
+    """
+    db = await get_db()
+    recovered_ids: list[int] = []
+    try:
+        cursor = await db.execute(
+            "SELECT id, novel_id, script_id, sort_order FROM storyboards WHERE id = ?",
+            (request.storyboard_id,),
+        )
+        source = await cursor.fetchone()
+        if not source:
+            raise HTTPException(status_code=404, detail=f"分镜 id={request.storyboard_id} 不存在")
+
+        explicit_ids = [int(x) for x in (request.storyboard_ids or []) if int(x) > 0]
+        if explicit_ids:
+            placeholder = ",".join(["?"] * len(explicit_ids))
+            cursor = await db.execute(
+                f"SELECT id FROM storyboards WHERE id IN ({placeholder}) AND video_status = 'chain_aborted'",
+                explicit_ids,
+            )
+        else:
+            script_id = source["script_id"]
+            if script_id is None:
+                cursor = await db.execute(
+                    "SELECT id FROM storyboards "
+                    "WHERE novel_id = ? AND script_id IS NULL AND sort_order > ? AND video_status = 'chain_aborted' "
+                    "ORDER BY sort_order ASC, id ASC",
+                    (source["novel_id"], source["sort_order"] or 0),
+                )
+            else:
+                cursor = await db.execute(
+                    "SELECT id FROM storyboards "
+                    "WHERE novel_id = ? AND script_id = ? AND sort_order > ? AND video_status = 'chain_aborted' "
+                    "ORDER BY sort_order ASC, id ASC",
+                    (source["novel_id"], script_id, source["sort_order"] or 0),
+                )
+        recovered_ids = [int(row["id"]) for row in await cursor.fetchall()]
+        if not recovered_ids:
+            return {"success": True, "recovered": 0, "storyboard_ids": []}
+
+        placeholder = ",".join(["?"] * len(recovered_ids))
+        await db.execute(
+            f"UPDATE storyboards SET video_status = NULL, video_fail_reason = NULL, submit_id = NULL "
+            f"WHERE id IN ({placeholder}) AND video_status = 'chain_aborted'",
+            recovered_ids,
+        )
+        await db.execute(
+            f"UPDATE video_task_queue SET status = 'aborted', finished_at = ?, "
+            f"error_code = 'CHAIN_RECOVERED', error_message = '链路已手动恢复，旧队列占用已清理' "
+            f"WHERE storyboard_id IN ({placeholder}) AND status IN ('queued','generating')",
+            [_now_str_simple(), *recovered_ids],
+        )
+        await db.commit()
+        return {"success": True, "recovered": len(recovered_ids), "storyboard_ids": recovered_ids}
+    finally:
+        await db.close()
+
+
 # v3.61.100: 火山方舟视频任务修复工具
 # ============================================================
 #

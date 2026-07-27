@@ -438,6 +438,32 @@ def _storyboard_assemble_eligibility(template: dict):
     return ("assemble", admin_id)
 
 
+def _template_tags(template: dict) -> List[str]:
+    raw = (template or {}).get("tags")
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except Exception:
+            pass
+        return [item.strip() for item in re.split(r"[,，、;；]", text) if item.strip()]
+    return []
+
+
+def _storyboard_flow(template: dict) -> str:
+    """选择补镜/分镜解析流程；缺少标签时保持漫剧虾旧版短剧行为。"""
+    tags = set(_template_tags(template))
+    return "short_film" if "短片" in tags or "short_film" in tags else "short_drama"
+
+
 def _parse_camera_continuity(camera_text: str) -> Optional[Dict[str, str]]:
     """把 camera 文本拆成景别/机位/运镜,用于跨小节景别避重。"""
     camera = str(camera_text or "").strip()

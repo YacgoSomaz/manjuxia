@@ -10,3 +10,4 @@ aiofiles>=24.1,<25
 python-docx>=1.2,<2
 openpyxl>=3.1,<4
 Pillow>=12.2,<13
+cryptography>=43,<48

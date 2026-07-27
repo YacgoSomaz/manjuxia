@@ -3,8 +3,13 @@ import sys
 
 
 def is_frozen() -> bool:
-    """判断是否在 PyInstaller 打包环境中运行"""
-    return getattr(sys, 'frozen', False)
+    """判断是否在打包环境中运行。
+
+    PyInstaller 会设置 ``sys.frozen``；Nuitka standalone 运行时会设置
+    ``__compiled__``。商业包后端现在由 Nuitka 编译，不能只判断
+    PyInstaller，否则会漏掉安装包内 resources/backend-dist 下的 CLI 资源。
+    """
+    return bool(getattr(sys, 'frozen', False) or globals().get('__compiled__'))
 
 
 APP_NAME = os.environ.get("WANSHAN_APP_NAME", "万山")

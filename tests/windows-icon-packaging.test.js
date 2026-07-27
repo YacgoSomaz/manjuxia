@@ -17,6 +17,6 @@ test("uses the 漫剧虾 icon for the executable, installer, and shortcuts", () 
   assert.match(build, /assets\\manjuxia-app-icon\.ico/);
   assert.match(build, /\$_.Extension -ieq "\.map"/);
   assert.match(build, /\$_.Extension -in "\.map", "\.md", "\.tmp", "\.bak"/);
-  assert.match(installer, /SetupIconFile=.*manjuxia-app-icon\.ico/);
-  assert.match(installer, /IconFilename: "\{app\}\\resources\\frontend\\assets\\manjuxia-app-icon\.ico"/);
+  assert.match(installer, /SetupIconFile=\{#SourcePath\}\\漫剧虾\.ico/);
+  assert.match(installer, /IconFilename: "\{app\}\\漫剧虾\.exe"/);
 });

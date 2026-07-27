@@ -50,7 +50,7 @@ function verifyPackagedRelease(root) {
   } catch (error) {
     return { ok: false, reason: `invalid integrity manifest: ${error.message}` };
   }
-  if (manifest.algorithm !== "sha256" || !manifest.files || typeof manifest.files !== "object") {
+  if (manifest.version !== 2 || manifest.algorithm !== "sha256" || manifest.scope !== "core" || !manifest.files || typeof manifest.files !== "object") {
     return { ok: false, reason: "unsupported integrity manifest" };
   }
 
@@ -65,17 +65,9 @@ function verifyPackagedRelease(root) {
   }
 
   const files = walkFiles(releaseRoot);
-  const payloadFiles = files.filter((file) => {
-    const name = path.basename(file);
-    return name !== "integrity_manifest.json" && name !== "integrity_manifest.sig";
-  });
   const listedFiles = new Set(Object.keys(manifest.files));
   if (listedFiles.has("integrity_manifest.json") || listedFiles.has("integrity_manifest.sig")) {
     return { ok: false, reason: "integrity metadata must not be listed as payload" };
-  }
-  for (const file of payloadFiles) {
-    const relative = path.relative(releaseRoot, file).split(path.sep).join("/");
-    if (!listedFiles.has(relative)) return { ok: false, reason: `unregistered release file: ${relative}` };
   }
   for (const relative of listedFiles) {
     const target = path.resolve(releaseRoot, relative);
@@ -83,10 +75,19 @@ function verifyPackagedRelease(root) {
       return { ok: false, reason: `manifest path escaped release root: ${relative}` };
     }
   }
-  const sourceLeak = files.find((file) => path.extname(file).toLowerCase() === ".py");
+  const protectedRoots = [
+    path.join(releaseRoot, "resources", "app"),
+    path.join(releaseRoot, "resources", "backend-dist"),
+  ];
+  const sourceLeak = files.find((file) => {
+    const normalized = path.resolve(file);
+    const protectedCode = protectedRoots.some((root) => normalized === root || normalized.startsWith(`${root}${path.sep}`));
+    return protectedCode && path.extname(file).toLowerCase() === ".py";
+  });
   if (sourceLeak) return { ok: false, reason: `Python source leaked: ${path.relative(releaseRoot, sourceLeak)}` };
-  if (!files.some((file) => path.extname(file).toLowerCase() === ".pyd")) {
-    return { ok: false, reason: "compiled Python module (.pyd) missing" };
+  const backendExecutable = path.join(releaseRoot, "resources", "backend-dist", "backend-server", "backend-server.exe");
+  if (!fs.existsSync(backendExecutable) || !fs.statSync(backendExecutable).isFile()) {
+    return { ok: false, reason: "compiled backend executable missing" };
   }
 
   for (const [relative, expected] of Object.entries(manifest.files)) {
