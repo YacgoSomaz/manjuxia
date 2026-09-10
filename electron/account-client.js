@@ -11,6 +11,13 @@ const DEFAULT_KEY_ID = "account-v1";
 const MAX_CLOCK_SKEW_SECONDS = 120;
 const MAX_LICENSE_DURATION_SECONDS = 600;
 const REQUEST_TIMEOUT_MS = 12_000;
+// Text-to-script jobs run synchronously on the current anyq.site gateway and
+// regularly take 30–90 seconds for a full chapter.  Account/login requests
+// retain the short timeout; only the main-process official-AI bridge opts in.
+// Official text/image job submission and polling requests may legitimately
+// occupy the gateway for several minutes.  Keep every official-AI transport
+// layer aligned with the product's five-minute image timeout.
+const OFFICIAL_AI_REQUEST_TIMEOUT_MS = 300_000;
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 
 function normalizeBaseUrl(value) {
@@ -161,7 +168,7 @@ function normalizePublicKeys(publicKey) {
   return {};
 }
 
-function verifyAccountDocument(document, { publicKey, productCode, now = Date.now() }) {
+function verifyAccountDocument(document, { publicKey, productCode, now = Date.now(), useSignedServerTime = false }) {
   try {
     if (!document || document.schema !== ACCOUNT_LICENSE_SCHEMA || document.alg !== "Ed25519" || !document.key_id || !document.payload || !document.signature) {
       return { ok: false, reason: "invalid_envelope" };
@@ -180,11 +187,24 @@ function verifyAccountDocument(document, { publicKey, productCode, now = Date.no
     if (payload.iss !== ACCOUNT_LICENSE_ISSUER) return { ok: false, reason: "issuer_mismatch" };
     if (payload.aud !== productCode) return { ok: false, reason: "audience_mismatch" };
     if (!Array.isArray(payload.products) || !payload.user) return { ok: false, reason: "payload_incomplete" };
-    const nowSeconds = Math.floor(now / 1000);
     const issuedAt = Number(payload.issued_at);
     const signedUntil = Number(payload.signed_until);
     if (!Number.isSafeInteger(issuedAt) || !Number.isSafeInteger(signedUntil)) {
       return { ok: false, reason: "invalid_time_range" };
+    }
+    let nowSeconds = Math.floor(now / 1000);
+    if (useSignedServerTime) {
+      const rawServerTime = payload.server_time;
+      const parsedServerTime = typeof rawServerTime === "string" ? Date.parse(rawServerTime) : NaN;
+      const serverTime = Number.isSafeInteger(rawServerTime)
+        ? rawServerTime
+        : (Number.isFinite(parsedServerTime) ? Math.floor(parsedServerTime / 1000) : NaN);
+      if (!Number.isSafeInteger(serverTime) || Math.abs(serverTime - issuedAt) > MAX_CLOCK_SKEW_SECONDS) {
+        return { ok: false, reason: "invalid_server_time" };
+      }
+      // A freshly downloaded, signed envelope must be verified against the
+      // server's signed clock. A wrong Windows clock must not prevent login.
+      nowSeconds = serverTime;
     }
     if (signedUntil <= nowSeconds) {
       return { ok: false, reason: "signature_expired", payload };
@@ -209,7 +229,12 @@ class AccountClient {
     this.safeStorage = safeStorage;
     this.fetchImpl = fetchImpl;
     this.now = now;
+    this.serverClockOffsetMs = null;
     this.lastFailReason = "";
+  }
+
+  _trustedNow() {
+    return Number.isFinite(this.serverClockOffsetMs) ? this.now() + this.serverClockOffsetMs : this.now();
   }
 
   _readState() {
@@ -234,7 +259,7 @@ class AccountClient {
     fs.renameSync(tempPath, this.dataPath);
   }
 
-  async _request(pathname, { method = "GET", body, cookie, baseUrl = this.baseUrl } = {}) {
+  async _request(pathname, { method = "GET", body, cookie, baseUrl = this.baseUrl, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
     if (typeof this.fetchImpl !== "function") throw Object.assign(new Error("当前运行环境不支持 HTTPS 请求"), { code: "network" });
     const headers = {
       Accept: "application/json",
@@ -247,7 +272,7 @@ class AccountClient {
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (cookie) headers.Cookie = cookie;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), Math.max(1_000, Number(timeoutMs) || REQUEST_TIMEOUT_MS));
     let response;
     try {
       response = await this.fetchImpl(`${baseUrl}${pathname}`, {
@@ -302,11 +327,12 @@ class AccountClient {
       if (!cookie) throw new Error("登录成功但服务端未返回会话 Cookie");
       const signed = this._validatedAccountFromResponse(data);
       const officialCredits = await this._fetchOfficialCredits(cookie);
+      const accountLicense = data.account_license || data.accountLicense || null;
       const state = {
         cookie,
         user: signed.user,
         products: signed.products,
-        account_license: data.account_license,
+        account_license: accountLicense,
         server_time: data.server_time || null,
         signed_until: signed.signed_until,
         credits: signed.credits,
@@ -315,8 +341,8 @@ class AccountClient {
         last_verified_at: Math.floor(this.now() / 1000)
       };
       this._writeState(state);
-      const active = hasActiveProduct(state.products, this.productCode, REQUIRED_ENTITLEMENT, this.now());
-      this.lastFailReason = active ? "" : inactiveProductReason(state.products, this.productCode, this.now());
+      const active = hasActiveProduct(state.products, this.productCode, REQUIRED_ENTITLEMENT, this._trustedNow());
+      this.lastFailReason = active ? "" : inactiveProductReason(state.products, this.productCode, this._trustedNow());
       return { success: true, ...this._infoFromState(state) };
     } catch (error) {
       this.lastFailReason = error && error.status === 401 ? "invalid" : "network";
@@ -337,13 +363,21 @@ class AccountClient {
         this.lastFailReason = "not_activated";
         return { ok: false, authenticated: false, reason: this.lastFailReason };
       }
-      const signed = this._validatedAccountFromResponse(data);
+      const refreshEnvelope = data && (data.account_license || data.accountLicense)
+        ? data
+        : { ...data, account_license: state.account_license };
+      const signed = this._validatedAccountFromResponse(refreshEnvelope);
       const officialCredits = await this._fetchOfficialCredits(state.cookie);
+      // Some account-service deployments only return the signed envelope at
+      // login (the /auth/me response contains the refreshed user/products but
+      // omits account_license). Never erase a still-valid local envelope just
+      // because that optional field is absent from a refresh response.
+      const accountLicense = data.account_license || data.accountLicense || state.account_license || null;
       const next = {
         ...state,
         user: signed.user,
         products: signed.products,
-        account_license: data.account_license,
+        account_license: accountLicense,
         server_time: data.server_time || null,
         signed_until: signed.signed_until,
         credits: signed.credits,
@@ -351,8 +385,8 @@ class AccountClient {
         last_verified_at: Math.floor(this.now() / 1000)
       };
       this._writeState(next);
-      if (!hasActiveProduct(next.products, this.productCode, REQUIRED_ENTITLEMENT, this.now())) {
-        this.lastFailReason = inactiveProductReason(next.products, this.productCode, this.now());
+      if (!hasActiveProduct(next.products, this.productCode, REQUIRED_ENTITLEMENT, this._trustedNow())) {
+        this.lastFailReason = inactiveProductReason(next.products, this.productCode, this._trustedNow());
         this.clearCachedEntitlements(this.lastFailReason);
         return { ok: false, authenticated: true, reason: this.lastFailReason, user: signed.user, products: next.products };
       }
@@ -371,12 +405,12 @@ class AccountClient {
           return { ok: false, authenticated: Boolean(state.user), offline: true, reason: this.lastFailReason };
         }
         const signedState = this._validatedState(state);
-        if (signedState && hasActiveProduct(signedState.products, this.productCode, REQUIRED_ENTITLEMENT, this.now())) {
+        if (signedState && hasActiveProduct(signedState.products, this.productCode, REQUIRED_ENTITLEMENT, this._trustedNow())) {
           this.lastFailReason = "network";
           return { ok: true, offline: true, payload: { user: signedState.user || null, products: signedState.products || [], credits: signedState.credits } };
         }
         const products = signedState ? signedState.products : [];
-        this.lastFailReason = inactiveProductReason(products, this.productCode, this.now());
+        this.lastFailReason = inactiveProductReason(products, this.productCode, this._trustedNow());
         return { ok: false, authenticated: Boolean(signedState && signedState.user), offline: true, reason: this.lastFailReason, user: signedState ? signedState.user : null, products };
       }
       if (isExplicitAuthorizationFailure(error)) {
@@ -407,8 +441,8 @@ class AccountClient {
       this.lastFailReason = "not_activated";
       return { ok: false, reason: this.lastFailReason };
     }
-    if (!hasActiveProduct(signedState.products, this.productCode, REQUIRED_ENTITLEMENT, this.now())) {
-      this.lastFailReason = inactiveProductReason(signedState.products, this.productCode, this.now());
+    if (!hasActiveProduct(signedState.products, this.productCode, REQUIRED_ENTITLEMENT, this._trustedNow())) {
+      this.lastFailReason = inactiveProductReason(signedState.products, this.productCode, this._trustedNow());
       return {
         ok: false,
         authenticated: true,
@@ -470,7 +504,27 @@ class AccountClient {
       error.status = 400;
       throw error;
     }
-    const result = await this._request(pathValue, { ...options, cookie: state.cookie, baseUrl: this.baseUrl });
+    // The bridge receives a Fetch-shaped request from OfficialAiClient.  The
+    // account transport serializes JSON itself, so forwarding that string as
+    // `body` would serialize it a second time (and make POST /ai/jobs reject
+    // an otherwise valid payload).
+    let body = options.body;
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body);
+      } catch (_) {
+        const error = new Error("官方算力请求内容无效");
+        error.status = 400;
+        throw error;
+      }
+    }
+    const result = await this._request(pathValue, {
+      ...options,
+      body,
+      cookie: state.cookie,
+      baseUrl: this.baseUrl,
+      timeoutMs: OFFICIAL_AI_REQUEST_TIMEOUT_MS
+    });
     if (!result || !result.data || typeof result.data !== "object" || Array.isArray(result.data)) return result && result.data;
     // Status is non-sensitive protocol metadata used to decide whether an async
     // official job may be polled. Cookies and response headers never cross IPC.
@@ -542,7 +596,8 @@ class AccountClient {
     const products = signedState ? signedState.products : [];
     const product = findProduct(products, this.productCode);
     const expiresAt = activeUntil(product);
-    const isActive = hasActiveProduct(products, this.productCode, REQUIRED_ENTITLEMENT, this.now());
+    const trustedNow = this._trustedNow();
+    const isActive = hasActiveProduct(products, this.productCode, REQUIRED_ENTITLEMENT, trustedNow);
     return {
       auth_mode: "account",
       account_id: user.id,
@@ -558,7 +613,7 @@ class AccountClient {
       product_status: product && product.status ? product.status : (expiresAt ? "expired" : "unopened"),
       member_level: product && product.status === "active" ? this.productCode : "free",
       membership_status: product && product.status ? product.status : (expiresAt ? "expired" : "unopened"),
-      remaining_days: expiresAt ? Math.max(0, Math.ceil((Date.parse(expiresAt) - this.now()) / 86400000)) : 0,
+      remaining_days: expiresAt ? Math.max(0, Math.ceil((Date.parse(expiresAt) - trustedNow) / 86400000)) : 0,
       entitlements: product && Array.isArray(product.entitlements) ? product.entitlements : [],
       products,
       credits: state && state.official_credits ? state.official_credits : (signedState ? signedState.credits : { total: null, language: null, image: null, video: null }),
@@ -579,7 +634,8 @@ class AccountClient {
     const result = verifyAccountDocument(data && data.account_license, {
       publicKey: this.publicKey,
       productCode: this.productCode,
-      now: this.now()
+      now: this.now(),
+      useSignedServerTime: true
     });
     if (!result.ok) {
       const error = new Error(`账号权益签名校验失败：${result.reason}`);
@@ -587,6 +643,10 @@ class AccountClient {
       error.reason = result.reason;
       throw error;
     }
+    const signedServerTimeMs = typeof result.payload.server_time === "string"
+      ? Date.parse(result.payload.server_time)
+      : Number(result.payload.server_time) * 1000;
+    if (Number.isFinite(signedServerTimeMs)) this.serverClockOffsetMs = signedServerTimeMs - this.now();
     return {
       user: result.payload.user,
       products: result.payload.products,
@@ -601,7 +661,7 @@ class AccountClient {
     const result = verifyAccountDocument(state.account_license, {
       publicKey: this.publicKey,
       productCode: this.productCode,
-      now: this.now()
+      now: this._trustedNow()
     });
     if (!result.ok) return null;
     return {
@@ -616,7 +676,7 @@ class AccountClient {
   _isCachedSnapshotExpired(state) {
     if (!state || !state.account_license) return false;
     const signedUntil = Number(state.signed_until || 0);
-    return Number.isSafeInteger(signedUntil) && signedUntil > 0 && Math.floor(this.now() / 1000) >= signedUntil;
+    return Number.isSafeInteger(signedUntil) && signedUntil > 0 && Math.floor(this._trustedNow() / 1000) >= signedUntil;
   }
 
   async _fetchOfficialCredits(cookie) {

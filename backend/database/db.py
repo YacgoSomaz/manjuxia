@@ -119,7 +119,8 @@ async def init_db():
                 is_preset INTEGER DEFAULT 0,
                 genres TEXT DEFAULT '[]',
                 tags TEXT DEFAULT '[]',
-                screen_mode TEXT DEFAULT '',
+                screen_mode TEXT DEFAULT 'portrait',
+                model_family TEXT DEFAULT 'seedance_2_0',
                 admin_id INTEGER DEFAULT NULL,
                 qianshan_id INTEGER DEFAULT NULL,
                 source TEXT DEFAULT '',
@@ -131,7 +132,7 @@ async def init_db():
         await db.execute(create_prompt_templates)
         await auto_migrate_table(db, "prompt_templates", create_prompt_templates)
 
-        # 作品标签定义表：用于小说导入打标签、模板推荐和流程校验。
+        # 标签定义表：用于作品/模板推荐匹配。prompt_templates.tags 仍只用于短剧/短片流程分流。
         logger.info("创建表: tag_definitions")
         create_tag_definitions = """
             CREATE TABLE IF NOT EXISTS tag_definitions (
@@ -158,7 +159,7 @@ async def init_db():
                 label TEXT NOT NULL,
                 dimension TEXT NOT NULL,
                 score REAL DEFAULT 1.0,
-                source TEXT DEFAULT 'manual',
+                source TEXT DEFAULT 'llm',
                 evidence TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
                 updated_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
@@ -376,6 +377,9 @@ async def init_db():
                 excluded_props TEXT DEFAULT '[]',
                 excluded_audios TEXT DEFAULT '[]',
                 auto_excluded_audios TEXT DEFAULT '[]',
+                manual_audio_order TEXT DEFAULT '[]',
+                jimeng_image_characters TEXT DEFAULT NULL,
+                jimeng_audio_characters TEXT DEFAULT NULL,
                 section_start_state TEXT DEFAULT '{}',
                 scene_type TEXT DEFAULT 'normal',
                 sort_order INTEGER DEFAULT 0,
@@ -454,7 +458,9 @@ async def init_db():
         await db.execute(create_video_task_queue)
         await auto_migrate_table(db, "video_task_queue", create_video_task_queue)
         # v3.61.296: 全局队列按 storyboard 做活跃态硬幂等。
-        # 创建部分唯一索引前先折叠历史脏数据,避免同一分镜留下多条 queued/generating 行。
+        # 旧版本只有应用层“查最新一条再 upsert”,两次入队请求交叠时可能留下
+        # 同一个 storyboard 的多条 queued/generating 行；worker 按队列行 id 派单,
+        # 串行模式也会把这些重复行顺序提交到即梦。创建部分唯一索引前先折叠历史脏数据。
         try:
             cur_dup = await db.execute(
                 """SELECT storyboard_id, COUNT(*) AS cnt
@@ -465,8 +471,8 @@ async def init_db():
             )
             dup_groups = await cur_dup.fetchall()
             collapsed = 0
-            for group in dup_groups:
-                storyboard_id = group["storyboard_id"]
+            for g in dup_groups:
+                sb_id = g["storyboard_id"]
                 cur_rows = await db.execute(
                     """SELECT id, status, jimeng_task_id, started_at, created_at
                     FROM video_task_queue
@@ -475,13 +481,13 @@ async def init_db():
                         CASE WHEN status='generating' THEN 0 ELSE 1 END,
                         CASE WHEN jimeng_task_id IS NOT NULL AND jimeng_task_id != '' THEN 0 ELSE 1 END,
                         id DESC""",
-                    (storyboard_id,),
+                    (sb_id,),
                 )
                 rows = await cur_rows.fetchall()
                 if len(rows) <= 1:
                     continue
                 keep_id = rows[0]["id"]
-                drop_ids = [int(row["id"]) for row in rows[1:]]
+                drop_ids = [int(r["id"]) for r in rows[1:]]
                 placeholders = ",".join("?" * len(drop_ids))
                 await db.execute(
                     f"""UPDATE video_task_queue
@@ -494,13 +500,13 @@ async def init_db():
                 )
                 collapsed += len(drop_ids)
                 logger.warning(
-                    f"[queue] 折叠重复活跃队列 storyboard_id={storyboard_id}, "
+                    f"[v3.61.296] 折叠重复活跃队列 storyboard_id={sb_id}, "
                     f"keep={keep_id}, aborted={drop_ids}"
                 )
             if collapsed:
-                logger.warning(f"[queue] 已折叠 {collapsed} 条重复活跃队列项")
+                logger.warning(f"[v3.61.296] 已折叠 {collapsed} 条重复活跃队列项")
         except Exception as e:
-            logger.warning(f"折叠重复活跃队列项失败(继续启动): {e}")
+            logger.warning(f"[v3.61.296] 折叠重复活跃队列项失败(继续启动): {e}")
         # 索引
         try:
             await db.execute(
@@ -623,7 +629,7 @@ async def init_db():
         await db.execute(create_fusion_history)
         await auto_migrate_table(db, "fusion_history", create_fusion_history)
 
-        # v3.61.383: 补镜视频任务链路，任务状态独立于页面生命周期。
+        # v3.61.321: 其他功能 -> 补镜视频。完全独立于正式 storyboards / video_task_queue。
         logger.info("创建表: supplement_video_tasks")
         create_supplement_video_tasks = """
             CREATE TABLE IF NOT EXISTS supplement_video_tasks (
@@ -642,7 +648,9 @@ async def init_db():
                 materials_json TEXT DEFAULT '{}',
                 missing_assets_json TEXT DEFAULT '[]',
                 first_frame_path TEXT DEFAULT NULL,
+                first_frame_orig_path TEXT DEFAULT NULL,
                 last_frame_path TEXT DEFAULT NULL,
+                last_frame_orig_path TEXT DEFAULT NULL,
                 provider TEXT DEFAULT 'jimeng',
                 video_config_id INTEGER DEFAULT NULL,
                 model_name TEXT DEFAULT '',
@@ -656,6 +664,7 @@ async def init_db():
                 output_video_path TEXT DEFAULT NULL,
                 output_remote_url TEXT DEFAULT NULL,
                 output_last_frame_path TEXT DEFAULT NULL,
+                output_last_frame_orig_path TEXT DEFAULT NULL,
                 error_message TEXT DEFAULT NULL,
                 created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
                 updated_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
@@ -892,7 +901,7 @@ async def init_db():
         # v3.61.13 起新失败会翻译,但 v3.61.12 之前留下的英文残留要补
         try:
             translations = [
-                ("real person", "参考图被识别为含真人人脸 — Seedance 2.0 系列不允许真人参考图。\n解决方法:\n  1) 换成漫画/卡通/Q版风格的角色图\n  2) 切回即梦CLI模式生成\n  3) 换 Seedance 1.5 Pro 模型(允许真人)"),
+                ("real person", "参考图被识别为含真人人脸 — Seedance 2.0 系列不允许真人参考图。\n解决方法:\n  1) 换成漫画/卡通/Q版风格的角色图\n  2) 切回即梦CLI模式生成\n  3) 改用非真人脸参考图后重试"),
                 ("Safe Experience Mode", "火山方舟「安全体验模式」限额,需到火山控制台 → 模型管理 关闭该选项或提高推理上限"),
                 ("inference limit", "火山方舟模型推理已达上限,请到火山控制台调整"),
                 ("first/last frame content cannot be mixed", "首尾帧参数不能跟参考图/参考音频混搭(已修)"),

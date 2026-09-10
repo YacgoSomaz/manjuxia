@@ -112,7 +112,7 @@ async def change_media_dir(req: ChangeMediaDirRequest):
         raise HTTPException(400, f"新目录无法创建:{e}")
 
     # 写入权限校验
-    test_file = os.path.join(new_dir, ".wanshan_write_test.tmp")
+    test_file = os.path.join(new_dir, ".千山漫剧_write_test.tmp")
     try:
         with open(test_file, "w") as f:
             f.write("ok")

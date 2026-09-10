@@ -8,7 +8,6 @@ logger = logging.getLogger(__name__)
 from services.llm_service import LLMService
 from services.template_service import get_by_id as get_template_by_id
 from services.novel_service import NovelService
-from services.utils import parse_llm_json_response
 from utils.timezone import now_beijing_str
 
 
@@ -20,24 +19,254 @@ class ExtractionService:
     """信息提取服务"""
 
     @staticmethod
-    def _parse_llm_response(response: str) -> List[Dict[str, Any]]:
-        """解析大模型返回的结果，提取JSON数组"""
-        result = parse_llm_json_response(response)
-        # 确保返回的每个项目都有 name 和 description 字段
-        normalized = []
-        for item in result:
-            if isinstance(item, dict):
-                normalized.append({
-                    "name": item.get("name", "").strip(),
-                    "description": item.get("description", "").strip(),
-                    "attributes": item.get("attributes", {}),
-                })
-        return normalized if normalized else [{"name": "提取结果", "description": response.strip() if response else ""}]
+    def _decode_llm_json(response: str) -> Any:
+        """从纯 JSON、Markdown 代码块或带少量前后文的响应中解出 JSON。"""
+        text = (response or "").strip()
+        if not text:
+            raise ValueError("模型返回为空")
+
+        candidates: List[str] = [text]
+        candidates.extend(
+            m.strip()
+            for m in re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+            if m.strip()
+        )
+
+        first_array, last_array = text.find("["), text.rfind("]")
+        first_object, last_object = text.find("{"), text.rfind("}")
+        wrapped_candidates = []
+        if first_array >= 0 and last_array > first_array:
+            wrapped_candidates.append((first_array, text[first_array:last_array + 1]))
+        if first_object >= 0 and last_object > first_object:
+            wrapped_candidates.append((first_object, text[first_object:last_object + 1]))
+        candidates.extend(value for _, value in sorted(wrapped_candidates, key=lambda x: x[0]))
+
+        seen = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+        raise ValueError("模型返回不是有效 JSON，请重试或更换模型")
+
+    @staticmethod
+    def _normalize_aliases(value: Any) -> List[str]:
+        if isinstance(value, list):
+            raw = value
+        elif isinstance(value, str):
+            raw = re.split(r"[,，、;；]", value)
+        else:
+            raw = []
+        result: List[str] = []
+        for item in raw:
+            alias = str(item or "").strip()
+            if alias and alias not in result:
+                result.append(alias)
+        return result
+
+    @staticmethod
+    def _fallback_description(item: Dict[str, Any], element_type: Optional[str]) -> str:
+        """兼容模型偶发返回综合分析结构，而不是标准 name/description 数组。"""
+        fields_by_type = {
+            "character": [
+                ("identity", "身份"), ("role", "角色"), ("gender", "性别"),
+                ("age", "年龄"), ("appearance", "外貌"), ("visual_description", "形象"),
+                ("personality", "性格"), ("traits", "特征"), ("clothing", "服装"),
+                ("costume", "服装"), ("actions_and_emotions", "行动与情绪"),
+                ("actions", "主要行动"),
+            ],
+            "scene": [
+                ("environment", "环境"), ("time", "时段"), ("type", "内外景"),
+                ("atmosphere", "氛围"), ("features", "特征"),
+            ],
+            "prop": [
+                ("function", "作用"), ("significance", "意义"), ("appearance", "外观"),
+                ("material", "材质"), ("features", "特征"),
+            ],
+        }
+        parts: List[str] = []
+        for key, label in fields_by_type.get(element_type or "", []):
+            value = item.get(key)
+            if value in (None, "", [], {}):
+                continue
+            if isinstance(value, list):
+                text = "、".join(str(v).strip() for v in value if str(v).strip())
+            elif isinstance(value, dict):
+                text = "；".join(f"{k}：{v}" for k, v in value.items())
+            else:
+                text = str(value).strip()
+            if text:
+                parts.append(f"{label}：{text}")
+        return "；".join(parts)
+
+    @staticmethod
+    def _parse_llm_response(
+        response: str,
+        element_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """按当前提取类型解析模型 JSON，兼容标准数组和综合分析对象。"""
+        payload = ExtractionService._decode_llm_json(response)
+
+        preferred_keys = {
+            "character": ["characters", "roles", "people", "persons", "人物", "角色"],
+            "scene": ["scenes", "locations", "environments", "场景"],
+            "prop": ["props", "key_props", "objects", "道具"],
+        }
+        if isinstance(payload, list):
+            items = payload
+        elif isinstance(payload, dict):
+            if payload.get("name"):
+                items = [payload]
+            else:
+                items = None
+                containers = [payload]
+                for container_key in ("data", "result"):
+                    nested = payload.get(container_key)
+                    if isinstance(nested, dict):
+                        containers.append(nested)
+                keys = preferred_keys.get(element_type or "", []) + [
+                    "elements", "items", "results", "list", "data"
+                ]
+                for container in containers:
+                    for key in keys:
+                        value = container.get(key)
+                        if isinstance(value, list):
+                            items = value
+                            break
+                    if items is not None:
+                        break
+                if items is None:
+                    expected = {
+                        "character": "characters",
+                        "scene": "scenes",
+                        "prop": "props/key_props",
+                    }.get(element_type or "", "elements")
+                    raise ValueError(f"模型返回 JSON 结构不匹配，未找到 {expected} 数组")
+        else:
+            raise ValueError("模型返回 JSON 顶层必须是数组或对象")
+
+        normalized: List[Dict[str, Any]] = []
+        name_keys = {
+            "character": ("name", "character_name", "role_name"),
+            "scene": ("name", "location", "scene_name"),
+            "prop": ("name", "prop_name", "item_name"),
+        }.get(element_type or "", ("name",))
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = ""
+            for key in name_keys:
+                value = item.get(key)
+                if value is not None and str(value).strip():
+                    name = str(value).strip()
+                    break
+            if not name:
+                continue
+
+            raw_description = item.get("description")
+            description = str(raw_description).strip() if isinstance(raw_description, str) else ""
+            if not description:
+                description = ExtractionService._fallback_description(item, element_type)
+
+            attributes = item.get("attributes")
+            if not isinstance(attributes, dict):
+                attributes = {}
+            normalized.append({
+                "name": name,
+                "description": description,
+                "attributes": attributes,
+                "aliases": ExtractionService._normalize_aliases(item.get("aliases")),
+            })
+
+        if items and not normalized:
+            raise ValueError("模型返回 JSON 可解析，但元素缺少可识别的 name/location 字段")
+        return normalized
 
     @staticmethod
     def _normalize_element_name(name: str) -> str:
         """标准化元素名称用于去重比较"""
         return name.strip().lower().replace(' ', '')
+
+    @staticmethod
+    async def save_official_result(
+        novel_id: int,
+        element_type: str,
+        chapter_ids: List[int],
+        response: str,
+    ) -> Dict[str, Any]:
+        """保存开发环境官方语言算力返回的提取结果，不触达生产服务。"""
+        elements_map: Dict[str, Dict[str, Any]] = {}
+        for elem in ExtractionService._parse_llm_response(response, element_type):
+            name = (elem.get("name") or "").strip()
+            if not name:
+                continue
+            key = ExtractionService._normalize_element_name(name)
+            candidate = {
+                "name": name,
+                "description": (elem.get("description") or "").strip(),
+                "attributes": elem.get("attributes") or {},
+                "chapter_ids": list(chapter_ids),
+            }
+            existing = elements_map.get(key)
+            if existing is None:
+                elements_map[key] = candidate
+            else:
+                if len(candidate["description"]) > len(existing["description"]):
+                    existing["description"] = candidate["description"]
+                existing["attributes"].update(candidate["attributes"])
+
+        if not elements_map:
+            return {
+                "success": False,
+                "code": "EXTRACTION_EMPTY",
+                "count": 0,
+                "skipped": 0,
+                "total_unique": 0,
+                "message": "官方算力没有返回可保存的结构化内容，请重试。",
+            }
+
+        saved_count = 0
+        skipped_count = 0
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                "SELECT name FROM extracted_elements WHERE novel_id = ? AND element_type = ?",
+                (novel_id, element_type),
+            )
+            existing_names = {
+                ExtractionService._normalize_element_name(row["name"])
+                for row in await cursor.fetchall()
+            }
+            for key, elem in elements_map.items():
+                if key in existing_names:
+                    skipped_count += 1
+                    continue
+                await db.execute(
+                    """INSERT INTO extracted_elements
+                       (novel_id, element_type, name, description, attributes, chapter_ids, aliases, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        novel_id, element_type, elem["name"], elem["description"],
+                        json.dumps(elem["attributes"], ensure_ascii=False),
+                        json.dumps(elem["chapter_ids"]), json.dumps([]),
+                        now_beijing_str(), now_beijing_str(),
+                    ),
+                )
+                saved_count += 1
+            await db.commit()
+        finally:
+            await db.close()
+        return {
+            "success": True,
+            "count": saved_count,
+            "skipped": skipped_count,
+            "total_unique": len(elements_map),
+            "message": f"新增 {saved_count} 个元素，跳过 {skipped_count} 个已存在元素",
+        }
 
     @staticmethod
     async def extract_from_chapter(
@@ -80,20 +309,27 @@ class ExtractionService:
         if not template:
             raise ValueError(f"模板不存在: {template_id}")
 
-        # 上报模板使用计数(异步、失败静默,不影响主流程)
-        try:
-            from services.template_service import report_usage as _report_template_usage
-            await _report_template_usage(template)
-        except Exception:
-            pass
-        
         # 获取小说信息
         novel = await NovelService.get_by_id(novel_id)
         if not novel:
             raise ValueError(f"小说不存在: {novel_id}")
         
         # 替换模板变量 - 使用剧本内容而非小说原文
-        template_content = template["content"]
+        template_content = str(template.get("content") or "").strip()
+        if not template_content:
+            template_name = template.get("name") or str(template_id)
+            raise ValueError(
+                f"提取模板「{template_name}」内容获取失败，本次未调用模型。"
+                "请刷新模板后重试；若仍失败请检查网络或模板是否刚刚改名。"
+            )
+
+        # 仅内容确实可用时才上报使用计数；拉取失败不能算一次有效使用。
+        try:
+            from services.template_service import report_usage as _report_template_usage
+            await _report_template_usage(template)
+        except Exception:
+            pass
+
         script_content = script.get("content", "")
         chapter_title = chapter.get("title", "")
         
@@ -148,7 +384,7 @@ class ExtractionService:
         )
         
         # 解析响应
-        elements = ExtractionService._parse_llm_response(response)
+        elements = ExtractionService._parse_llm_response(response, element_type)
         
         # 标准化元素数据
         normalized_elements = []
@@ -158,6 +394,7 @@ class ExtractionService:
                     "name": elem.get("name", "").strip(),
                     "description": elem.get("description", "").strip(),
                     "attributes": elem.get("attributes", {}),
+                    "aliases": elem.get("aliases", []),
                 })
         
         return normalized_elements
@@ -221,40 +458,46 @@ class ExtractionService:
                         # 合并属性
                         if elem.get("attributes"):
                             existing["attributes"].update(elem["attributes"])
+                        # 合并别称，避免同一人物跨章节出现的新称谓丢失。
+                        for alias in elem.get("aliases", []):
+                            if alias and alias not in existing.get("aliases", []):
+                                existing.setdefault("aliases", []).append(alias)
                     else:
                         # 新元素
                         elements_map[normalized_name] = {
                             "name": name,
                             "description": elem.get("description", ""),
                             "attributes": elem.get("attributes", {}),
+                            "aliases": elem.get("aliases", []),
                             "chapter_ids": [chapter_id]
                         }
                         
             except Exception as e:
                 errors.append(f"章节 {chapter_id}: {str(e)}")
 
-        missing_script_errors = [
-            err for err in errors
-            if "尚未转换为剧本" in err or "请先进行剧本转换" in err
-        ]
-        if not elements_map and errors and len(missing_script_errors) == len(errors):
+        if not elements_map and errors and all(
+            ("尚未转换为剧本" in err or "请先进行剧本转换" in err) for err in errors
+        ):
             return {
                 "success": False,
-                "code": "SCRIPT_REQUIRED",
+                "code": "NO_CONVERTED_SCRIPT",
                 "count": 0,
-                "skipped": 0,
                 "total_unique": 0,
-                "message": "所选章节尚未生成剧本，请先到「剧本转换」生成剧本后，再提取人物、场景或道具。",
+                "message": "所选章节没有可提取的转换后剧本，请先去「剧本转换」完成转换后再提取。",
                 "errors": errors,
             }
+
+        # 以前模板拉取失败、响应结构错误等异常会被吞进 errors，随后仍返回
+        # success=true + total_unique=0，前端就显示“提取成功 0 个”。没有任何
+        # 可用元素且确实发生错误时必须明确失败，不能制造假成功。
         if not elements_map and errors:
+            first_error = errors[0].split(": ", 1)[-1]
             return {
                 "success": False,
-                "code": "EXTRACTION_EMPTY",
+                "code": "EXTRACTION_FAILED",
                 "count": 0,
-                "skipped": 0,
                 "total_unique": 0,
-                "message": "没有提取到可保存的内容，请检查章节剧本、提示词模板或模型返回结果。",
+                "message": f"信息提取失败：{first_error}",
                 "errors": errors,
             }
         
@@ -320,7 +563,7 @@ class ExtractionService:
         common_cols = """e.id, e.novel_id, e.element_type, e.name, e.description, e.attributes, e.chapter_ids, e.aliases,
                          e.image_url, e.image_prompt, e.image_status, e.reference_image, e.finished_image, e.grid_image,
                          e.panorama_url,
-                         e.audio_file, e.volc_asset_id, e.volc_asset_uri, e.volc_asset_status, e.volc_asset_group_id,
+                         e.audio_file, e.voice_id, e.volc_asset_id, e.volc_asset_uri, e.volc_asset_status, e.volc_asset_group_id,
                          e.active_variant_id,
                          e.remote_source,
                          e.created_at, e.updated_at,
@@ -655,11 +898,31 @@ class ExtractionService:
                 return None
             
             await db.execute(
-                "UPDATE extracted_elements SET audio_file = ? WHERE id = ?",
+                "UPDATE extracted_elements SET audio_file = ?, updated_at = datetime('now', '+8 hours') WHERE id = ?",
                 (audio_file, element_id)
             )
             await db.commit()
-            
+
+            return await ExtractionService.get_element(element_id)
+        finally:
+            await db.close()
+
+    @staticmethod
+    async def update_element_voice(
+        element_id: int,
+        voice_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """更新角色绑定的音色 voice_id(TTS 用,与 audio_file 即梦参考音频独立)"""
+        db = await get_db()
+        try:
+            existing = await ExtractionService.get_element(element_id)
+            if not existing:
+                return None
+            await db.execute(
+                "UPDATE extracted_elements SET voice_id = ? WHERE id = ?",
+                (voice_id, element_id)
+            )
+            await db.commit()
             return await ExtractionService.get_element(element_id)
         finally:
             await db.close()

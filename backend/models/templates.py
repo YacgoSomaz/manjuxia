@@ -9,6 +9,9 @@ class TemplateCreate(BaseModel):
     content: str
     variables: Optional[List[str]] = None
     description: Optional[str] = None
+    tags: Optional[List[str]] = None
+    screen_mode: Optional[str] = "portrait"
+    model_family: Optional[str] = "seedance_2_0"
 
 
 class TemplateUpdate(BaseModel):
@@ -17,6 +20,9 @@ class TemplateUpdate(BaseModel):
     content: Optional[str] = None
     variables: Optional[List[str]] = None
     description: Optional[str] = None
+    tags: Optional[List[str]] = None
+    screen_mode: Optional[str] = None
+    model_family: Optional[str] = None
 
 
 class TemplateResponse(BaseModel):
@@ -26,6 +32,9 @@ class TemplateResponse(BaseModel):
     content: str
     variables: str
     description: str
+    tags: Optional[str] = None
+    screen_mode: Optional[str] = "portrait"
+    model_family: Optional[str] = "seedance_2_0"
     created_at: datetime
     updated_at: datetime
 

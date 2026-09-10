@@ -4,7 +4,7 @@ v3.61.156: ERP 全景图 → 多视角拆图(参考用户提供的工作流)
 输入: 一张 2:1 / 2.35:1 等距柱状投影全景图(equirectangular)
 输出: 按 yaw 角度从全景图里采样出 N 张 16:9 透视截图,拼成网格图存盘
 
-默认: 12 张,每 30° 一张(0°/30°/60°/.../330°),拼 4×3 网格
+默认: 9 张,每 40° 一张(0°/40°/80°/.../320°),拼 3×3 网格
 其他: 可指定 6/9/12 视角,自动适配 cols=ceil(N/3)
 
 核心算法: equirectangular → perspective projection
@@ -15,7 +15,7 @@ v3.61.156: ERP 全景图 → 多视角拆图(参考用户提供的工作流)
     4. 双线性采样
 
 为啥不用 OpenCV: 现有依赖 numpy + Pillow 就够了,bundle 更小。
-单张全景 3072×1296 → 12 张 640×360 拼接,实测 < 3s,适合一键拆图。
+单张全景 3072×1296 → 9 张 640×360 拼接,实测 < 3s,适合一键拆图。
 """
 
 import logging
@@ -27,8 +27,8 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-# 默认 12 视角(对齐用户参考工作流),每 30°
-DEFAULT_YAW_STEP = 30
+# 默认 9 视图,每 40°
+DEFAULT_YAW_STEP = 40
 DEFAULT_TILE_W = 640    # 单格 16:9
 DEFAULT_TILE_H = 360
 DEFAULT_FOV_DEG = 75.0  # 标准镜头视角,接近自然观感
@@ -123,7 +123,7 @@ def equirect_to_perspective(
 def panorama_to_views(
     panorama_path: str,
     output_path: str,
-    view_count: int = 12,
+    view_count: int = 9,
     pitch: float = DEFAULT_PITCH,
     fov: float = DEFAULT_FOV_DEG,
     tile_w: int = DEFAULT_TILE_W,
@@ -131,7 +131,7 @@ def panorama_to_views(
     gap_px: int = 16,
     gap_color: Tuple[int, int, int] = (255, 255, 255),
 ) -> Tuple[bool, str]:
-    """ERP 全景图 → N 视角网格图(默认 12 视角 4×3 16:9)。
+    """ERP 全景图 → N 视角网格图(默认 9 视图 3×3 16:9)。
 
     Args:
         panorama_path: 输入全景图绝对路径(2:1 或 2.35:1 ERP)
@@ -207,7 +207,7 @@ def panorama_to_views(
 
 # v3.61.147 老 API 保留(老调用方可能还在用)— 默认 6 视角 3×2
 def panorama_to_grid(panorama_path: str, output_path: str) -> Tuple[bool, str]:
-    """老 API,默认 6 视角 3×2,新代码推荐 panorama_to_views(view_count=12)。
+    """老 API,默认 6 视角 3×2,新代码推荐 panorama_to_views(view_count=9)。
 
     v3.61.186: 老 API 保持 gap_px=0 紧贴拼接,不破坏既有输出尺寸。
     """

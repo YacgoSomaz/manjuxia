@@ -7,7 +7,6 @@ const https = require("node:https");
 const os = require("node:os");
 const path = require("node:path");
 const { isTrustedExternalUrl, isTrustedJimengUrl } = require("./trusted-origins");
-const { verifyPackagedRelease } = require("./release-guard");
 const { LicenseClient } = require("./license-client");
 const { AccountClient } = require("./account-client");
 const { OfficialAiClient, OFFICIAL_AI_PRODUCT_ID, OFFICIAL_AI_TASK_TYPE } = require("./official-ai-client");
@@ -16,11 +15,39 @@ const { readReleaseConfig } = require("./release-config");
 const { removeApplicationMenu } = require("./shell-hardening");
 const { normalizeLlmConfigRequest } = require("./local-api-bridge");
 
+// A Windows GUI launch may inherit a console pipe that has already been
+// closed by its parent (for example after an installer or launcher exits).
+// Node otherwise turns a later console.log into an unhandled EPIPE exception.
+for (const stream of [process.stdout, process.stderr]) {
+  if (stream && typeof stream.on === "function") {
+    stream.on("error", () => {});
+  }
+}
+
 const APP_NAME = "漫剧虾";
-const DATA_APP_NAME = "万山";
+const DATA_APP_NAME = "ManJuXia";
 const PRODUCT_ID = "comic_shrimp";
+// Packaged clients must not be able to turn the commercial account gate off by
+// editing release_config.json. The account service remains the authoritative
+// verifier; these values only pin the local client to that service.
+const PACKAGED_COMMERCIAL_POLICY = Object.freeze({
+  commercial: true,
+  auth_mode: "account",
+  account_api_url: "https://anyq.site",
+  account_public_key: "CqLAEE2KnduTFtw1gVQIExS1qLRa-XI3TaWpbchMbKc",
+  product_code: PRODUCT_ID
+});
 const isBackendSmoke = process.argv.includes("--backend-smoke");
-const isPrimaryInstance = isBackendSmoke ? true : app.requestSingleInstanceLock();
+const isOfficialAiSmoke = process.argv.includes("--official-ai-smoke");
+const isOfficialImageSmoke = process.argv.includes("--official-image-smoke");
+const officialImageSmokeJobId = String(
+  process.argv.find((value) => value.startsWith("--official-image-job=")) || ""
+).slice("--official-image-job=".length);
+const isAccountContextSmoke = process.argv.includes("--account-context-smoke");
+// Source builds are routinely run beside the installed production client for
+// comparison and QA.  Keep the single-instance lock for packaged releases,
+// but do not let the installed client silently swallow a development launch.
+const isPrimaryInstance = (isBackendSmoke || !app.isPackaged) ? true : app.requestSingleInstanceLock();
 
 if (!isPrimaryInstance) {
   app.exit(0);
@@ -29,7 +56,6 @@ if (!isPrimaryInstance) {
 let mainWindow = null;
 let splashWindow = null;
 let jimengWindow = null;
-let qianshanConfigWindow = null;
 let backendProcess = null;
 let backendUrl = "http://127.0.0.1:8000";
 let backendLaunchStartedAt = 0;
@@ -42,13 +68,9 @@ let updateClient = null;
 let updatePromptInFlight = false;
 let authMode = "license";
 let licenseRefreshTimer = null;
-let licenseRefreshInFlight = false;
+let licenseRefreshPromise = null;
 let officialAiClient = null;
 const BACKEND_PORT_CANDIDATES = [8000, 18472, 28800, 38765, 48899];
-// Revocations made in the account backend must reach an open client promptly.
-// Only stored account sessions poll; logged-out clients never create this
-// network traffic. The signed snapshot remains the offline safety boundary.
-const LICENSE_REFRESH_INTERVAL_MS = 10 * 1000;
 
 function focusMainWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -64,7 +86,10 @@ if (isPrimaryInstance) {
 }
 
 function appRootDir() {
-  return app.isPackaged ? app.getAppPath() : path.resolve(__dirname, "..");
+  // Keep executable code in app.asar, but keep the Python runtime, backend and
+  // frontend beside it in resources. Python cannot execute a module from asar
+  // and this also makes the installed layout independent of the build machine.
+  return app.isPackaged ? process.resourcesPath : path.resolve(__dirname, "..");
 }
 
 function resourceDir() {
@@ -116,13 +141,39 @@ function dataDir() {
   return path.join(appData, DATA_APP_NAME, "data");
 }
 
+function authDiagnosticPath() {
+  return path.join(dataDir(), "auth-debug.log");
+}
+
+function writeAuthDiagnostic(event, details = {}) {
+  try {
+    fs.mkdirSync(dataDir(), { recursive: true });
+    const safeDetails = Object.fromEntries(Object.entries(details).map(([key, value]) => {
+      if (/cookie|token|signature|payload|secret|key/i.test(key)) return [key, value ? "[present]" : "[missing]"];
+      if (value instanceof Error) return [key, value.message];
+      return [key, value];
+    }));
+    fs.appendFileSync(authDiagnosticPath(), `${JSON.stringify({
+      time: new Date().toISOString(),
+      event: String(event || "unknown"),
+      app_version: app.getVersion(),
+      packaged: app.isPackaged,
+      backend_url: backendUrl || null,
+      ...safeDetails
+    })}\n`, "utf8");
+  } catch (_) {
+    // Diagnostics must never interrupt application startup or authorization.
+  }
+}
+
 function getMachineId() {
   const stableParts = [process.env.ComputerName || os.hostname(), process.platform, process.arch];
   return crypto.createHash("sha256").update(stableParts.join("|"), "utf8").digest("hex");
 }
 
 function initializeLicenseClient() {
-  const config = readReleaseConfig({ rootDir: resourceDir(), isPackaged: app.isPackaged, env: process.env });
+  const loadedConfig = readReleaseConfig({ rootDir: resourceDir(), isPackaged: app.isPackaged, env: process.env });
+  const config = app.isPackaged ? { ...loadedConfig, ...PACKAGED_COMMERCIAL_POLICY } : loadedConfig;
   releaseConfig = config;
   commercialBuild = Boolean(config.commercial);
   authMode = String(config.auth_mode || process.env.WANSHAN_AUTH_MODE || (commercialBuild ? "account" : "license")).toLowerCase();
@@ -154,29 +205,59 @@ function initializeLicenseClient() {
   });
 }
 
-async function syncLicenseContext() {
-  if (!commercialBuild || !licenseClient) return;
+async function syncLicenseContext(source = "unknown") {
+  if (!commercialBuild || !licenseClient) return true;
   const info = licenseClient.getInfo();
-  if (!info || !info.active || !backendUrl) return;
+  if (!info || !info.active || !backendUrl) {
+    writeAuthDiagnostic("context_sync_skipped", {
+      source,
+      reason: !backendUrl ? "backend_url_missing" : (!info ? "account_info_missing" : "account_inactive"),
+      active: Boolean(info && info.active)
+    });
+    return false;
+  }
   const accountLicense = authMode === "account" && typeof licenseClient.getAccountLicense === "function"
     ? licenseClient.getAccountLicense()
     : null;
-  if (authMode === "account" && !accountLicense) return;
-  try {
-    await requestBackend("/api/license/context/set", {
-      method: "POST",
-      body: {
-        machine_id: getMachineId(),
-        account_license: accountLicense
-      }
-    });
-  } catch (_) {
-    // The local app remains usable if its local backend is still starting.
+  if (authMode === "account" && !accountLicense) {
+    writeAuthDiagnostic("context_sync_skipped", { source, reason: "account_license_missing", active: true });
+    return false;
   }
-  const cloudToken = typeof licenseClient.getCloudToken === "function" ? licenseClient.getCloudToken() : null;
-  if (cloudToken && cloudToken.accessToken) {
-    await pushCloudTokenToBackend(cloudToken);
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      await requestBackend("/api/license/context/set", {
+        method: "POST",
+        body: {
+          machine_id: getMachineId(),
+          account_license: accountLicense
+        }
+      });
+      const status = await requestBackend("/api/license/context/status");
+      if (!status || status.is_set !== true) throw new Error("local_context_status_not_set");
+      writeAuthDiagnostic("context_sync_ok", {
+        source,
+        attempt,
+        signed_until: info.signed_until || null,
+        account_state: info.account_state || null
+      });
+      return true;
+    } catch (error) {
+      lastError = error;
+      writeAuthDiagnostic("context_sync_failed", {
+        source,
+        attempt,
+        error: error instanceof Error ? error.message : String(error),
+        signed_until: info.signed_until || null,
+        local_unix_time: Math.floor(Date.now() / 1000)
+      });
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+    }
   }
+  console.error(`[account] local context sync failed from ${source}:`, lastError instanceof Error ? lastError.message : lastError);
+  return false;
+  // Do not forward account state into the legacy production cloud-LLM path.
+  // Official compute uses account-client directly through official-ai.js.
 }
 
 async function clearLicenseContext() {
@@ -238,23 +319,35 @@ async function navigateToActivation(reason) {
   }
 }
 
-async function enforceLicenseState(source = "timer") {
+async function enforceLicenseState(source = "timer", navigateOnFailure = true) {
   if (!commercialBuild || !licenseClient) return true;
-  if (licenseRefreshInFlight) return true;
-  licenseRefreshInFlight = true;
+  if (licenseRefreshPromise) return licenseRefreshPromise;
+  const operation = (async () => {
   try {
     const result = await licenseClient.verify();
+    const currentInfo = licenseClient.getInfo();
+    writeAuthDiagnostic("account_verify_result", {
+      source,
+      ok: Boolean(result && result.ok),
+      authenticated: Boolean(result && result.authenticated),
+      offline: Boolean(result && result.offline),
+      reason: String((result && result.reason) || licenseClient.lastFailReason || ""),
+      has_account_license: Boolean(typeof licenseClient.getAccountLicense === "function" && licenseClient.getAccountLicense()),
+      signed_until: currentInfo && currentInfo.signed_until || null,
+      server_time: currentInfo && currentInfo.server_time || null,
+      local_unix_time: Math.floor(Date.now() / 1000)
+    });
     if (result && result.ok) {
-      await syncLicenseContext();
+      const contextReady = await syncLicenseContext(source);
       publishAccountState(result, source);
-      return true;
+      return contextReady;
     }
     if (authMode === "account" && result && result.authenticated) {
       await clearLicenseContext();
       const reason = result.reason || licenseClient.lastFailReason || "unauthorized_tool";
       publishAccountState({ ...result, reason }, source);
       console.warn(`[license] account is authenticated but not entitled from ${source}: ${reason}`);
-      await navigateToActivation(reason);
+      if (navigateOnFailure) await navigateToActivation(reason);
       return false;
     }
     const reason = (result && result.reason) || licenseClient.lastFailReason || "unknown";
@@ -264,27 +357,36 @@ async function enforceLicenseState(source = "timer") {
       licenseClient.logout();
       await clearLicenseContext();
     }
-    await navigateToActivation(reason);
+    if (navigateOnFailure) await navigateToActivation(reason);
     return false;
   } catch (error) {
     console.error(`[license] verification error from ${source}:`, error);
-    await navigateToActivation("network");
+    writeAuthDiagnostic("account_verify_failed", { source, error: error instanceof Error ? error.message : String(error) });
+    if (navigateOnFailure) await navigateToActivation("network");
     return false;
+  }
+  })();
+  licenseRefreshPromise = operation;
+  try {
+    return await operation;
   } finally {
-    licenseRefreshInFlight = false;
+    if (licenseRefreshPromise === operation) licenseRefreshPromise = null;
   }
 }
 
 function startLicenseRefreshTimer() {
-  if (!commercialBuild || !licenseClient || licenseRefreshTimer) return;
-  licenseRefreshTimer = setInterval(() => {
-    if (authMode === "account" && (!licenseClient.hasSession || !licenseClient.hasSession())) return;
-    enforceLicenseState("interval").catch((error) => {
-      console.error("[license] interval refresh failed:", error);
-    });
-  }, LICENSE_REFRESH_INTERVAL_MS);
+  // Renew the short-lived signed account envelope in the background.  This
+  // intentionally never navigates or reloads the renderer: a previous
+  // implementation removed the timer to protect unsaved editor content, but
+  // that also left the local backend with an expired 10-minute envelope.
+  // Navigation remains an explicit user/action boundary in
+  // `requirePaidDesktopAction`.
+  if (!commercialBuild || authMode !== "account" || !licenseClient || licenseRefreshTimer) return;
+  const refreshContextOnly = async () => {
+    await enforceLicenseState("background", false);
+  };
+  licenseRefreshTimer = setInterval(() => { void refreshContextOnly(); }, 60_000);
   if (typeof licenseRefreshTimer.unref === "function") licenseRefreshTimer.unref();
-  console.log(`[license] periodic refresh enabled: ${LICENSE_REFRESH_INTERVAL_MS / 1000} seconds`);
 }
 
 function stopLicenseRefreshTimer() {
@@ -300,7 +402,7 @@ async function requirePaidDesktopAction() {
   // server-side stop takes effect on the next action even before the timer.
   const result = await licenseClient.verify();
   if (result && result.ok) {
-    await syncLicenseContext();
+    await syncLicenseContext("paid-action");
     return { allowed: true };
   }
   if (result && result.authenticated) {
@@ -396,25 +498,6 @@ async function checkForUpdatesOnStartup() {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     updateClient.emit("update-error", { error: message, source: "startup" });
-  }
-}
-
-async function pushCloudTokenToBackend(token) {
-  if (!token || !token.accessToken || !backendUrl) return { success: false, message: "远端登录态为空" };
-  try {
-    const response = await requestBackend("/api/license/context/set-cloud-token", {
-      method: "POST",
-      body: {
-        accessToken: token.accessToken,
-        refreshToken: token.refreshToken || "",
-        expiresIn: Number(token.expiresIn || 7200),
-        userId: token.userId || null,
-        team: token.team || null
-      }
-    });
-    return response;
-  } catch (error) {
-    return { success: false, message: error instanceof Error ? error.message : "同步远端登录态失败" };
   }
 }
 
@@ -558,7 +641,8 @@ function startBackend() {
   const backendDist = path.join(resourceDir(), "backend-dist");
   const packagedBackend = path.join(backendDist, "backend-server", "backend-server.exe");
   const legacyPackagedBackend = path.join(backendDist, "backend-server.exe");
-  let command = process.env.WANSHAN_PYTHON || "python";
+  const bundledPython = path.join(resourceDir(), "python", "python.exe");
+  let command = process.env.WANSHAN_PYTHON || (app.isPackaged && fs.existsSync(bundledPython) ? bundledPython : "python");
   let args = [backendMain];
   let cwd = path.dirname(backendMain);
   if (app.isPackaged && fs.existsSync(packagedBackend)) {
@@ -618,7 +702,9 @@ function startBackend() {
       WANSHAN_REQUIRE_ACCOUNT_AUTH: commercialBuild ? "1" : "0",
       WANSHAN_REQUIRED_PRODUCT_ID: PRODUCT_ID,
       WANSHAN_REQUIRED_ENTITLEMENT: "comic_course",
-      WANSHAN_ENABLE_CLOUD: process.env.WANSHAN_ENABLE_CLOUD || "0",
+      // This migration intentionally keeps production cloud services detached.
+      // Account and official-compute traffic use the development bridge instead.
+      WANSHAN_ENABLE_CLOUD: "0",
       PYTHONUTF8: "1"
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -715,6 +801,16 @@ function ensureInside(base, target) {
   return resolvedTarget;
 }
 
+function ensureRealPathInside(base, target) {
+  const resolvedBase = fs.realpathSync(base);
+  const resolvedTarget = fs.realpathSync(target);
+  const relative = path.relative(resolvedBase, resolvedTarget);
+  if (!relative || relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("素材路径不在漫剧虾数据目录内");
+  }
+  return resolvedTarget;
+}
+
 async function openEnsured(target) {
   fs.mkdirSync(target, { recursive: true });
   const result = await shell.openPath(target);
@@ -770,85 +866,21 @@ function openJimengWindow() {
   });
 }
 
-async function captureQianshanCloudToken() {
-  if (!qianshanConfigWindow || qianshanConfigWindow.isDestroyed()) {
-    return { success: false, message: "千山配置窗口未打开" };
-  }
-  const url = qianshanConfigWindow.webContents.getURL();
-  let host = "";
-  try {
-    host = new URL(url).hostname.toLowerCase();
-  } catch (_) {
-    return { success: false, message: "当前页面地址无效" };
-  }
-  if (!["qianshanai.cn", "www.qianshanai.cn"].includes(host)) {
-    return { success: false, message: "请先在千山配置窗口完成登录" };
-  }
-  const raw = await qianshanConfigWindow.webContents.executeJavaScript(`(() => {
-    const userRaw = localStorage.getItem("userInfo") || "{}";
-    let user = {};
-    try { user = JSON.parse(userRaw) || {}; } catch (_) {}
-    return JSON.stringify({
-      accessToken: localStorage.getItem("accessToken") || "",
-      refreshToken: localStorage.getItem("refreshToken") || "",
-      userId: user.id || user.userId || null,
-      team: user.team || null
-    });
-  })()`, true);
-  const token = JSON.parse(raw || "{}");
-  if (!token.accessToken) return { success: false, message: "未检测到千山登录态，请在窗口内登录后刷新" };
-  return pushCloudTokenToBackend({ ...token, expiresIn: 7200 });
-}
-
-function openQianshanConfigWindow() {
-  if (qianshanConfigWindow && !qianshanConfigWindow.isDestroyed()) {
-    qianshanConfigWindow.focus();
-    return { success: true, message: "千山远端模型配置窗口已打开" };
-  }
-  qianshanConfigWindow = new BrowserWindow({
-    width: 1180,
-    height: 820,
-    minWidth: 960,
-    minHeight: 640,
-    title: "千山远端模型配置",
-    backgroundColor: "#0b1020",
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-      devTools: !app.isPackaged,
-      webSecurity: true
-    }
-  });
-  closePackagedDevTools(qianshanConfigWindow);
-  qianshanConfigWindow.loadURL("https://qianshanai.cn/user/llm-configs");
-  qianshanConfigWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (isTrustedExternalUrl(url)) shell.openExternal(url);
-    return { action: "deny" };
-  });
-  qianshanConfigWindow.webContents.on("will-navigate", (event, url) => {
-    try {
-      const host = new URL(url).hostname.toLowerCase();
-      if (!["qianshanai.cn", "www.qianshanai.cn"].includes(host)) event.preventDefault();
-    } catch (_) {
-      event.preventDefault();
-    }
-  });
-  qianshanConfigWindow.webContents.on("did-finish-load", () => {
-    captureQianshanCloudToken().catch(() => {});
-  });
-  qianshanConfigWindow.on("closed", () => {
-    qianshanConfigWindow = null;
-  });
-  return { success: true, message: "千山远端模型配置窗口已打开" };
-}
-
 ipcMain.handle("get-backend-url", () => backendUrl);
 ipcMain.handle("get-session-secret", () => readSessionSecret());
 ipcMain.handle("get-app-version", () => app.getVersion());
 ipcMain.handle("get-version-history", () => ({ versions: [] }));
 
 ipcMain.handle("local-api:llm-configs", async (_event, request = {}) => {
+  // A packaged account session can be valid in the renderer while the
+  // backend's short-lived verified context has not yet been pushed (for
+  // example immediately after launch or after an /auth/me response omitted
+  // the optional envelope). Refresh and synchronise before local model CRUD;
+  // this keeps self-configured models usable without weakening backend gates.
+  if (commercialBuild && authMode === "account") {
+    const access = await enforceLicenseState("local-model-config");
+    if (!access) throw new Error(`账号授权上下文同步失败，请重试；诊断日志：${authDiagnosticPath()}`);
+  }
   const method = String(request.method || "GET").toUpperCase();
   const requestPath = normalizeLlmConfigRequest(request.path, method);
   const rawBody = request.body === undefined || request.body === null ? undefined : String(request.body);
@@ -944,12 +976,20 @@ ipcMain.handle("jimeng-inject-script", async (_event, script) => {
 ipcMain.handle("embed-config:open-llm-config", async () => {
   const access = await requirePaidDesktopAction();
   if (!access.allowed) return { success: false, code: "membership_required", message: access.message };
-  return openQianshanConfigWindow();
+  return {
+    success: false,
+    code: "local_models_only",
+    message: "此开发迁移版已切断千山远端模型配置，请在本地大模型配置中管理模型。"
+  };
 });
 ipcMain.handle("embed-config:sync-llm-token", async () => {
   const access = await requirePaidDesktopAction();
   if (!access.allowed) return { success: false, code: "membership_required", message: access.message };
-  return captureQianshanCloudToken();
+  return {
+    success: false,
+    code: "local_models_only",
+    message: "此开发迁移版不接收千山远端模型令牌。"
+  };
 });
 
 ipcMain.handle("check-for-updates", async () => {
@@ -1012,11 +1052,19 @@ ipcMain.handle("account:send-code", async (_event, phone) => {
     return { success: false, message: "账号登录服务未启用" };
   }
   try {
-    return await licenseClient.sendCode(phone);
+    writeAuthDiagnostic("account_send_code_attempt", { phone_suffix: String(phone || "").slice(-4) });
+    const result = await licenseClient.sendCode(phone);
+    writeAuthDiagnostic("account_send_code_result", { success: Boolean(result && result.success), message: result && result.message || "" });
+    return result;
   } catch (error) {
     console.error("[account] send-code request failed:", {
       message: error instanceof Error ? error.message : String(error),
       code: error && error.code ? error.code : "",
+      cause: error && error.cause ? String(error.cause.message || error.cause) : ""
+    });
+    writeAuthDiagnostic("account_send_code_failed", {
+      message: error instanceof Error ? error.message : String(error),
+      code: error && error.code ? String(error.code) : "",
       cause: error && error.cause ? String(error.cause.message || error.cause) : ""
     });
     return { success: false, message: error instanceof Error ? error.message : "验证码发送失败" };
@@ -1027,10 +1075,17 @@ ipcMain.handle("account:login", async (_event, phone, code) => {
   if (!commercialBuild || authMode !== "account" || !licenseClient || typeof licenseClient.login !== "function") {
     return { success: false, message: "账号登录服务未启用" };
   }
+  writeAuthDiagnostic("account_login_attempt", { phone_suffix: String(phone || "").slice(-4), code_length: String(code || "").length });
   const result = await licenseClient.login(phone, code);
+  writeAuthDiagnostic("account_login_result", {
+    success: Boolean(result && result.success),
+    active: Boolean(result && result.active),
+    message: result && result.message || "",
+    reason: licenseClient.lastFailReason || ""
+  });
   publishAccountState({ ...result, authenticated: Boolean(result && result.success), reason: result.success && result.active ? "" : "unauthorized_tool" }, "login");
   if (result.success && result.active) {
-    void syncLicenseContext().catch((error) => console.warn("[account] deferred local context sync failed:", error));
+    result.local_context_ready = await syncLicenseContext("login");
   } else if (result.success) {
     // A successful login can still be a free, expired, or disabled account.
     // Never leave the previous account's local commercial context active.
@@ -1045,15 +1100,24 @@ ipcMain.handle("account:me", async () => {
   // server, not replay the locally cached signed snapshot, so an admin stop
   // or expiry is visible without restarting or manually forcing a reload.
   const verified = await licenseClient.verify();
+  let localContextReady = false;
   if (verified.ok) {
-    await syncLicenseContext();
+    localContextReady = await syncLicenseContext("manual-refresh");
   } else {
     // The UI refresh is also an authorization boundary. Clearing the local
     // backend context makes a server-side stop effective immediately.
     await clearLicenseContext();
   }
   publishAccountState(verified, "manual");
-  return { success: true, ok: verified.ok, authenticated: Boolean(verified.ok || verified.authenticated), offline: Boolean(verified.offline), reason: verified.reason || "", info: licenseClient.getInfo() };
+  return { success: true, ok: verified.ok && localContextReady, account_ok: Boolean(verified.ok), local_context_ready: localContextReady, authenticated: Boolean(verified.ok || verified.authenticated), offline: Boolean(verified.offline), reason: verified.reason || (verified.ok && !localContextReady ? "local_context_sync_failed" : ""), diagnostic_path: authDiagnosticPath(), info: licenseClient.getInfo() };
+});
+
+ipcMain.handle("account:open-diagnostics", async () => {
+  fs.mkdirSync(dataDir(), { recursive: true });
+  const target = authDiagnosticPath();
+  if (!fs.existsSync(target)) writeAuthDiagnostic("diagnostics_opened", {});
+  shell.showItemInFolder(target);
+  return { success: true, path: target };
 });
 
 ipcMain.handle("account:logout", async () => {
@@ -1092,21 +1156,98 @@ ipcMain.handle("official-ai:catalog", async () => {
   if (!officialAiClient || PRODUCT_ID !== OFFICIAL_AI_PRODUCT_ID) {
     return { ok: false, code: "membership_required", message: "官方算力仅支持漫剧虾账号" };
   }
-  return officialAiClient.getCatalog();
+  const result = await officialAiClient.getCatalog();
+  writeAuthDiagnostic("official_ai_catalog", {
+    ok: Boolean(result && result.ok),
+    code: result && result.code || "",
+    task_count: Array.isArray(result && result.items) ? result.items.length : 0
+  });
+  return result;
 });
 
 ipcMain.handle("official-ai:create-job", async (_event, inputText, idempotencyKey, taskType) => {
   if (!officialAiClient || PRODUCT_ID !== OFFICIAL_AI_PRODUCT_ID) {
     return { ok: false, code: "membership_required", message: "官方算力仅支持漫剧虾账号" };
   }
-  return officialAiClient.createJob(inputText, idempotencyKey, taskType);
+  const result = await officialAiClient.createJob(inputText, idempotencyKey, taskType);
+  const job = result && (result.job || result.data || result);
+  writeAuthDiagnostic("official_ai_create_job", {
+    ok: Boolean(result && result.ok !== false),
+    task_type: String(taskType || ""),
+    code: result && result.code || "",
+    remote_code: result && result.remoteCode || "",
+    status: job && (job.status || job.state) || "",
+    job_id: job && (job.id || result.id) || ""
+  });
+  return result;
 });
 
 ipcMain.handle("official-ai:get-job", async (_event, jobId) => {
   if (!officialAiClient || PRODUCT_ID !== OFFICIAL_AI_PRODUCT_ID) {
     return { ok: false, code: "membership_required", message: "官方算力仅支持漫剧虾账号" };
   }
-  return officialAiClient.getJob(jobId);
+  const result = await officialAiClient.getJob(jobId);
+  const job = result && (result.job || result.data || result);
+  const state = String(job && (job.status || job.state) || "").toLowerCase();
+  if (result && result.ok === false || ["failed", "error", "cancelled", "canceled"].includes(state)) {
+    writeAuthDiagnostic("official_ai_job_failed", {
+      ok: Boolean(result && result.ok !== false),
+      code: result && result.code || job && job.code || "",
+      remote_code: result && result.remoteCode || job && (job.failure_code || job.error_code) || "",
+      status: state,
+      job_id: String(jobId || "")
+    });
+  }
+  return result;
+});
+
+ipcMain.handle("official-ai:create-video-job", async (_event, payload) => {
+  if (!officialAiClient || PRODUCT_ID !== OFFICIAL_AI_PRODUCT_ID) {
+    return { ok: false, code: "membership_required", message: "官方算力仅支持漫剧虾账号" };
+  }
+  const result = await officialAiClient.createVideoJob(payload);
+  const job = result && (result.job || result.data || result);
+  writeAuthDiagnostic("official_video_create_job", {
+    ok: Boolean(result && result.ok !== false),
+    code: result && result.code || "",
+    status: job && (job.status || job.state) || "",
+    job_id: job && (job.id || result.id) || "",
+    input_text_length: String(payload && payload.input_text || "").trim().length,
+    source_storyboard_id: Number.isSafeInteger(Number(payload && payload.source_storyboard_id)) ? Number(payload.source_storyboard_id) : null
+  });
+  return result;
+});
+
+ipcMain.handle("official-ai:get-video-job", async (_event, jobId) => {
+  if (!officialAiClient || PRODUCT_ID !== OFFICIAL_AI_PRODUCT_ID) {
+    return { ok: false, code: "membership_required", message: "官方算力仅支持漫剧虾账号" };
+  }
+  return officialAiClient.getVideoJob(jobId);
+});
+
+// The renderer may have several compatibility fetch wrappers installed by the
+// legacy video page. Read only the saved local storyboard text through the
+// trusted main-process backend bridge so an official video request can never
+// lose its prompt due to wrapper ordering.
+ipcMain.handle("official-ai:get-storyboard-prompt", async (_event, storyboardId) => {
+  const id = Number(storyboardId);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    writeAuthDiagnostic("official_video_prompt_read", { ok: false, code: "invalid_storyboard_id", storyboard_id: String(storyboardId || "") });
+    return { ok: false, code: "invalid_storyboard_id", message: "分镜编号无效" };
+  }
+  try {
+    const storyboard = await requestBackend(`/api/storyboards/${id}`);
+    const prompt = String(storyboard && (storyboard.prompt || storyboard.description || storyboard.video_prompt) || "").trim();
+    if (!prompt) {
+      writeAuthDiagnostic("official_video_prompt_read", { ok: false, code: "storyboard_prompt_empty", storyboard_id: id });
+      return { ok: false, code: "storyboard_prompt_empty", message: "该分镜没有可用的视频提示词" };
+    }
+    writeAuthDiagnostic("official_video_prompt_read", { ok: true, storyboard_id: id, prompt_length: prompt.length });
+    return { ok: true, prompt };
+  } catch (error) {
+    writeAuthDiagnostic("official_video_prompt_read", { ok: false, code: "storyboard_prompt_unavailable", storyboard_id: id, error: error && error.message || String(error) });
+    return { ok: false, code: "storyboard_prompt_unavailable", message: error && error.message || "无法读取分镜提示词" };
+  }
 });
 
 function safeAssetName(value) {
@@ -1142,6 +1283,81 @@ function downloadHttpsAsset(url, destination, redirects = 0) {
   });
 }
 
+function putTemporaryVideoAsset(uploadUrl, sourcePath, contentType) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try { parsed = new URL(String(uploadUrl || "")); } catch (_) { reject(new Error("OSS 上传地址无效")); return; }
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+      reject(new Error("OSS 上传地址必须使用 HTTPS"));
+      return;
+    }
+    let size;
+    try { size = fs.statSync(sourcePath).size; } catch (error) { reject(error); return; }
+    const request = https.request(parsed, {
+      method: "PUT",
+      headers: { "Content-Type": contentType, "Content-Length": String(size) }
+    }, (response) => {
+      response.resume();
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        resolve();
+      } else {
+        reject(new Error(`OSS 上传失败（HTTP ${response.statusCode || 0}）`));
+      }
+    });
+    request.setTimeout(120000, () => request.destroy(new Error("OSS 上传超时")));
+    request.on("error", reject);
+    const input = fs.createReadStream(sourcePath);
+    input.on("error", (error) => request.destroy(error));
+    input.pipe(request);
+  });
+}
+
+async function uploadVideoAssetFromDataDir(asset) {
+  if (!officialAiClient || PRODUCT_ID !== OFFICIAL_AI_PRODUCT_ID) {
+    return { ok: false, code: "account_unavailable", message: "账号上传服务未就绪" };
+  }
+  const value = asset && typeof asset === "object" ? asset : {};
+  const inputPath = String(value.path || "").trim();
+  const kind = String(value.kind || "").trim().toLowerCase();
+  const mimeType = String(value.mime_type || value.mimeType || "").trim().toLowerCase();
+  try {
+    const sourcePath = ensureRealPathInside(dataDir(), inputPath);
+    const stat = await fs.promises.stat(sourcePath);
+    if (!stat.isFile()) return { ok: false, code: "asset_not_file", message: "素材不是有效文件" };
+    const policy = await officialAiClient.createVideoAssetUploadPolicy({
+      kind, mime_type: mimeType, size_bytes: stat.size
+    });
+    const remoteAsset = policy && (policy.asset || policy.data && policy.data.asset);
+    if (!policy || policy.ok === false || !remoteAsset || !remoteAsset.upload_url || !remoteAsset.read_url) {
+      return { ok: false, code: policy && policy.code || "video_input_policy_failed", message: policy && policy.message || "临时素材签名失败" };
+    }
+    const expectedHeaders = remoteAsset.upload_headers && typeof remoteAsset.upload_headers === "object"
+      ? remoteAsset.upload_headers : {};
+    await putTemporaryVideoAsset(remoteAsset.upload_url, sourcePath, String(expectedHeaders["Content-Type"] || "application/octet-stream"));
+    return {
+      ok: true,
+      asset: {
+        kind: remoteAsset.kind || kind,
+        object_key: remoteAsset.object_key,
+        read_url: remoteAsset.read_url,
+        read_expires_at: remoteAsset.read_expires_at
+      }
+    };
+  } catch (error) {
+    return { ok: false, code: "video_input_upload_failed", message: error && error.message || "临时素材上传失败" };
+  }
+}
+
+ipcMain.handle("official-ai:upload-video-asset", async (_event, asset) => {
+  const result = await uploadVideoAssetFromDataDir(asset);
+  writeAuthDiagnostic("video_input_upload", {
+    ok: Boolean(result && result.ok),
+    code: result && result.code || "",
+    kind: asset && asset.kind || ""
+  });
+  return result;
+});
+
 ipcMain.handle("official-ai:save-asset", async (_event, url, suggestedName) => {
   try {
     let parsed;
@@ -1169,6 +1385,10 @@ ipcMain.handle("official-ai:save-asset", async (_event, url, suggestedName) => {
 
 app.whenReady().then(async () => {
   app.setName(APP_NAME);
+  // Create the per-user data root before any account or backend initialization.
+  // This keeps installations writable even when the selected install directory
+  // is read-only (for example a protected folder on D:).
+  fs.mkdirSync(dataDir(), { recursive: true });
   removeApplicationMenu(Menu);
   createSplashWindow();
   if (app.isPackaged) {
@@ -1181,15 +1401,6 @@ app.whenReady().then(async () => {
     }
   }
   initializeLicenseClient();
-  if (app.isPackaged) {
-    const releaseCheck = verifyPackagedRelease(path.dirname(resourceDir()));
-    if (!releaseCheck.ok) {
-      dialog.showErrorBox(`${APP_NAME}启动失败`, `安装包完整性校验失败：${releaseCheck.reason}`);
-      closeSplashWindow();
-      app.quit();
-      return;
-    }
-  }
   startBackend();
   backendReadyPromise = waitForBackend();
   const backendReady = await backendReadyPromise;
@@ -1234,6 +1445,116 @@ app.whenReady().then(async () => {
   // backend. This closes the startup window where a server-side revocation
   // could otherwise be mistaken for the last locally cached snapshot.
   const startupLicenseValid = await enforceLicenseState("startup");
+  if (isAccountContextSmoke) {
+    let createdId = null;
+    try {
+      if (!startupLicenseValid) throw new Error("account_context_not_ready");
+      const marker = `packaged-account-smoke-${Date.now()}`;
+      const created = await requestBackend("/api/llm-configs/", {
+        method: "POST",
+        body: {
+          name: marker,
+          base_url: "https://api.deepseek.com",
+          model_name: "deepseek-chat",
+          config_type: "llm",
+          api_key: "smoke-key-not-used",
+          temperature: 0.7,
+          max_tokens: 1024,
+          context_window: 8192,
+          extra_params: {}
+        }
+      });
+      createdId = created && created.id;
+      if (!createdId) throw new Error("local_model_create_failed");
+      const listed = await requestBackend("/api/llm-configs/?config_type=llm&force=true&local_only=true");
+      if (!Array.isArray(listed) || !listed.some((item) => item && item.id === createdId)) {
+        throw new Error("local_model_list_failed");
+      }
+      await requestBackend(`/api/llm-configs/${createdId}?local_only=true`, { method: "DELETE" });
+      createdId = null;
+      writeAuthDiagnostic("account_context_smoke_ok", { source: "packaged-smoke" });
+      console.log("ACCOUNT_CONTEXT_SMOKE_OK");
+      app.exit(0);
+    } catch (error) {
+      if (createdId) {
+        try { await requestBackend(`/api/llm-configs/${createdId}?local_only=true`, { method: "DELETE" }); } catch (_) {}
+      }
+      writeAuthDiagnostic("account_context_smoke_failed", { source: "packaged-smoke", error: error instanceof Error ? error.message : String(error) });
+      console.error("ACCOUNT_CONTEXT_SMOKE_FAIL", error instanceof Error ? error.message : String(error));
+      app.exit(1);
+    }
+    return;
+  }
+  if (isOfficialAiSmoke || isOfficialImageSmoke || officialImageSmokeJobId) {
+    try {
+      if (!startupLicenseValid || !officialAiClient) throw new Error("账号授权或官方算力客户端未就绪");
+      const smokeAccess = await requirePaidDesktopAction();
+      console.log("OFFICIAL_AI_ACCESS", JSON.stringify({ allowed: Boolean(smokeAccess && smokeAccess.allowed), code: smokeAccess && smokeAccess.code }));
+      if (!smokeAccess || !smokeAccess.allowed) throw Object.assign(new Error(smokeAccess && smokeAccess.message || "账号无官方算力权限"), { code: smokeAccess && smokeAccess.code });
+      const transportCatalog = await licenseClient.requestOfficialAi(`/api/v1/ai/catalog?product_id=${PRODUCT_ID}`);
+      console.log("OFFICIAL_AI_TRANSPORT", JSON.stringify({
+        ok: transportCatalog && transportCatalog.ok,
+        code: transportCatalog && (transportCatalog.code || transportCatalog.error),
+        taskCount: Array.isArray(transportCatalog && transportCatalog.tasks) ? transportCatalog.tasks.length : 0
+      }));
+      const catalog = await officialAiClient.getCatalog();
+      if (!catalog.ok) throw Object.assign(new Error(catalog.message || "官方目录读取失败"), { code: catalog.code });
+      const isImageSmokeRun = Boolean(isOfficialImageSmoke || officialImageSmokeJobId);
+      const requestedSmokeTask = isImageSmokeRun ? "comic_image" : "comic_creation";
+      const task = catalog.items.find((item) => item.task_type === requestedSmokeTask) || (!isImageSmokeRun ? catalog.items[0] : null);
+      if (!task) throw new Error("服务端未开放可测试任务");
+      const smokeInput = isOfficialImageSmoke
+        ? "电影级写实摄影，一只红色苹果放在干净的木桌上，柔和自然光，画面中不出现文字或人物"
+        : "你好";
+      const created = officialImageSmokeJobId
+        ? await officialAiClient.getJob(officialImageSmokeJobId)
+        : await officialAiClient.createJob(smokeInput, crypto.randomUUID(), task.task_type);
+      if (!created || created.ok === false) throw Object.assign(new Error(created && created.message || "官方任务读取/提交失败"), { code: created && created.code });
+      const job = created.job || created.data || created;
+      const id = String(officialImageSmokeJobId || job.id || created.id || "");
+      if (!id) throw new Error("服务端未返回任务编号");
+      let finalJob = job;
+      const maxAttempts = isOfficialImageSmoke ? 120 : 24;
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        const state = String(finalJob.status || finalJob.state || "").toLowerCase();
+        if (["completed", "complete", "succeeded", "success", "failed", "error", "cancelled", "canceled"].includes(state)) break;
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+        const result = await officialAiClient.getJob(id);
+        if (!result || result.ok === false) throw new Error(result && result.message || "官方任务状态查询失败");
+        finalJob = result.job || result.data || result;
+      }
+      const state = String(finalJob.status || finalJob.state || "").toLowerCase();
+      const text = String(finalJob.result_text || finalJob.output_text || finalJob.content || finalJob.text || "").trim();
+      const assets = Array.isArray(finalJob.result_assets) ? finalJob.result_assets : Array.isArray(finalJob.assets) ? finalJob.assets : [];
+      const hasOutput = isImageSmokeRun ? assets.length > 0 : Boolean(text);
+      const assetHosts = assets.map((asset) => {
+        try { return new URL(asset && (asset.display_url || asset.download_url || asset.url) || "").hostname; } catch (_) { return ""; }
+      }).filter(Boolean);
+      if (assetHosts.length) console.log(`OFFICIAL_AI_ASSET_HOSTS ${[...new Set(assetHosts)].join(",")}`);
+      if (isImageSmokeRun && assets.length) {
+        const assetUrl = String(assets[0] && (assets[0].display_url || assets[0].download_url || assets[0].url) || "");
+        const assetResponse = await fetch(assetUrl, { signal: AbortSignal.timeout(300_000) });
+        const assetBytes = Buffer.from(await assetResponse.arrayBuffer());
+        const assetType = String(assetResponse.headers.get("content-type") || "").toLowerCase();
+        if (!assetResponse.ok || !assetType.startsWith("image/") || assetBytes.length < 128) {
+          throw new Error(`官方图片资源不可用 status=${assetResponse.status} type=${assetType || "unknown"} bytes=${assetBytes.length}`);
+        }
+        console.log(`OFFICIAL_AI_ASSET_DOWNLOAD_OK type=${assetType} bytes=${assetBytes.length}`);
+      }
+      console.log(`OFFICIAL_AI_SMOKE task=${task.task_type} job=${id} state=${state} output=${hasOutput ? "present" : "empty"}`);
+      app.exit(["completed", "complete", "succeeded", "success"].includes(state) && hasOutput ? 0 : 1);
+    } catch (error) {
+      console.error("OFFICIAL_AI_SMOKE_FAIL", JSON.stringify({
+        message: error instanceof Error ? error.message : String(error),
+        code: error && error.code,
+        status: error && error.status,
+        remoteCode: error && error.remoteCode,
+        serverCode: error && error.data && (error.data.code || error.data.error)
+      }));
+      app.exit(1);
+    }
+    return;
+  }
   if (startupLicenseValid) {
     void syncLicenseContext().catch((error) => console.error("[backend] startup synchronization failed:", error));
   }

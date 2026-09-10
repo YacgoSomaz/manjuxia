@@ -145,6 +145,8 @@ from api.subtitle_removal import router as subtitle_removal_router
 from api.settings import router as settings_router
 from api.queue import router as queue_router
 from api.team import router as team_router
+from api.short_drama_sync import router as short_drama_sync_router
+from api.team_script import router as team_script_router
 from api.license_context import router as license_context_router
 from utils.local_access import require_local_business_access
 qianshan_lab_router = None
@@ -228,7 +230,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"创建字幕去除目录失败: {e}")
     
-    logger.info("万山离线策略:跳过远端模板同步、远端模型配置同步和预置模板清空")
+    logger.info("万山离线策略:跳过远端模板同步和远端模型配置同步")
+    # 仍需写入开发版随代码携带的本地厂商预设，否则模型配置页面会空白。
+    # sync_preset_llm_configs 在离线模式只使用 LOCAL_PROVIDER_PRESETS，不会访问生产服务。
+    try:
+        from services.model_presets import sync_preset_llm_configs
+        await sync_preset_llm_configs()
+        logger.info("本地模型厂商预设就绪")
+    except Exception as e:
+        logger.error(f"本地模型厂商预设初始化失败: {e}")
     
     # 自动修正 Gemini 3 系列的 api_style:必须走 gemini_native 否则会被网关 8K 截断
     try:
@@ -365,6 +375,8 @@ app.include_router(subtitle_removal_router)
 app.include_router(settings_router)
 app.include_router(queue_router)
 app.include_router(team_router)
+app.include_router(short_drama_sync_router)
+app.include_router(team_script_router)
 app.include_router(license_context_router)
 if qianshan_lab_router is not None:
     app.include_router(qianshan_lab_router)

@@ -1,6 +1,6 @@
 import re
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 from database.db import get_db
@@ -54,13 +54,18 @@ class NovelService:
             """,
             ids,
         )
-        grouped = {}
+        grouped = {novel_id: [] for novel_id in ids}
         for row in await cur.fetchall():
+            tag_code = row["tag_code"] or ""
+            if str(tag_code).startswith("genre_"):
+                # Legacy coarse tags like 古装/情感/宅斗 are no longer exposed.
+                # Novel topic labels now match storyboard template subject labels.
+                continue
             dimension = row["dimension"] or ""
             if dimension == "trope":
                 dimension = "genre"
             grouped.setdefault(row["novel_id"], []).append({
-                "code": row["tag_code"],
+                "code": tag_code,
                 "label": row["label"],
                 "dimension": dimension,
                 "score": row["score"],
@@ -381,7 +386,7 @@ class NovelService:
         if match:
             return f"num:{int(match.group(1))}"
 
-        match = re.search(r'第\s*([\d零一二三四五六七八九十百千]+)\s*[章回节卷集]', text)
+        match = re.search(r'第\s*([\d零一二三四五六七八九十百千]+)\s*[章回节卷集话]', text)
         if match:
             raw = match.group(1)
             try:
@@ -402,50 +407,178 @@ class NovelService:
         return f"order:{fallback_order}"
 
     @staticmethod
-    def _split_chapters_from_content(content: str):
-        """用和 parse_chapters 一致的规则切出章节列表,不写库。"""
-        chapter_patterns = [
-            (r'(?:^|\n)\s*#{0,6}\s*\*{0,2}(EP\s*\d+)\*{0,2}\s*[::]?\s*([^\n]*)', 2),
-            (r'(?:^|\n)\s*(?:#{1,6}\s+)?\*{0,2}(第\s*[\d零一二三四五六七八九十百千]+\s*[章回节卷集])\*{0,2}\s*[::]?\s*([^\n]*)', 2),
-            (r'(?:^|\n)\s*(?:#{1,6}\s+)?\*{0,2}(Chapter\s+\d+)\*{0,2}\s*[::]?\s*([^\n]*)', 2),
-            (r'(?:^|\n)\s*#{1,6}\s+\*{0,2}(\d+)\*{0,2}\s*[、..]\s*([^\n]+)', 2),
-            (r'(?:^|\n)[ \t]*(\d{1,4})\s+([\u4e00-\u9fa5]{2,10})[ \t]*(?=\n|$)', 3),
+    def _split_chapters_from_content(
+        content: str,
+        *,
+        allow_single_explicit: bool = False,
+        fallback_to_chunks: bool = True,
+        custom_rules: Optional[List[Dict[str, Any]]] = None,
+        mode: str = "",
+    ):
+        """用和 parse_chapters 一致的规则切出章节列表,不写库。
+
+        增量导入常见场景是只补 1 集。全量导入为防误判要求 EP/第X集 至少 2 个,
+        但增量导入对这些显式集号应允许单集识别;纯数字松规则仍保持更高门槛。
+        """
+        builtin_rules: List[Dict[str, Any]] = [
+            {
+                "name": "bracketed_cn_episode",
+                "priority": 1000,
+                "type": "regex",
+                "pattern": r'(?:^|\n)\s*[【\[［〔]\s*(第\s*[\d零一二三四五六七八九十百千]+\s*[章回节卷集话])(?:\s*[:：·\-—]\s*|\s+)?([^】\]］〕\n]*)[】\]］〕]\s*',
+                "min_matches": 2,
+                "allow_single": True,
+            },
+            {
+                "name": "ep_number",
+                "priority": 1010,
+                "type": "regex",
+                "pattern": r'(?:^|\n)\s*#{0,6}\s*\*{0,2}(EP\s*\d+)\*{0,2}\s*[：:]?\s*([^\n]*)',
+                "min_matches": 2,
+                "allow_single": True,
+            },
+            {
+                "name": "cn_chapter_number",
+                "priority": 1020,
+                "type": "regex",
+                "pattern": r'(?:^|\n)\s*(?:#{1,6}\s+)?\*{0,2}(第\s*[\d零一二三四五六七八九十百千]+\s*[章回节卷集话])\*{0,2}\s*[：:]?\s*([^\n]*)',
+                "min_matches": 2,
+                "allow_single": True,
+            },
+            {
+                "name": "english_chapter_number",
+                "priority": 1030,
+                "type": "regex",
+                "pattern": r'(?:^|\n)\s*(?:#{1,6}\s+)?\*{0,2}(Chapter\s+\d+)\*{0,2}\s*[：:]?\s*([^\n]*)',
+                "min_matches": 2,
+                "allow_single": True,
+            },
+            {
+                "name": "markdown_numeric_title",
+                "priority": 1040,
+                "type": "regex",
+                "pattern": r'(?:^|\n)\s*#{1,6}\s+\*{0,2}(\d+)\*{0,2}\s*[、.]\s*([^\n]+)',
+                "min_matches": 2,
+                "allow_single": True,
+            },
+            {
+                "name": "loose_numeric_title",
+                "priority": 1050,
+                "type": "regex",
+                "pattern": r'(?:^|\n)[ \t]*(\d{1,4})\s+([\u4e00-\u9fa5]{2,10})[ \t]*(?=\n|$)',
+                "min_matches": 3,
+                "allow_single": False,
+                "validate_sequence": True,
+                "max_first_number": 5,
+                "min_gap_chars": 30,
+            },
         ]
 
-        def _looks_like_real_chapters(_matches, _content: str) -> bool:
+        def _group_value(match: re.Match, group: Any) -> str:
+            if group is None or group == "":
+                return ""
+            if isinstance(group, str) and group.isdigit():
+                group = int(group)
+            try:
+                return str(match.group(group) or "").strip().strip('*').strip()
+            except (IndexError, KeyError):
+                return ""
+
+        def _chapter_number(value: str) -> Optional[int]:
+            digit_match = re.search(r'\d+', value or "")
+            if digit_match:
+                return int(digit_match.group(0))
+            cn_match = re.search(r'[零一二三四五六七八九十百千]+', value or "")
+            if cn_match:
+                parsed = NovelService._parse_chinese_number(cn_match.group(0))
+                return parsed or None
+            return None
+
+        def _int_value(value: Any, default: int) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _looks_like_real_chapters(_matches, rule: Dict[str, Any]) -> bool:
             if len(_matches) < 2:
                 return True
-            try:
-                nums = [int(m.group(1)) for m in _matches]
-            except (ValueError, IndexError):
+            number_group = rule.get("number_group", 1)
+            nums = [_chapter_number(_group_value(match, number_group)) for match in _matches]
+            if any(num is None for num in nums):
                 return False
             for i in range(len(nums) - 1):
                 if nums[i + 1] <= nums[i]:
                     return False
-            if nums[0] > 5:
+            if nums[0] > _int_value(rule.get("max_first_number"), 5):
                 return False
             gaps = [_matches[i + 1].start() - _matches[i].end() for i in range(len(_matches) - 1)]
-            return min(gaps) >= 30
+            return min(gaps) >= _int_value(rule.get("min_gap_chars"), 30)
+
+        def _compile_rule(rule: Dict[str, Any]):
+            if rule.get("enabled", True) is False or rule.get("type", "regex") != "regex":
+                return None
+            modes = rule.get("modes")
+            if modes is not None and not isinstance(modes, (list, tuple, set)):
+                modes = [modes]
+            if modes and mode not in {str(item) for item in modes}:
+                return None
+            pattern = rule.get("pattern")
+            if not isinstance(pattern, str) or not pattern:
+                return None
+            flags = 0
+            if rule.get("ignore_case", True):
+                flags |= re.IGNORECASE
+            if rule.get("multiline", True):
+                flags |= re.MULTILINE
+            if rule.get("dotall", False):
+                flags |= re.DOTALL
+            try:
+                return re.compile(pattern, flags)
+            except re.error as exc:
+                logger.warning(
+                    "[chapter_split] skip invalid rule %s: %s",
+                    rule.get("name") or "unnamed",
+                    exc,
+                )
+                return None
 
         chapters = []
         last_pos = 0
         last_title = ""
         src = content or ""
 
-        for pattern, min_required in chapter_patterns:
-            matches = list(re.finditer(pattern, src, re.IGNORECASE | re.MULTILINE))
-            if len(matches) >= min_required:
-                if min_required >= 3 and not _looks_like_real_chapters(matches, src):
+        dynamic_rules = [rule for rule in (custom_rules or []) if isinstance(rule, dict)]
+        dynamic_rules.sort(key=lambda item: _int_value(item.get("priority"), 100))
+        for rule in dynamic_rules + builtin_rules:
+            compiled = _compile_rule(rule)
+            if compiled is None:
+                continue
+            matches = list(compiled.finditer(src))
+            min_required = max(1, _int_value(rule.get("min_matches"), 2))
+            allow_single = bool(rule.get("allow_single", False))
+            required = 1 if allow_single_explicit and allow_single else min_required
+            if len(matches) >= required:
+                if rule.get("validate_sequence") and not _looks_like_real_chapters(matches, rule):
                     continue
                 chapters = []
                 for i, match in enumerate(matches):
                     start_pos = match.start()
-                    chapter_num = match.group(1).strip().strip('*') if len(match.groups()) >= 1 else ""
-                    title_part = match.group(2).strip().strip('*').strip() if len(match.groups()) >= 2 else ""
-                    if title_part:
-                        current_title = title_part if title_part.startswith(chapter_num) else f"{chapter_num}: {title_part}"
+                    chapter_num = _group_value(match, rule.get("number_group", 1))
+                    title_part = _group_value(match, rule.get("title_group", 2))
+                    title_template = rule.get("title_template")
+                    if isinstance(title_template, str) and title_template:
+                        try:
+                            current_title = title_template.format(number=chapter_num, title=title_part).strip()
+                        except (KeyError, ValueError):
+                            current_title = ""
                     else:
-                        current_title = chapter_num
+                        current_title = ""
+                    if not current_title:
+                        if title_part:
+                            current_title = title_part if title_part.startswith(chapter_num) else f"{chapter_num}: {title_part}"
+                        else:
+                            current_title = chapter_num
 
                     if i > 0:
                         chapter_content = src[last_pos:start_pos].strip()
@@ -464,9 +597,15 @@ class NovelService:
                             "title": last_title if last_title else f"第{len(chapters) + 1}章",
                             "content": chapter_content,
                         })
+                logger.info(
+                    "[chapter_split] matched rule=%s chapters=%s mode=%s",
+                    rule.get("name") or "unnamed",
+                    len(chapters),
+                    mode or "default",
+                )
                 break
 
-        if len(chapters) == 0:
+        if len(chapters) == 0 and fallback_to_chunks:
             paragraphs = [p.strip() for p in src.split('\n') if p.strip()]
             chunk_size = 50
             for i in range(0, len(paragraphs), chunk_size):
@@ -479,149 +618,52 @@ class NovelService:
         return chapters
 
     @staticmethod
+    async def _load_chapter_split_rules() -> Optional[List[Dict[str, Any]]]:
+        try:
+            from services import parser_rule_service
+            return await parser_rule_service.get_rules("chapter_split")
+        except Exception as exc:
+            logger.warning("[chapter_split] failed to load admin rules, using built-ins: %s", exc)
+            return None
+
+    @staticmethod
     async def parse_chapters(novel_id: int):
-        """自动解析章节"""
+        """Automatically split the imported source into chapters or episodes."""
         db = await get_db()
         try:
-            # 获取小说内容
             cursor = await db.execute(
-                "SELECT raw_content FROM novels WHERE id = ?",
-                (novel_id,)
+                "SELECT raw_content, mode FROM novels WHERE id = ?",
+                (novel_id,),
             )
             row = await cursor.fetchone()
             if not row:
                 return None
-            
-            content = row["raw_content"]
-            
-            # 章节匹配正则
-            # 支持:第X章、第X节、Chapter X、第一章、第二十三章等
-            # 支持 Markdown 标题格式:## 第1集:重生
-            # 支持 Markdown 加粗格式:**第一集**、**第二集:标题**
-            # v3.61.73 新增:"N 中文标题" 独占一行(如"1 赐婚"、"2 大婚")
-            # 每个 pattern 后面跟最小匹配数门槛 — 越松的格式门槛越严,防误判
-            chapter_patterns = [
-                # 0) v3.61.258:EP/集编号(如 "# EP01《标题》"、"EP 1"、"ep01:标题")
-                #    短剧/漫剧剧本常用 EP 编号,旧正则不认 → 整本走 fallback 按 50 段硬切成 N 个"第N部分"。
-                #    >=2 即认;不区分大小写(re.IGNORECASE 已开)。
-                (r'(?:^|\n)\s*#{0,6}\s*\*{0,2}(EP\s*\d+)\*{0,2}\s*[::]?\s*([^\n]*)', 2),
-                # 1) 第 X 章/回/节/卷/集 — 最可靠,>=2 即认
-                (r'(?:^|\n)\s*(?:#{1,6}\s+)?\*{0,2}(第\s*[\d零一二三四五六七八九十百千]+\s*[章回节卷集])\*{0,2}\s*[::]?\s*([^\n]*)', 2),
-                # 2) Chapter X
-                (r'(?:^|\n)\s*(?:#{1,6}\s+)?\*{0,2}(Chapter\s+\d+)\*{0,2}\s*[::]?\s*([^\n]*)', 2),
-                # 3) "N、标题" / "N.标题" 但必须带 Markdown 标题前缀(#)
-                # 禁止无 Markdown 前缀的纯 "1. xxx",避免把剧本场景号误判为章节
-                (r'(?:^|\n)\s*#{1,6}\s+\*{0,2}(\d+)\*{0,2}\s*[、..]\s*([^\n]+)', 2),
-                # 4) v3.61.73:"N 中文标题"独占一行(如"1 赐婚"、"2 大婚")
-                # 阿拉伯数字 + 空格 + 2-10 字纯中文,前后必须是换行(或开头/结尾)
-                # 风险:正文里"3 个月后"如果独占一行也会匹配 → 抬高门槛 >=3 + 后面用 _looks_like_real_chapters 校验间距
-                (r'(?:^|\n)[ \t]*(\d{1,4})\s+([\u4e00-\u9fa5]{2,10})[ \t]*(?=\n|$)', 3),
-            ]
 
-            chapters = []
-            last_pos = 0
-            last_title = ""
-
-            def _looks_like_real_chapters(_matches, _content: str) -> bool:
-                """v3.61.73 防误判:松规则(数字+空格+中文)容易把正文里的"3 个月后"误判。
-                需同时满足:
-                  ① 章节数字单调递增(真章节都是 1,2,3...)
-                  ② 第一个章节数字 ≤ 5(从开头开始,而不是"1990 年代"这种)
-                  ③ 章节间距 ≥ 50 字(避免连续多行数字行)
-                """
-                if len(_matches) < 2:
-                    return True
-                # 提取每个匹配的数字
-                try:
-                    nums = [int(m.group(1)) for m in _matches]
-                except (ValueError, IndexError):
-                    return False
-                # ① 单调递增
-                for i in range(len(nums) - 1):
-                    if nums[i+1] <= nums[i]:
-                        return False
-                # ② 第一个 ≤ 5
-                if nums[0] > 5:
-                    return False
-                # ③ 间距(真实章节再短也得几十字,误判"3 个月后\n5 年后"间距通常 < 20)
-                gaps = [_matches[i+1].start() - _matches[i].end() for i in range(len(_matches)-1)]
-                return min(gaps) >= 30
-
-            # 尝试用正则匹配章节
-            for pattern, min_required in chapter_patterns:
-                matches = list(re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE))
-                if len(matches) >= min_required:
-                    # 松规则(第 4 条)额外校验章节间距合理,避免把正文里的"3 个月"误判
-                    if min_required >= 3 and not _looks_like_real_chapters(matches, content):
-                        continue
-                    chapters = []
-                    for i, match in enumerate(matches):
-                        start_pos = match.start()
-                        # 提取章节标题
-                        # group(1) = 章节编号（如 "第1集"），group(2) = 标题（如 "重生"）
-                        chapter_num = match.group(1).strip().strip('*') if len(match.groups()) >= 1 else ""
-                        title_part = match.group(2).strip().strip('*').strip() if len(match.groups()) >= 2 else ""
-                        
-                        # 组合完整标题：章节编号 + 标题部分
-                        if title_part:
-                            if title_part.startswith(chapter_num):
-                                current_title = title_part
-                            else:
-                                current_title = f"{chapter_num}: {title_part}"
-                        else:
-                            current_title = chapter_num
-                        
-                        if i > 0:
-                            # 先保存上一个章节（用上一个章节的标题）
-                            chapter_content = content[last_pos:start_pos].strip()
-                            if chapter_content:
-                                chapters.append({
-                                    "title": last_title if last_title else f"第{len(chapters)+1}章",
-                                    "content": chapter_content
-                                })
-                        # 更新标题和位置（当前章节的标题留给下次循环保存）
-                        last_title = current_title
-                        last_pos = match.end()
-                    
-                    # 添加最后一个章节
-                    if last_pos < len(content):
-                        chapter_content = content[last_pos:].strip()
-                        if chapter_content:
-                            chapters.append({
-                                "title": last_title if last_title else f"第{len(chapters)+1}章",
-                                "content": chapter_content
-                            })
-                    break
-            
-            # 如果没有识别到章节，按固定段落数拆分
-            if len(chapters) == 0:
-                paragraphs = [p.strip() for p in content.split('\n') if p.strip()]
-                chunk_size = 50  # 每50段作为一个章节
-                
-                for i in range(0, len(paragraphs), chunk_size):
-                    chunk = paragraphs[i:i + chunk_size]
-                    chapter_content = '\n\n'.join(chunk)
-                    chapters.append({
-                        "title": f"第{i//chunk_size + 1}部分",
-                        "content": chapter_content
-                    })
-            
-            # 清空现有章节
-            await db.execute(
-                "DELETE FROM chapters WHERE novel_id = ?",
-                (novel_id,)
+            mode = row["mode"] or ""
+            custom_rules = await NovelService._load_chapter_split_rules()
+            chapters = NovelService._split_chapters_from_content(
+                row["raw_content"] or "",
+                allow_single_explicit=mode in {
+                    "script_import",
+                    "script_to_script",
+                    "team_script_sync",
+                    "short_drama_sync",
+                },
+                fallback_to_chunks=True,
+                custom_rules=custom_rules,
+                mode=mode,
             )
-            
-            # 插入新章节
+
+            await db.execute("DELETE FROM chapters WHERE novel_id = ?", (novel_id,))
             for idx, chapter in enumerate(chapters):
                 await db.execute(
                     """
                     INSERT INTO chapters (novel_id, title, content, sort_order)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (novel_id, chapter["title"], chapter["content"], idx)
+                    (novel_id, chapter["title"], chapter["content"], idx),
                 )
-            
+
             await db.commit()
             return len(chapters)
         finally:
@@ -630,15 +672,24 @@ class NovelService:
     @staticmethod
     async def incremental_import_chapters(novel_id: int, raw_content: str):
         """增量导入章节:同集号/章节号更新,不存在则新增;不清空旧章节。"""
-        chapters = NovelService._split_chapters_from_content(raw_content)
-        if not chapters:
-            return {"updated": 0, "created": 0, "total": 0}
-
         db = await get_db()
         try:
-            cursor = await db.execute("SELECT id FROM novels WHERE id = ?", (novel_id,))
-            if not await cursor.fetchone():
+            cursor = await db.execute("SELECT id, mode FROM novels WHERE id = ?", (novel_id,))
+            novel_row = await cursor.fetchone()
+            if not novel_row:
                 return None
+
+            mode = novel_row["mode"] or ""
+            custom_rules = await NovelService._load_chapter_split_rules()
+            chapters = NovelService._split_chapters_from_content(
+                raw_content,
+                allow_single_explicit=True,
+                fallback_to_chunks=False,
+                custom_rules=custom_rules,
+                mode=mode,
+            )
+            if not chapters:
+                return {"updated": 0, "created": 0, "total": 0}
 
             existing_rows = await (await db.execute(
                 "SELECT id, title, sort_order FROM chapters WHERE novel_id=? ORDER BY sort_order, id",

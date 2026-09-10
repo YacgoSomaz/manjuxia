@@ -323,6 +323,10 @@ async def upload_image_to_admin_temp(image_local_path: str) -> str:
 
     上传前压缩成 JPEG q=85 / 长边 1920(再快的 CDN 也比小图慢)
     """
+    from services.offline_guard import cloud_enabled
+    if not cloud_enabled():
+        raise RuntimeError("开发迁移版已切断生产 storyboard-ref/OSS 服务，请使用本地或模型提供商直传的素材链路")
+
     from services.image_service import ImageService
     from utils.paths import resolve_db_path
     abs_path = resolve_db_path(image_local_path)

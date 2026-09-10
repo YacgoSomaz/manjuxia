@@ -11,17 +11,68 @@ from database.db import get_db
 from services.llm_service import LLMService
 from services.script_service import ScriptService
 from services.extraction_service import ExtractionService
+from services.scene_reference_service import prepare_scene_reference, dispose_scene_references
 from services.template_service import get_by_id as get_template_by_id
+from services.offline_guard import cloud_enabled
 from services.utils import parse_storyboard_response
 from utils.timezone import now_beijing_str
 from utils.paths import resolve_db_path
 
 logger = logging.getLogger(__name__)
 
+
+async def _prepare_scene_reference_safe(
+    novel_id: int,
+    scene_title: str,
+    scene_content: str,
+    enabled: bool,
+) -> List[Dict[str, Any]]:
+    """Best-effort scene ref lookup; ambiguity/failure never blocks text generation."""
+    if not enabled:
+        return []
+    try:
+        reference = await prepare_scene_reference(novel_id, scene_title, scene_content)
+        return [reference] if reference else []
+    except Exception as exc:
+        logger.warning(
+            "[scene-reference] prepare failed novel=%s scene=%r; continue without image: %s",
+            novel_id,
+            scene_title,
+            exc,
+        )
+        return []
+
 # SQLite并发写入重试配置
 DB_RETRY_MAX_ATTEMPTS = 5
 DB_RETRY_BASE_DELAY = 0.1  # 100ms基础延迟
 DB_RETRY_MAX_DELAY = 2.0  # 最大延迟2秒
+STORYBOARD_LLM_TIMEOUT_SECONDS = 60 * 60
+
+# Keep storyboard request assembly byte-for-byte stable. These two values are
+# taken from the audited original DeepSeek request rather than re-authored.
+STORYBOARD_SYSTEM_PROMPT = (
+    "你是一位专业的分镜设计助手。\n\n"
+    "【输出约束(必读)】\n"
+    "1. 直接输出中文分镜内容,严禁输出任何思考过程(英文如 **Refining Novel to Script**、中文如 **剧本转化思考** 等加粗段落)\n"
+    "2. 严禁在分镜前加任何元描述(如 'Here is the storyboard:' / '以下是分镜:' / '我来转换:')\n"
+    "3. 第一个字符必须是场景标头(如 【内 xxx 日】)或节奏类型词,不允许任何前言/思考链"
+)
+# Imported original templates are stored without their final line break. The
+# audited request has that final line break plus two blank-line separators.
+STORYBOARD_SCRIPT_SEPARATOR = "\n\n\n以下是需要转换为分镜的剧本内容:\n\n"
+
+
+def _append_storyboard_script(template_content: str, script_content: str) -> str:
+    """Append source script exactly as the audited original request does."""
+    return f"{template_content}{STORYBOARD_SCRIPT_SEPARATOR}{script_content}"
+
+
+def _storyboard_messages(prompt: str) -> List[Dict[str, str]]:
+    """Build the two-message request shared by every storyboard entry point."""
+    return [
+        {"role": "system", "content": STORYBOARD_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
 
 # ============================================================================
 # 全局异步任务追踪机制
@@ -35,6 +86,120 @@ _running_generation_tasks: Dict[str, Dict[str, Any]] = {}
 def _get_task_key(novel_id: int, script_id: int, scene_index: int) -> str:
     """生成任务追踪的key"""
     return f"{novel_id}_{script_id}_{scene_index}"
+
+
+def _normalize_chain_scene_name(value: Any) -> str:
+    """接尾帧用的物理场景名归一化,忽略拆分产生的「(续2)」后缀。"""
+    text = str(value or "").strip()
+    return re.sub(r"\s*[\(（]\s*续\s*\d*\s*[\)）]\s*$", "", text).strip()
+
+
+def _normalize_scene_identity(value: Any) -> str:
+    """把场景标题归一成可用于跨章节连续性判断的完整身份。
+
+    身份保留「内/外 + 地点 + 时段」；任一项变化都视为新场景。仅忽略编号、
+    方括号和软拆分产生的「(续N)」后缀，避免把地点或时间不同的两场误判为连续。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    bracket_match = re.search(r"[【\[]([^】\]]+)[】\]]", text)
+    if bracket_match:
+        text = bracket_match.group(1)
+    else:
+        text = text.replace("【", "").replace("】", "").replace("[", "").replace("]", "")
+    text = _normalize_chain_scene_name(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _scene_from_section_info(section_info: Any) -> str:
+    """从 storyboards.section_info 中安全读取场景身份。"""
+    try:
+        data = json.loads(section_info) if isinstance(section_info, str) else section_info
+        if isinstance(data, dict):
+            return _normalize_scene_identity(data.get("scene", ""))
+    except Exception:
+        pass
+    return ""
+
+
+def _can_strong_inherit_across_scripts(
+    previous_scene: Any,
+    current_scene: Any,
+    previous_scene_type: Optional[str] = "normal",
+    current_scene_type: Optional[str] = "normal",
+) -> bool:
+    """跨章节是否允许继承:必须同场景、同时段、同时间线。
+
+    跨章节不使用同章的“弱继承·只留伤势”规则；任一条件不一致都完全断开。
+    """
+    prev_identity = _normalize_scene_identity(previous_scene)
+    cur_identity = _normalize_scene_identity(current_scene)
+    if not prev_identity or not cur_identity:
+        return False
+    prev_type = (previous_scene_type or "normal").lower()
+    cur_type = (current_scene_type or "normal").lower()
+    return prev_identity == cur_identity and prev_type == cur_type
+
+
+async def _get_previous_script_id(db, novel_id: int, script_id: int) -> Optional[int]:
+    """按章节 sort_order 找当前剧本的上一章剧本。
+
+    旧实现用 ``script_id < current`` 猜章节顺序，章节重排、补生成剧本或云端同步后
+    都可能取错。仅在旧数据缺少 chapter_id/章节表信息时才退回按 script id 查找。
+    """
+    try:
+        async with db.execute(
+            "SELECT s.chapter_id, c.sort_order "
+            "FROM scripts s LEFT JOIN chapters c ON c.id=s.chapter_id "
+            "WHERE s.id=? AND s.novel_id=?",
+            (script_id, novel_id),
+        ) as cur:
+            current = await cur.fetchone()
+        if current and current["chapter_id"] is not None and current["sort_order"] is not None:
+            async with db.execute(
+                "SELECT s.id FROM scripts s "
+                "JOIN chapters c ON c.id=s.chapter_id "
+                "WHERE s.novel_id=? AND ("
+                "c.sort_order < ? OR (c.sort_order = ? AND c.id < ?)"
+                ") ORDER BY c.sort_order DESC, c.id DESC, s.id DESC LIMIT 1",
+                (
+                    novel_id,
+                    current["sort_order"],
+                    current["sort_order"],
+                    current["chapter_id"],
+                ),
+            ) as cur:
+                previous = await cur.fetchone()
+            return previous["id"] if previous else None
+    except Exception as exc:
+        logger.warning(f"[state-chain] 按章节顺序定位上一章失败,回退 script_id: {exc}")
+
+    try:
+        async with db.execute(
+            "SELECT id FROM scripts WHERE novel_id=? AND id<? ORDER BY id DESC LIMIT 1",
+            (novel_id, script_id),
+        ) as cur:
+            previous = await cur.fetchone()
+        return previous["id"] if previous else None
+    except Exception as exc:
+        logger.warning(f"[state-chain] 回退定位上一章剧本失败: {exc}")
+        return None
+
+
+async def _get_previous_script_tail_row(db, novel_id: int, script_id: int):
+    """返回真实上一章的最后一条分镜；不跳过空状态行，也不跨越到更早章节。"""
+    previous_script_id = await _get_previous_script_id(db, novel_id, script_id)
+    if previous_script_id is None:
+        return None
+    async with db.execute(
+        "SELECT id, description, prompt, script_id, scene_index, section_number, sort_order, "
+        "section_info, scene_type, end_state FROM storyboards "
+        "WHERE novel_id=? AND script_id=? "
+        "ORDER BY scene_index DESC, section_number DESC, sort_order DESC, id DESC LIMIT 1",
+        (novel_id, previous_script_id),
+    ) as cur:
+        return await cur.fetchone()
 
 
 def register_generation_task(novel_id: int, script_id: int, scene_index: int, task: asyncio.Task) -> str:
@@ -74,16 +239,24 @@ def unregister_generation_task(key: str):
         logger.info(f"[task-tracker] 注销任务: key={key}, 当前活跃任务数={len(_running_generation_tasks)}")
 
 
-async def cancel_generation_tasks(novel_id: int, script_id: int = None) -> int:
+async def cancel_generation_tasks(
+    novel_id: int,
+    script_id: int = None,
+    wait_timeout: float = 2.0,
+    scene_index: int = None,
+) -> int:
     """
     取消指定小说/章节的所有正在运行的生成任务
     
     Args:
         novel_id: 小说ID
         script_id: 剧本ID（可选，如果不指定则取消该小说所有任务）
+        scene_index: 场景序号（可选；日志页单条中断时用于精确取消一个场景）
         
+        wait_timeout: 等待任务响应取消的最长秒数。上游请求可能卡住,不能让"中止"接口一直挂起。
+
     Returns:
-        取消的任务数量
+        已发出取消请求的任务数量
     """
     cancelled_count = 0
     keys_to_cancel = []
@@ -91,24 +264,36 @@ async def cancel_generation_tasks(novel_id: int, script_id: int = None) -> int:
     for key, task_info in list(_running_generation_tasks.items()):
         if task_info["novel_id"] == novel_id:
             # 如果指定了script_id，只取消匹配的任务
-            if script_id is None or task_info["script_id"] == script_id:
+            if (
+                (script_id is None or task_info["script_id"] == script_id)
+                and (scene_index is None or task_info["scene_index"] == scene_index)
+            ):
                 keys_to_cancel.append(key)
     
     for key in keys_to_cancel:
-        task_info = _running_generation_tasks[key]
+        task_info = _running_generation_tasks.get(key)
+        if not task_info:
+            continue
         task = task_info["task"]
         
         if not task.done():
             logger.info(f"[task-tracker] 取消任务: key={key}, scene_index={task_info['scene_index']}")
             task.cancel()
+            cancelled_count += 1
             try:
-                await task  # 等待任务真正取消
+                await asyncio.wait_for(task, timeout=max(0.1, float(wait_timeout)))
             except asyncio.CancelledError:
                 pass
-            cancelled_count += 1
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[task-tracker] 任务取消等待超时,已解除前端占用: "
+                    f"key={key}, scene_index={task_info['scene_index']}"
+                )
+            except Exception as _e:
+                logger.warning(f"[task-tracker] 等待取消任务异常(忽略): key={key}, err={_e}")
         
-        # 从追踪字典中移除
-        del _running_generation_tasks[key]
+        # 从追踪字典中移除。任务自身 finally 里还会 unregister,这里 pop 保持幂等。
+        _running_generation_tasks.pop(key, None)
 
     # v3.61.223: 取消任务后,把对应仍为 running 的分镜日志标成 error。
     #   asyncio 任务被 cancel 时抛 CancelledError,日志可能停留在 'running',
@@ -118,20 +303,20 @@ async def cancel_generation_tasks(novel_id: int, script_id: int = None) -> int:
             db = await get_db()
             try:
                 now = now_beijing_str()
-                if script_id is None:
-                    await db.execute(
-                        "UPDATE llm_logs SET status='error', "
-                        "error_message=COALESCE(error_message,'')||'(已手动中止生成)', end_time=? "
-                        "WHERE status='running' AND source_type='storyboard' AND novel_id=?",
-                        (now, novel_id)
-                    )
-                else:
-                    await db.execute(
-                        "UPDATE llm_logs SET status='error', "
-                        "error_message=COALESCE(error_message,'')||'(已手动中止生成)', end_time=? "
-                        "WHERE status='running' AND source_type='storyboard' AND novel_id=? AND source_id=?",
-                        (now, novel_id, script_id)
-                    )
+                where_parts = ["status='running'", "source_type='storyboard'", "novel_id=?"]
+                params = [now, novel_id]
+                if script_id is not None:
+                    where_parts.append("source_id=?")
+                    params.append(script_id)
+                if scene_index is not None:
+                    where_parts.append("source_scene_index=?")
+                    params.append(scene_index)
+                await db.execute(
+                    "UPDATE llm_logs SET status='error', "
+                    "error_message=COALESCE(error_message,'')||'(已手动中止生成)', end_time=? WHERE "
+                    + " AND ".join(where_parts),
+                    tuple(params),
+                )
                 await db.commit()
             finally:
                 await db.close()
@@ -162,6 +347,27 @@ def get_running_task_count(novel_id: int = None, script_id: int = None) -> int:
             if script_id is None or task_info["script_id"] == script_id:
                 count += 1
     return count
+
+
+def get_running_task_scene_indices(novel_id: int = None, script_id: int = None) -> List[int]:
+    """获取当前内存中仍在运行的分镜生成 scene_index 列表。"""
+    scene_indices: List[int] = []
+    for task_info in _running_generation_tasks.values():
+        if novel_id is not None and task_info["novel_id"] != novel_id:
+            continue
+        if script_id is not None and task_info["script_id"] != script_id:
+            continue
+        task = task_info.get("task")
+        if task is not None and task.done():
+            continue
+        scene_idx = task_info.get("scene_index")
+        if scene_idx is None:
+            continue
+        try:
+            scene_indices.append(int(scene_idx))
+        except Exception:
+            continue
+    return sorted(set(scene_indices))
 
 
 async def db_execute_with_retry(db, query: str, params: tuple = (), max_retries: int = DB_RETRY_MAX_ATTEMPTS):
@@ -270,6 +476,7 @@ async def _detect_scene_boundary_break(
     section_number: int,
     scene_type: Optional[str],
     current_scene_name: Optional[str] = None,
+    allow_cross_script: bool = False,
 ) -> Tuple[bool, Optional[int], Optional[str]]:
     """判断当前节是否应断开强状态继承。
 
@@ -303,6 +510,27 @@ async def _detect_scene_boundary_break(
         )
         row = await cursor.fetchone()
         if not row:
+            # 新章首场首节没有“本章上一节”，需显式检查真实上一章末场。
+            # 旧逻辑直接返回 False，正是跨章不同场景被误判成强继承的根因。
+            if allow_cross_script and scene_index == 0 and (section_number or 1) == 1:
+                previous = await _get_previous_script_tail_row(db, novel_id, script_id)
+                if previous:
+                    prev_si = previous["scene_index"]
+                    prev_type = previous["scene_type"] or "normal"
+                    prev_scene = _scene_from_section_info(previous["section_info"])
+                    strong_continuity = _can_strong_inherit_across_scripts(
+                        prev_scene,
+                        current_scene_name,
+                        prev_type,
+                        cur_type,
+                    )
+                    logger.info(
+                        "[state-chain] 跨章边界检测: "
+                        f"prev='{prev_scene or '未知'}'({prev_type}) → "
+                        f"cur='{_normalize_scene_identity(current_scene_name) or '未知'}'({cur_type}), "
+                        f"strong_continuity={strong_continuity}"
+                    )
+                    return not strong_continuity, prev_si, prev_type
             return False, None, None
 
         prev_si = row["scene_index"]
@@ -391,81 +619,8 @@ async def _detect_time_slot_change(
         return False
 
 
-def _strip_state_blocks(text: str) -> str:
-    """v3.61.229: 关闭"生成人物状态"时,从分镜文本里剥掉所有人物状态块(兜底,防模型仍输出)。
-
-    去掉:「场景起始状态:」块、「🔗 本节结尾状态:」块、以及残留的 姿态[/情绪[/伤势[/朝向关系[/持有道具[ 单行。
-    line-based 处理:遇状态块起始行进入跳过,直到边界行(空间布局/本节主线/镜号/🎬/📏/场景标头/---)恢复。
-    """
-    if not text:
-        return text
-    _start_re = re.compile(r'^\s*(场景起始状态|🔗?\s*本节结尾状态)\s*[:：]')
-    _boundary_re = re.compile(r'^\s*(空间布局|本节主线|本节剧情|镜号|Shot\b|🎬|📏|【|---|===)')
-    _tag_re = re.compile(r'^\s*(姿态|情绪|伤势|朝向关系|持有道具)\s*\[')
-    out: List[str] = []
-    skipping = False
-    for ln in text.split('\n'):
-        if skipping:
-            if _boundary_re.match(ln):
-                skipping = False
-                out.append(ln)
-            continue  # 状态块内部行丢弃
-        if _start_re.match(ln):
-            skipping = True
-            continue
-        if _tag_re.match(ln):
-            continue
-        out.append(ln)
-    return '\n'.join(out)
-
-
-def _storyboard_assemble_eligibility(template: dict):
-    """判断分镜模板走 服务端拼装(assemble) 还是 旧 messages 模式。
-    返回 (mode, admin_id_or_reason):
-      - ('legacy', None)      自建模板(is_preset≠1 或非分镜类),走旧模式,客户端本地拼(用户自己的模板,无所谓)
-      - ('assemble', admin_id) 预置分镜模板,走服务端拼装,模板明文不出客户端
-      - ('fail', reason)      预置分镜模板既缺 admin_id 又没有本地内容 → 拒绝
-    """
-    if (not template) or (template.get("is_preset") != 1) or (template.get("category") != "storyboard_generation"):
-        return ("legacy", None)
-    admin_id = template.get("admin_id")
-    if not admin_id:
-        # 离线发行版会把预置模板内容随应用打包,没有云端 admin_id 时应使用本地内容。
-        # 只有内容也为空的模板才需要继续失败关闭,避免把缺失模板静默当成可用模板。
-        if (template.get("content") or "").strip():
-            return ("legacy", None)
-        return ("fail", "预置分镜模板缺 admin_id,无法服务端拼装;为保护模板不回退本地拼接,请重启客户端或联系管理员")
-    return ("assemble", admin_id)
-
-
-def _template_tags(template: dict) -> List[str]:
-    raw = (template or {}).get("tags")
-    if not raw:
-        return []
-    if isinstance(raw, list):
-        return [str(item).strip() for item in raw if str(item).strip()]
-    if isinstance(raw, str):
-        text = raw.strip()
-        if not text:
-            return []
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, list):
-                return [str(item).strip() for item in parsed if str(item).strip()]
-        except Exception:
-            pass
-        return [item.strip() for item in re.split(r"[,，、;；]", text) if item.strip()]
-    return []
-
-
-def _storyboard_flow(template: dict) -> str:
-    """选择补镜/分镜解析流程；缺少标签时保持漫剧虾旧版短剧行为。"""
-    tags = set(_template_tags(template))
-    return "short_film" if "短片" in tags or "short_film" in tags else "short_drama"
-
-
 def _parse_camera_continuity(camera_text: str) -> Optional[Dict[str, str]]:
-    """把 camera 文本拆成景别/机位/运镜,用于跨小节景别避重。"""
+    """把 camera 文本拆成景别/机位/运镜。只做结构化提取,不做候选替换。"""
     camera = str(camera_text or "").strip()
     if not camera:
         return None
@@ -509,8 +664,10 @@ async def _get_prev_section_tail_camera_continuity(
     scene_index: Optional[int],
     section_number: int,
     allow_cross_script: bool = False,
+    current_scene_name: Optional[str] = None,
+    current_scene_type: str = "normal",
 ) -> Optional[Dict[str, str]]:
-    """查找上一小节末镜 camera,供 admin-server 拼装景别避重提示。"""
+    """查找上一小节末镜 camera,用于跨小节景别避重提示。"""
     if not script_id:
         return None
     cur_scene_idx = scene_index if scene_index is not None else 0
@@ -526,7 +683,7 @@ async def _get_prev_section_tail_camera_continuity(
             ORDER BY scene_index DESC, section_number DESC, sort_order DESC, id DESC
             LIMIT 8
             """,
-            (novel_id, script_id, cur_scene_idx, cur_scene_idx, cur_section),
+            (novel_id, script_id, cur_scene_idx, cur_scene_idx, cur_section)
         ) as cur:
             rows = await cur.fetchall()
         for row in rows:
@@ -542,18 +699,40 @@ async def _get_prev_section_tail_camera_continuity(
                 return info
 
         if allow_cross_script:
+            previous_script_id = await _get_previous_script_id(db, novel_id, script_id)
+            if previous_script_id is None:
+                return None
             async with db.execute(
                 """
-                SELECT id, description, prompt, script_id, scene_index, section_number
+                SELECT id, description, prompt, script_id, scene_index, section_number,
+                       section_info, scene_type
                 FROM storyboards
-                WHERE novel_id=? AND script_id<? AND script_id IS NOT NULL
-                ORDER BY script_id DESC, scene_index DESC, section_number DESC, sort_order DESC, id DESC
+                WHERE novel_id=? AND script_id=?
+                ORDER BY scene_index DESC, section_number DESC, sort_order DESC, id DESC
                 LIMIT 8
                 """,
-                (novel_id, script_id),
+                (novel_id, previous_script_id)
             ) as cur:
                 rows = await cur.fetchall()
+            if rows:
+                latest_scene = _scene_from_section_info(rows[0]["section_info"])
+                latest_type = rows[0]["scene_type"] or "normal"
+                if not _can_strong_inherit_across_scripts(
+                    latest_scene,
+                    current_scene_name,
+                    latest_type,
+                    current_scene_type,
+                ):
+                    logger.info(
+                        "[camera-chain] 跨章节场景不连续,跳过上一章末镜: "
+                        f"prev='{latest_scene or '未知'}'({latest_type}) → "
+                        f"cur='{_normalize_scene_identity(current_scene_name) or '未知'}'({current_scene_type})"
+                    )
+                    return None
             for row in rows:
+                # 只在上一章最后一个物理场景内回找可解析的末镜，不能越过其场景边界。
+                if _scene_from_section_info(row["section_info"]) != latest_scene:
+                    continue
                 info = _extract_tail_camera_continuity(row["description"] or row["prompt"] or "")
                 if info and info.get("shot_size"):
                     info["storyboard_id"] = str(row["id"])
@@ -570,6 +749,709 @@ async def _get_prev_section_tail_camera_continuity(
     finally:
         await db.close()
     return None
+
+
+def _strip_state_blocks(text: str) -> str:
+    """v3.61.229: 关闭"生成人物状态"时,从分镜文本里剥掉所有人物状态块(兜底,防模型仍输出)。
+
+    去掉:「场景起始状态:」块、「🔗 本节结尾状态:」块、以及残留的 姿态[/情绪[/伤势[/朝向关系[/持有道具[ 单行。
+    line-based 处理:遇状态块起始行进入跳过,直到下一个非状态结构边界恢复。
+    """
+    if not text:
+        return text
+    _start_re = re.compile(r'^\s*(场景起始状态|🔗?\s*本节结尾状态)\s*[:：]')
+    _boundary_re = re.compile(
+        r'^\s*(本节资产调用|人物|群体角色|核心证据|关键道具|空间布局|本节目的|本节情绪|'
+        r'本节封面候选|本节主线|本节剧情|本节落点|本节统一降噪提示词|统一降噪提示词|'
+        r'特殊降噪|不变元素|渐进变化|镜号|镜头|Shot\b|🎬|📏|【|---|===)'
+    )
+    _tag_re = re.compile(r'^\s*(姿态|情绪|伤势|朝向关系|持有道具)\s*\[')
+    out: List[str] = []
+    skipping = False
+    for ln in text.split('\n'):
+        if skipping:
+            # 模板通常用空行分隔状态块和下一段。把空行也视为边界，避免未知的
+            # 非状态标题被状态清洗连带吞掉；显式标题用于兼容没有空行的紧凑输出。
+            if not ln.strip():
+                skipping = False
+                out.append(ln)
+            elif _boundary_re.match(ln):
+                skipping = False
+                out.append(ln)
+            continue  # 状态块内部行丢弃
+        if _start_re.match(ln):
+            skipping = True
+            continue
+        if _tag_re.match(ln):
+            continue
+        out.append(ln)
+    return '\n'.join(out)
+
+
+def _character_alias_values(value: Any) -> List[str]:
+    """解析 extracted_elements.aliases 以及云端人物卡里的称呼字段。"""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, (list, tuple, set)):
+            result: List[str] = []
+            for item in parsed:
+                result.extend(_character_alias_values(item))
+            return result
+        if isinstance(parsed, str) and parsed != text:
+            return _character_alias_values(parsed)
+        return [
+            part.strip()
+            for part in re.split(r"[,，、;；/／|]+", text)
+            if part.strip()
+        ]
+    if isinstance(value, (list, tuple, set)):
+        result: List[str] = []
+        for item in value:
+            result.extend(_character_alias_values(item))
+        return result
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _normalize_character_elements(character_elements: List[Any]) -> List[Dict[str, Any]]:
+    """兼容旧调用的名字列表与新版 name/aliases 人物元素列表。"""
+    normalized: List[Dict[str, Any]] = []
+    by_name: Dict[str, Dict[str, Any]] = {}
+    for raw_element in character_elements or []:
+        if isinstance(raw_element, str):
+            element: Dict[str, Any] = {"name": raw_element, "aliases": []}
+        else:
+            try:
+                element = dict(raw_element)
+            except (TypeError, ValueError):
+                element = raw_element if isinstance(raw_element, dict) else {}
+
+        name = str(element.get("name") or "").strip()
+        name_key = name.casefold()
+        if not name or not name_key:
+            continue
+
+        aliases_raw: List[str] = _character_alias_values(element.get("aliases"))
+        attributes_raw = element.get("attributes")
+        if isinstance(attributes_raw, str):
+            try:
+                attributes_raw = json.loads(attributes_raw or "{}")
+            except (json.JSONDecodeError, TypeError, ValueError):
+                attributes_raw = {}
+        if isinstance(attributes_raw, dict):
+            for key in (
+                "aliases",
+                "alias",
+                "nickname",
+                "nickName",
+                "nicknames",
+                "otherNames",
+                "other_names",
+            ):
+                aliases_raw.extend(_character_alias_values(attributes_raw.get(key)))
+
+        target = by_name.get(name_key)
+        if target is None:
+            target = {"name": name, "aliases": []}
+            by_name[name_key] = target
+            normalized.append(target)
+
+        seen_aliases = {name_key, *(str(alias).casefold() for alias in target["aliases"])}
+        for raw_alias in aliases_raw:
+            alias = str(raw_alias or "").strip()
+            alias_key = alias.casefold()
+            if alias and alias_key not in seen_aliases:
+                seen_aliases.add(alias_key)
+                target["aliases"].append(alias)
+    return normalized
+
+
+def _match_section_character_names(
+    text: str,
+    known_characters: List[Any],
+    *,
+    allow_short_aliases: bool = False,
+) -> List[str]:
+    """匹配当前小节人物，并将昵称/简称稳定回写为素材库正式名。
+
+    别名只有在整个角色库中唯一时才采用，避免“母亲、陛下、师兄”这类共享
+    称呼误绑。全文兜底默认跳过一字别名；显式人物白名单可开启短别名。
+    """
+    elements = _normalize_character_elements(known_characters)
+    if not text or not elements:
+        return []
+
+    canonical_owners: Dict[str, set] = {}
+    alias_owners: Dict[str, set] = {}
+    for element in elements:
+        canonical = element["name"]
+        canonical_owners.setdefault(canonical.casefold(), set()).add(canonical)
+        for alias in element.get("aliases", []):
+            alias_owners.setdefault(alias.casefold(), set()).add(canonical)
+
+    candidates: List[tuple] = []
+    seen_variants = set()
+    for order, element in enumerate(elements):
+        canonical = element["name"]
+        variants = [(canonical, True)] + [
+            (alias, False) for alias in element.get("aliases", [])
+        ]
+        variants.sort(key=lambda item: (-len(item[0]), not item[1]))
+        for variant, is_canonical in variants:
+            variant = str(variant or "").strip()
+            variant_key = variant.casefold()
+            dedup_key = (canonical.casefold(), variant_key)
+            if not variant or dedup_key in seen_variants:
+                continue
+            seen_variants.add(dedup_key)
+
+            if not is_canonical:
+                owners = alias_owners.get(variant_key, set())
+                canonical_conflicts = canonical_owners.get(variant_key, set()) - {canonical}
+                if len(owners) != 1 or canonical_conflicts:
+                    continue
+                if len(variant) < 2 and not allow_short_aliases:
+                    continue
+
+            for match in re.finditer(re.escape(variant), text, flags=re.IGNORECASE):
+                candidates.append(
+                    (match.start(), match.end(), canonical, order, variant, is_canonical)
+                )
+
+    matched: List[tuple] = []
+    for start, end, canonical, order, variant, is_canonical in candidates:
+        enclosed_by_longer_other = any(
+            other_canonical != canonical
+            and other_start <= start
+            and end <= other_end
+            and (other_end - other_start) > (end - start)
+            for (
+                other_start,
+                other_end,
+                other_canonical,
+                _,
+                _,
+                _,
+            ) in candidates
+        )
+        if not enclosed_by_longer_other:
+            matched.append(
+                (start, -len(variant), order, 0 if is_canonical else 1, canonical)
+            )
+
+    first_by_name: Dict[str, tuple] = {}
+    for item in matched:
+        canonical = item[4]
+        if canonical not in first_by_name or item < first_by_name[canonical]:
+            first_by_name[canonical] = item
+    return [item[4] for item in sorted(first_by_name.values())]
+
+
+def _canonicalize_character_names(
+    names: List[str],
+    known_characters: List[Any],
+    *,
+    preserve_unknown: bool = True,
+) -> List[str]:
+    """把旧模板 characters/人物行中的昵称转为正式角色名。"""
+    result: List[str] = []
+    seen = set()
+    for raw_name in names or []:
+        value = str(raw_name or "").strip()
+        if not value:
+            continue
+        matches = _match_section_character_names(
+            value,
+            known_characters,
+            allow_short_aliases=True,
+        )
+        resolved = matches or ([value] if preserve_unknown else [])
+        for name in resolved:
+            key = str(name or "").strip().casefold()
+            if key and key not in seen:
+                seen.add(key)
+                result.append(str(name).strip())
+    return result
+
+
+def _normalize_prop_elements(prop_elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """把数据库道具行归一成稳定的正式名/别名列表。"""
+    normalized: List[Dict[str, Any]] = []
+    seen_names = set()
+    for raw_element in prop_elements or []:
+        try:
+            element = dict(raw_element)
+        except (TypeError, ValueError):
+            element = raw_element if isinstance(raw_element, dict) else {}
+
+        name = str(element.get("name") or "").strip()
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+
+        aliases_raw = element.get("aliases")
+        if isinstance(aliases_raw, str):
+            try:
+                aliases_raw = json.loads(aliases_raw or "[]")
+            except (json.JSONDecodeError, TypeError, ValueError):
+                aliases_raw = re.split(r"[,，、;；]", aliases_raw)
+        if not isinstance(aliases_raw, list):
+            aliases_raw = []
+
+        aliases: List[str] = []
+        seen_aliases = {name}
+        for raw_alias in aliases_raw:
+            alias = str(raw_alias or "").strip()
+            if alias and alias not in seen_aliases:
+                seen_aliases.add(alias)
+                aliases.append(alias)
+        normalized.append({"name": name, "aliases": aliases})
+    return normalized
+
+
+def _build_prop_code_map(
+    texts: List[str],
+    prop_elements: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    """从整批分镜中恢复 ``C01/D04`` 这类模板局部道具编号。
+
+    只接受编号与已提取道具正式名/别名相邻的显式定义，例如
+    ``C01暗朱绳``、``空令囊D02``、``D04黑金令``。逗号、顿号和斜杠
+    不属于连接符，避免把 ``C01、空令囊D02`` 错解成 C01=空令囊。
+    """
+    props = _normalize_prop_elements(prop_elements)
+    if not props:
+        return {}
+
+    evidence: Dict[str, Dict[str, Tuple[int, int]]] = {}
+    connector = r"[ \t:=：_\-—（(【\[]*"
+    code_pattern = r"(?<![A-Za-z0-9])([A-Za-z]\d{1,3})(?![A-Za-z0-9])"
+
+    for prop in props:
+        canonical = prop["name"]
+        variants = [(canonical, True)] + [
+            (alias, False) for alias in prop.get("aliases", [])
+        ]
+        # 先处理长词，既减少短别名噪声，也让冲突时结果更稳定。
+        variants.sort(key=lambda item: (-len(item[0]), not item[1]))
+        for variant, is_canonical in variants:
+            escaped = re.escape(variant)
+            patterns = (
+                re.compile(rf"{code_pattern}{connector}{escaped}", re.IGNORECASE),
+                re.compile(rf"{escaped}{connector}{code_pattern}", re.IGNORECASE),
+            )
+            for raw_text in texts or []:
+                text = str(raw_text or "")
+                if not text:
+                    continue
+                for pattern in patterns:
+                    for match in pattern.finditer(text):
+                        code = match.group(1).upper()
+                        # 正式名证据高于别名；同级时长名称更可靠。
+                        score = (10000 if is_canonical else 5000) + len(variant)
+                        previous = evidence.setdefault(code, {}).get(canonical)
+                        if previous is None:
+                            evidence[code][canonical] = (score, 1)
+                        else:
+                            evidence[code][canonical] = (
+                                max(previous[0], score),
+                                previous[1] + 1,
+                            )
+
+    prop_order = {prop["name"]: index for index, prop in enumerate(props)}
+    code_map: Dict[str, str] = {}
+    for code, candidates in evidence.items():
+        ranked = sorted(
+            candidates.items(),
+            key=lambda item: (
+                -item[1][0],
+                -item[1][1],
+                prop_order.get(item[0], 10**9),
+            ),
+        )
+        if ranked:
+            code_map[code] = ranked[0][0]
+            if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+                logger.warning(
+                    "[storyboard-props] 道具编号 %s 存在同分歧义 %s，采用 %s",
+                    code,
+                    [item[0] for item in ranked],
+                    ranked[0][0],
+                )
+    return code_map
+
+
+def _match_section_prop_names(
+    text: str,
+    prop_elements: List[Dict[str, Any]],
+    code_map: Optional[Dict[str, str]] = None,
+    *,
+    enforce_visual_evidence: bool = True,
+) -> List[str]:
+    """匹配当前小节真正启用的已提取道具，并把局部编号还原为正式名。
+
+    组合式模板优先读取 ``当前道具(参考图)`` 和 ``启用道具`` 字段，避免把
+    “下一节将取出伤药”之类的未来状态误关联到本节。旧模板没有这些字段时，
+    才回退到当前小节全文的正式名/较长别名匹配。
+
+    新模板偶尔会自相矛盾：把未来道具写进 ``启用道具``，但逐镜只写
+    “未显露/不可见/不启用素材”。当正文具备固定逐镜字段时，再要求道具至少
+    有一次正向可见或交互证据；没有证据的声明不进入素材关联。没有固定逐镜
+    字段的旧模板仍保持原兼容行为。
+    """
+    props = _normalize_prop_elements(prop_elements)
+    if not text or not props:
+        return []
+
+    # ``启用道具`` 是节级权威名单。新模板在同字段内使用 ``、``，但已落库的
+    # v8.3.3 文本可能误用 `` / `` 分隔名单成员；此处必须一直读到“下一个带
+    # 字段名和等号的结构项”或行尾，不能在每个斜杠处截断。
+    enabled_scope_matches = re.findall(
+        r"启用道具\s*[:：=]\s*(.*?)"
+        r"(?=\s*[/／]\s*[^/／\r\n=＝:：]{1,40}\s*(?:=|＝|[:：])|[\r\n】]|$)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # ``当前道具(参考图)`` 的历史格式里，斜杠后通常是质感等另一结构项，
+    # 继续沿用原来的单字段边界；节级 ``启用道具`` 单独使用上面的兼容规则。
+    current_scope_matches = re.findall(
+        r"(?:当前道具参考图|当前道具)\s*[:：=]\s*([^/／\n】]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    scope_matches = current_scope_matches + enabled_scope_matches
+    has_structured_scope = bool(scope_matches)
+    scope_text = "\n".join(scope_matches) if has_structured_scope else text
+    scope_folded = scope_text.casefold()
+
+    # 当前小节若重新声明编号，应覆盖整批上下文中的旧映射。
+    resolved_codes = dict(code_map or {})
+    resolved_codes.update(_build_prop_code_map([text], props))
+    codes_in_scope = {
+        match.group(1).upper()
+        for match in re.finditer(
+            r"(?<![A-Za-z0-9])([A-Za-z]\d{1,3})(?![A-Za-z0-9])",
+            scope_text,
+            flags=re.IGNORECASE,
+        )
+    }
+    names_from_codes = {
+        resolved_codes[code]
+        for code in codes_in_scope
+        if code in resolved_codes
+    }
+
+    matched: List[str] = []
+    for prop in props:
+        canonical = prop["name"]
+        direct_match = canonical.casefold() in scope_folded
+        if not direct_match:
+            for alias in prop.get("aliases", []):
+                # 结构化道具清单里一字别名也安全；旧模板全文兜底时跳过，
+                # 防止“药效、剑气”等叙事词误绑素材。
+                if (has_structured_scope or len(alias) >= 2) and alias.casefold() in scope_folded:
+                    direct_match = True
+                    break
+        if direct_match or canonical in names_from_codes:
+            matched.append(canonical)
+
+    if (
+        enforce_visual_evidence
+        and enabled_scope_matches
+        and matched
+    ):
+        evidence_lines: List[str] = []
+        has_shot_evidence_contract = False
+        evidence_field_re = re.compile(
+            r"^(?:画面/构图提示词|动作/表演/关系|道具交互/连续性|"
+            r"光影/质感/脸部读性|运镜/动作衔接)\s*[:：]",
+        )
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if evidence_field_re.match(line):
+                has_shot_evidence_contract = True
+                evidence_lines.append(line)
+                continue
+            # 起始状态允许证明一个静态持有道具已经真实在场；全片光影、美术、
+            # 声音基准和叙事目标不算视觉证据，避免未来道具从这些摘要中混入。
+            if (
+                line.startswith("起始连续性账本:")
+                or line.startswith("起始连续性账本：")
+                or "持有道具[" in line
+                or "持续接触[" in line
+            ):
+                evidence_lines.append(line)
+
+        if has_shot_evidence_contract:
+            negative_evidence_re = re.compile(
+                r"(?:不启用素材|不可见|尚未显露|未显露|隐藏物|"
+                r"不呈现|不入画|画外|禁止[^/／|｜;；，,、]{0,20}出现)"
+            )
+
+            def _has_positive_evidence(prop: Dict[str, Any]) -> bool:
+                variants = [prop["name"], *prop.get("aliases", [])]
+                variants.extend(
+                    code
+                    for code, mapped_name in resolved_codes.items()
+                    if mapped_name == prop["name"]
+                )
+                variants_folded = [
+                    str(value).strip().casefold()
+                    for value in variants
+                    if str(value).strip()
+                ]
+                for evidence_line in evidence_lines:
+                    # 同一结构字段可含多件道具；逐条看局部记录，避免后一个
+                    # “不可见”误伤前一个真实可见道具。
+                    clauses = re.split(
+                        r"[/／|｜;；，,、]",
+                        evidence_line,
+                    )
+                    for clause in clauses:
+                        clause_folded = clause.casefold()
+                        if not any(
+                            variant in clause_folded
+                            for variant in variants_folded
+                        ):
+                            continue
+                        if negative_evidence_re.search(clause):
+                            continue
+                        return True
+                return False
+
+            prop_by_name = {prop["name"]: prop for prop in props}
+            visible_matched = [
+                name
+                for name in matched
+                if name in prop_by_name and _has_positive_evidence(prop_by_name[name])
+            ]
+            removed = [name for name in matched if name not in visible_matched]
+            if removed:
+                logger.warning(
+                    "[storyboard-props] 启用道具缺少逐镜正向可见证据，"
+                    "按未显露道具过滤: %s",
+                    removed,
+                )
+            matched = visible_matched
+    return matched
+
+
+def _extract_explicit_visible_character_names(
+    text: str,
+    known_characters: List[Any],
+    *,
+    ending_only: bool = False,
+) -> Optional[List[str]]:
+    """从组合式分镜白名单中提取真正可见的人物。
+
+    返回 ``None`` 表示正文没有显式可见人物字段，调用方才可以走旧格式兜底；
+    返回空列表表示正文明确写了“无”。画外声源、门外人物、台词/OS 中提到
+    的姓名都不属于可见人物。
+
+    ``ending_only=True`` 时优先取最后一个镜头的可见/局部可见人物，供俯视
+    结尾调度使用；否则优先取“本节实际出镜”，供分镜 characters 元数据使用。
+    """
+    if not text:
+        return None
+    normalized_characters = _normalize_character_elements(known_characters)
+
+    empty_value_re = re.compile(
+        r"^(?:无|没有|none|null|空|无人|无人物|无角色)"
+        r"(?:\s*[（(][^）)]*[）)])?$",
+        flags=re.IGNORECASE,
+    )
+
+    def _is_explicit_empty_value(value: Any) -> bool:
+        normalized = str(value or "").strip().rstrip("。；;，,")
+        return not normalized or bool(empty_value_re.fullmatch(normalized))
+
+    def _names_from_values(values: List[str]) -> List[str]:
+        result: List[str] = []
+        seen = set()
+        for value in values:
+            value = str(value or "").strip()
+            if _is_explicit_empty_value(value):
+                continue
+            for name in _match_section_character_names(
+                value,
+                normalized_characters,
+                allow_short_aliases=True,
+            ):
+                if name not in seen:
+                    seen.add(name)
+                    result.append(name)
+        return result
+
+    def _resolve_values(values: List[str]) -> Optional[List[str]]:
+        """区分“明确无人”和“字段存在但程序没解析出名字”。
+
+        后一种情况必须返回 None 交给旧格式/正文匹配兜底，不能把 characters
+        权威地覆盖成 []。这正是新模板字段名变化后整批人物关联消失的根因。
+        """
+        if not values:
+            return None
+        names = _names_from_values(values)
+        if names:
+            return names
+        if all(_is_explicit_empty_value(value) for value in values):
+            return []
+        return None
+
+    # 兼容两套已投入使用的节头：
+    #   本节实际出镜=沈昭昭、裴砚之
+    #   人物:S0=... / IN=... / OUT=... / 实际出镜=沈昭昭[C01]、裴砚之[C02]
+    # 新规范：同字段名单用 ``、``，不同字段才用 `` / ``。同时兼容已经落库的
+    # 旧输出 ``实际出镜=甲 / 乙 / 丙 / 画外发声=无``：只有斜杠后紧跟
+    # “字段名=”时才视为字段边界，其余斜杠仍属于本名单。
+    section_field_name = (
+        r"(?:本节)?(?:起始在场|允许入场|允许退场|实际出镜|画外发声|启用道具)"
+    )
+    section_values = re.findall(
+        rf"(?:本节)?实际出镜\s*(?:=|＝|[:：])\s*(.*?)"
+        rf"(?=\s*[/／|｜;；]\s*{section_field_name}\s*(?:=|＝|[:：])|[\r\n】]|$)",
+        text,
+    )
+    shot_lines = [
+        line for line in text.splitlines()
+        if re.search(r"本镜人物白名单\s*(?:=|＝|[:：])", line)
+    ]
+
+    def _shot_values(lines: List[str]) -> List[str]:
+        values: List[str] = []
+        shot_field_name = (
+            r"(?:本镜)?(?:可见人物|局部可见人物|新入场人物|退场人物|"
+            r"画外声源|启用角色参考)"
+        )
+        visible_field_re = re.compile(
+            rf"(?:^|[/／|｜;；])\s*(?:本镜)?(?:可见人物|局部可见人物)"
+            rf"\s*(?:=|＝|[:：])\s*(.*?)"
+            rf"(?=\s*[/／|｜;；]\s*{shot_field_name}\s*(?:=|＝|[:：])|$)"
+        )
+        for line in lines:
+            marker = re.search(r"本镜人物白名单\s*(?:=|＝|[:：])", line)
+            payload = line[marker.end():] if marker else line
+            values.extend(
+                match.group(1).strip()
+                for match in visible_field_re.finditer(payload)
+            )
+        return values
+
+    def _legacy_visible_end_state_names() -> Optional[List[str]]:
+        """兼容旧模板：从“本节结尾状态”人物行中排除明确标为画外/退场者。"""
+        lines = text.splitlines()
+        capturing = False
+        found_block = False
+        saw_character_entry = False
+        saw_explicit_empty = False
+        values: List[str] = []
+        invisible_tokens = ("画外", "不在场", "已退场", "未入场", "不可见")
+        boundary_re = re.compile(
+            r"^\s*(?:本节追更钩子|本节统一降噪提示词|📏\s*本小节总时长)\s*[:：]"
+        )
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not capturing:
+                marker = re.match(r"^(?:🔗\s*)?本节结尾状态\s*[:：]\s*(.*)$", line)
+                if not marker:
+                    continue
+                capturing = True
+                found_block = True
+                line = marker.group(1).strip()
+                if not line:
+                    continue
+            elif boundary_re.match(line):
+                break
+
+            if _is_explicit_empty_value(line):
+                saw_explicit_empty = True
+                continue
+            prefix_match = re.match(r"^([^:：=]+)\s*[:：=]", line)
+            if not prefix_match:
+                continue
+            matched_names = _match_section_character_names(
+                prefix_match.group(1),
+                normalized_characters,
+                allow_short_aliases=True,
+            )
+            if matched_names:
+                saw_character_entry = True
+                if not any(token in line for token in invisible_tokens):
+                    values.extend(matched_names)
+        if not found_block:
+            return None
+        if values:
+            return _names_from_values(values)
+        if saw_character_entry or saw_explicit_empty:
+            return []
+        # 看到了“本节结尾状态”外壳，但没有解析出任何已知人物，属于格式或
+        # 名称映射失败，不能权威地把原有 characters 覆盖成空。
+        return None
+
+    if ending_only:
+        if shot_lines:
+            resolved = _resolve_values(_shot_values(shot_lines[-1:]))
+            if resolved is not None:
+                return resolved
+            # 看见了白名单外壳却没解析出非空人物，说明是格式兼容/名称映射失败，
+            # 不能将其误判成“结尾明确无人”。
+            legacy_end_names = _legacy_visible_end_state_names()
+            return legacy_end_names
+        legacy_end_names = _legacy_visible_end_state_names()
+        if legacy_end_names is not None:
+            return legacy_end_names
+        if section_values:
+            return _resolve_values(section_values)
+        return None
+
+    if section_values:
+        resolved = _resolve_values(section_values)
+        if resolved is not None:
+            return resolved
+    if shot_lines:
+        resolved = _resolve_values(_shot_values(shot_lines))
+        if resolved is not None:
+            return resolved
+    return None
+
+
+# 关闭"生成人物状态"只移除状态块,不能缩减模板原有的非状态输出结构。
+_NO_STATE_INSTR = (
+    "\n\n【本次最高优先级·覆盖模板】仅关闭人物状态块:"
+    "严禁输出「场景起始状态:」「🔗 本节结尾状态:」及其中的姿态[/情绪[/伤势[/朝向关系[/持有道具[ 等人物状态行。"
+    "除上述人物状态块外,模板原本要求的所有非状态字段必须完整保留并照常输出,包括但不限于场景标头、时间光线、美术基准、"
+    "人物、群体角色、核心证据、空间布局、本节主线、全部镜号分镜内容、总时长、不变元素与渐进变化。"
+    "不得把关闭人物状态理解为精简分镜,不得省略人物名单、场景信息、道具/证据、台词/OS、镜头或结尾落点等字段。"
+)
+
+
+def _storyboard_assemble_eligibility(template: dict):
+    """判断分镜模板走 服务端拼装(assemble) 还是 旧 messages 模式。
+    返回 (mode, admin_id_or_reason):
+      - ('legacy', None)      自建模板(is_preset≠1 或非分镜类),走旧模式,客户端本地拼(用户自己的模板,无所谓)
+      - ('assemble', admin_id) 预置分镜模板,走服务端拼装,模板明文不出客户端
+      - ('fail', reason)      预置分镜模板但缺 admin_id → 拒绝(绝不本地拼预置模板以护 IP,Codex#1)
+    """
+    if (not template) or (template.get("is_preset") != 1) or (template.get("category") != "storyboard_generation"):
+        return ("legacy", None)
+    # 商业客户端把官方算力交给 Electron 的远端桥接处理，本地后端明确关闭云端
+    # 代理。此时自配模型必须使用安装包内完整 Markdown 模板直连；若仍返回
+    # assemble，本地既没有代理可走，也不会加载模板正文，最终所有自配模型的
+    # 分镜生成都会在发出上游请求前失败。这里只切换传输方式，不改动模板内容。
+    if not cloud_enabled():
+        return ("legacy", None)
+    admin_id = template.get("admin_id")
+    if not admin_id:
+        return ("fail", "预置分镜模板缺 admin_id,无法服务端拼装;为保护模板不回退本地拼接,请重启客户端或联系管理员")
+    return ("assemble", admin_id)
 
 
 def _build_storyboard_assemble_payload(template: dict, admin_id, var_values: dict,
@@ -592,6 +1474,39 @@ def _build_storyboard_assemble_payload(template: dict, admin_id, var_values: dic
     }
 
 
+def _template_tags(template: dict) -> List[str]:
+    raw = (template or {}).get("tags")
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+        return [x.strip() for x in re.split(r"[,，、;；]", s) if x.strip()]
+    return []
+
+
+def _storyboard_flow(template: dict) -> str:
+    """Return storyboard generation flow.
+
+    短剧: existing scene/section flow.
+    短片: each shot number is parsed and stored as its own section.
+    Missing tags intentionally default to 短剧 to avoid changing old templates.
+    """
+    tags = set(_template_tags(template))
+    if "短片" in tags or "short_film" in tags:
+        return "short_film"
+    return "short_drama"
+
+
 def _strip_reasoning_chain(response: str, scene_header_re: str = r'【\s*(内|外|场景\s*\d+|黑屏|序幕|片头|片尾)') -> str:
     """v3.61.89: 剥离 Gemini 3.1 Pro / Claude 等 reasoning 模型在输出开头夹带的思考链。
 
@@ -609,6 +1524,27 @@ def _strip_reasoning_chain(response: str, scene_header_re: str = r'【\s*(内|�
     """
     if not response or not response.strip():
         return response
+    original = response
+
+    # MiniMax-M3 / some reasoning models may expose thinking text as
+    # <think>...</think>. Remove it before the storyboard parser sees it.
+    response = re.sub(r'(?is)<think\b[^>]*>.*?</think\s*>', '', response)
+    if re.search(r'(?is)<think\b[^>]*>', response):
+        tail = re.split(r'(?is)<think\b[^>]*>', response, maxsplit=1)[-1]
+        m = re.search(scene_header_re, tail)
+        if m:
+            response = tail[m.start():]
+        else:
+            response = re.sub(r'(?is)</?think\b[^>]*>', '', response)
+    else:
+        response = re.sub(r'(?is)</?think\b[^>]*>', '', response)
+    if response != original:
+        logger.info(
+            f"[storyboard] 剥离 <think> 思考块 {len(original) - len(response)} 字符,"
+            f"保留 {len(response)} 字符"
+        )
+        response = response.strip()
+
     stripped = response.lstrip()
     if not stripped.startswith('**'):
         return response
@@ -641,6 +1577,9 @@ def _dedupe_start_state_blocks(header_lines: List[str]) -> List[str]:
     策略:识别 header_lines 里的每个"场景起始状态:" + 紧随的"  角色 = ..."缩进行,合并成 block。
          若 ≥2 个块,**保留最后一个**(因为它通常贴近【场景标头】,代表本节真正起点;
          前面那个往往是 LLM 抄的注入老状态)。
+         若已经存在标准多行块,同时删除旧模板生成的
+         "场景起始状态:角色=..."单行副本。只有单行而没有标准块时原样保留,
+         避免误删存量数据的唯一状态。
 
     边缘情况:
     - 中间隔了一行非缩进内容 → 块结束
@@ -650,6 +1589,7 @@ def _dedupe_start_state_blocks(header_lines: List[str]) -> List[str]:
     if not header_lines:
         return header_lines
     block_re = re.compile(r'^\s*场景起始状态\s*[:：]\s*$')
+    inline_re = re.compile(r'^\s*场景起始状态\s*[:：]\s*\S[^\r\n]*$')
     indent_re = re.compile(r'^[ \t]+\S')
 
     # 标记每行是不是某个 block 的起点
@@ -677,17 +1617,23 @@ def _dedupe_start_state_blocks(header_lines: List[str]) -> List[str]:
         else:
             i += 1
 
-    if len(blocks) < 2:
+    if not blocks:
         return header_lines
 
-    # 只保留最后一个块,前面所有块整段删掉
-    keep_start, _ = blocks[-1]
-    # 收集要删的索引
+    # 有标准多行块时,单行旧格式只可能是副本;仅此时删除。
     drop = set()
-    for (s, e) in blocks[:-1]:
-        for idx in range(s, e):
+    for idx, line in enumerate(header_lines):
+        if inline_re.match(line or ""):
             drop.add(idx)
 
+    # 多个标准块仍沿用旧策略:只保留最后一个。
+    if len(blocks) >= 2:
+        for (s, e) in blocks[:-1]:
+            for idx in range(s, e):
+                drop.add(idx)
+
+    if not drop:
+        return header_lines
     out = [line for idx, line in enumerate(header_lines) if idx not in drop]
     return out
 
@@ -780,11 +1726,23 @@ def _relocate_orphan_tail_fragments(sections: List[Dict[str, Any]]) -> List[Dict
     _start_state_re = _re.compile(r'(?:^|\n)[ \t]*场景起始状态[:：]')
     _state_line_re = _re.compile(r'^[ \t]*[^=\n【】]{1,30}=\s*\S')
 
-    def _parse_states(block: str) -> Dict[str, str]:
+    def _parse_character_end_states(block: str, allow_leading_headerless: bool = False) -> Dict[str, str]:
+        """只解析人物结尾状态,避免把「核心证据结尾状态」里的道具键值误当角色。"""
         od: Dict[str, str] = {}
+        mode: Optional[str] = None
         for ln in block.split('\n'):
             s = ln.strip()
-            if not s or s.startswith('🔗') or s.startswith('🎬') or '=' not in s:
+            if not s:
+                continue
+            if re.match(r'^🔗\s*本节结尾状态[:：]?', s):
+                mode = "character"
+                continue
+            if s.startswith('🔗') or s.startswith('🎬') or s.startswith('📋') or s.startswith('📏'):
+                mode = "other"
+                continue
+            if not _state_line_re.match(ln):
+                continue
+            if mode != "character" and not (allow_leading_headerless and mode is None):
                 continue
             if '【' in s or '镜号' in s:
                 continue
@@ -795,9 +1753,28 @@ def _relocate_orphan_tail_fragments(sections: List[Dict[str, Any]]) -> List[Dict
                 od[nm] = val
         return od
 
+    def _is_separator_line(l: str) -> bool:
+        return bool(_re.match(r'^[ \t]*(?:[-—–_=*]){3,}[ \t]*$', l.strip()))
+
+    def _is_tail_marker_line(l: str) -> bool:
+        s = l.strip()
+        if not s:
+            return True
+        if s.startswith('🔗'):
+            return True
+        if (s.startswith('🎬') or s.startswith('📋')) and ('不变元素' in s or '渐进变化' in s):
+            return True
+        if s.startswith('📏') and '本小节总时长' in s:
+            return True
+        return False
+
     def _is_orphan_line(l: str) -> bool:
         s = l.strip()
-        return s.startswith('🔗') or s.startswith('🎬') or bool(_state_line_re.match(l))
+        return (
+            _is_tail_marker_line(l)
+            or _is_separator_line(l)
+            or bool(_state_line_re.match(l))
+        )
 
     for idx in range(1, len(sections)):
         curr = sections[idx].get("full_text", "") or ""
@@ -818,73 +1795,42 @@ def _relocate_orphan_tail_fragments(sections: List[Dict[str, Any]]) -> List[Dict
             continue
 
         # —— 确认是孤儿尾块 ——
-        orphan_states = _parse_states(head)
-        orphan_jin = [l.rstrip() for l in head.split('\n') if l.strip().startswith('🎬')]
-        if not orphan_states and not orphan_jin:
+        strong_tail_lines = [
+            l for l in head_lines
+            if _is_tail_marker_line(l) and l.strip()
+        ]
+        orphan_states = _parse_character_end_states(head, allow_leading_headerless=True)
+        if not orphan_states and not strong_tail_lines:
             continue
+        orphan_text = head.rstrip()
+
         # 1) 从当前节移除残片
         sections[idx]["full_text"] = curr[cut:].lstrip()
 
-        # 2) 合并进上一节(重建节末:body + 🔗块 + 🎬 + 📏)
+        # 2) 原文搬回上一节:新模板的尾块已扩展到 群体/核心证据/不变/渐进,
+        #    不能再按旧格式重建,否则会丢字段或把道具证据误归到人物状态。
         prev = (sections[idx - 1].get("full_text", "") or "").rstrip()
-        plines = prev.split('\n')
+        sections[idx - 1]["full_text"] = (prev + "\n" + orphan_text).strip()
 
-        def _is_tail(l: str) -> bool:
-            s = l.strip()
-            return s.startswith('🔗') or s.startswith('🎬') or s.startswith('📏')
-
-        ts = len(plines)
-        for i, l in enumerate(plines):
-            if _is_tail(l):
-                ts = i
-                break
-        body = plines[:ts]
-        tail = '\n'.join(plines[ts:])
-        prev_states = _parse_states(tail)
-        prev_jin = [l.rstrip() for l in tail.split('\n') if l.strip().startswith('🎬')]
-        durm = _re.search(r'(📏\s*本小节总时长[:：]\s*\d+(?:\.\d+)?\s*秒)', tail)
-        dur = durm.group(1) if durm else None
-
-        merged = dict(prev_states)
-        for nm, val in orphan_states.items():
-            merged.setdefault(nm, val)
-        # 🎬 合并:不是二选一,而是按"不变元素/渐进变化"类目并集(上一节已有的优先,
-        # 漂来的补缺)。修上一节有🎬不变、下一节漂🎬渐进时丢一行的问题(125 轻漏法)。
-        def _jin_cat(l: str) -> str:
-            if '不变元素' in l:
-                return '不变'
-            if '渐进变化' in l:
-                return '渐进'
-            return l.strip()
-        jin = list(prev_jin)
-        _have_cat = {_jin_cat(l) for l in prev_jin}
-        for l in orphan_jin:
-            c = _jin_cat(l)
-            if c not in _have_cat:
-                jin.append(l)
-                _have_cat.add(c)
-
-        new_lines = list(body)
-        new_lines.append('🔗 本节结尾状态:')
-        for nm, val in merged.items():
-            new_lines.append(f'  {nm} = {val}')
-        new_lines.extend(jin)
-        if dur:
-            new_lines.append(dur)
-        sections[idx - 1]["full_text"] = '\n'.join(new_lines).strip()
-
-        # 3) 修正上一节 _end_state(补缺角色,不覆盖)
+        # 3) 修正 _end_state:上一节补回人物状态;当前节从清理后的正文重新解析。
+        parsed_prev = _parse_character_end_states(sections[idx - 1]["full_text"])
         es = dict(sections[idx - 1].get("_end_state") or {})
-        for nm, val in prev_states.items():
+        for nm, val in parsed_prev.items():
             es.setdefault(nm, val)
         for nm, val in orphan_states.items():
             es.setdefault(nm, val)
         if es:
             sections[idx - 1]["_end_state"] = es
+
+        curr_es = _parse_character_end_states(sections[idx].get("full_text", "") or "")
+        if curr_es:
+            sections[idx]["_end_state"] = curr_es
+        else:
+            sections[idx].pop("_end_state", None)
         try:
             logger.info(
                 f"[🔗归位v2] 小节 {sections[idx].get('section_number')} 节首残片"
-                f"(角色:{list(orphan_states.keys())} 🎬:{len(orphan_jin)}行)挪回前一节并合并"
+                f"(角色:{list(orphan_states.keys())} 尾块:{len(strong_tail_lines)}行)原文挪回前一节"
             )
         except Exception:
             pass
@@ -898,16 +1844,38 @@ class StoryboardService:
         """判断分镜文本里是否至少有一个真实镜号。
 
         防止 LLM 输出只有风格描述/状态块/节头的"空境小节"被保存或展示。
-        只认带数字的镜号标记,避免把"运镜/镜头语言"这类普通词误判成有效镜头。
+        只认独立镜头行开头的带数字标记,避免把总账/审计说明里的
+        "镜头1完成……、镜头2完成……"误判成有效镜头。
         """
-        return bool(re.search(r'(?:镜号|镜头|镜|Shot)\s*\d', text or '', re.IGNORECASE))
+        return bool(
+            re.search(
+                r'(?mi)^[ \t]*(?:[-*#>]+[ \t]*)*'
+                r'(?:镜号|镜头|镜|Shot)[ \t]*\d+',
+                text or '',
+            )
+        )
+
+    @staticmethod
+    def _build_no_storyboard_error_message(response: str) -> str:
+        """把“模型有回复、但没有分镜”的返回转换成用户能看懂的失败原因。"""
+        text = re.sub(r'^\s*```(?:text|markdown)?\s*|\s*```\s*$', '', response or '', flags=re.I)
+        text = re.sub(r'\s+', ' ', text).strip()
+        if not text:
+            return "大模型返回空内容，未生成任何分镜。"
+        if len(text) > 900:
+            text = text[:900].rstrip() + "…"
+        if "冲突" in text or "需上游调整" in text or "无法形成" in text:
+            return f"分镜模板规则与当前场景冲突，未生成有效镜头：{text}"
+        return f"模型未返回有效分镜（缺少“镜号/镜头”行）：{text}"
 
     # 标准景别格式（作为拆分点）- 匹配【外/内/外/内/内/外 场景描述】格式
-    SCENE_PATTERN = re.compile(r'^【(?:外|内|外/内|内/外)\s+[^】]+】', re.MULTILINE)
+    # 兼容剧本分段前缀: "3-1 【外 演武场 上午】"
+    _SCENE_PREFIX = r'(?:(?:\d+(?:-\d+)?|场景?\s*\d+|第\s*\d+\s*场)\s*[：:、.．-]?\s*)?'
+    SCENE_PATTERN = re.compile(r'^\s*' + _SCENE_PREFIX + r'【(?:外|内|外/内|内/外)\s+[^】]+】', re.MULTILINE)
     
     # 通用中文方括号格式（fallback）- 匹配【任意内容】行首模式
     # 如【现实 · 深夜书房 · 夜】、【回忆 · 主卧室 · 夜】等
-    SCENE_PATTERN_GENERAL = re.compile(r'^【[^【】]+】', re.MULTILINE)
+    SCENE_PATTERN_GENERAL = re.compile(r'^\s*' + _SCENE_PREFIX + r'【[^【】]+】', re.MULTILINE)
 
     @staticmethod
     def _normalize_characters(characters_input) -> List[str]:
@@ -945,8 +1913,13 @@ class StoryboardService:
         """标准化场景标题：去除【】括号，规范化空格"""
         if not title:
             return title
-        # 去除【】括号
-        title = title.replace('【', '').replace('】', '')
+        # 兼容 "3-1 【外 演武场 上午】" 这类编号前缀,只取括号内场景名。
+        bracket_match = re.search(r'[【\[]([^】\]]+)[】\]]', title)
+        if bracket_match:
+            title = bracket_match.group(1)
+        else:
+            # 去除【】括号
+            title = title.replace('【', '').replace('】', '')
         # 将多个连续空格替换为单个空格
         title = re.sub(r'\s+', ' ', title)
         # 去除首尾空格
@@ -1029,7 +2002,7 @@ class StoryboardService:
 
         # 遍历所有场景标记
         for i, match in enumerate(matches):
-            scene_title = match.group(0).strip()
+            scene_title = StoryboardService.normalize_scene_title(match.group(0).strip())
             start_pos = match.start()
             end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(content)
 
@@ -1266,7 +2239,11 @@ class StoryboardService:
         return result
 
     @staticmethod
-    async def _parse_sections_with_dynamic_rules(response: str) -> List[Dict[str, Any]]:
+    async def _parse_sections_with_dynamic_rules(
+        response: str,
+        flow: str = "short_drama",
+        max_section_duration_sec: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """异步包装:先从 admin 拉取小节解析规则,再调同步解析。
         拉取失败会自动降级到硬编码规则。"""
         try:
@@ -1275,10 +2252,84 @@ class StoryboardService:
         except Exception as e:
             logger.warning(f"[storyboard] 拉取 section_split 规则失败,降级硬编码: {e}")
             rules = None
-        return StoryboardService._parse_sections_from_response(response, custom_rules=rules)
+        return StoryboardService._parse_sections_from_response(
+            response,
+            custom_rules=rules,
+            flow=flow,
+            max_section_duration_sec=max_section_duration_sec,
+        )
 
     @staticmethod
-    def _parse_sections_from_response(response: str, custom_rules: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    def _parse_short_film_sections(text: str) -> List[Dict[str, Any]]:
+        """短片链路:每个镜号独立成为一个小节。
+
+        主格式:
+          【外 场景 日 · 镜号1 · 5秒 · 视觉目的】
+          场景：...
+          人物：...
+          镜号1 (5秒): ...
+          📏 本小节总时长:5 秒
+        """
+        if not text or not text.strip():
+            return []
+
+        # 优先按独占场景头拆,且场景头必须带"镜号N",避免误切普通短剧模板的场景头。
+        header_re = re.compile(r'(?m)^[ \t]*(【[^】\n]{2,220}(?:镜号|Shot)\s*\d+[^】\n]*】)[ \t]*$')
+        matches = list(header_re.finditer(text))
+        if not matches:
+            return []
+
+        sections: List[Dict[str, Any]] = []
+        for idx, match in enumerate(matches):
+            start = match.start()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+            block = text[start:end].strip()
+            if not StoryboardService._has_shot_marker(block):
+                continue
+
+            header = match.group(1).strip()
+            inner = header.strip("【】")
+            scene = ""
+            characters = ""
+            scene_match = re.search(r'场景[：:]\s*([^\n]+)', block)
+            if scene_match:
+                scene = scene_match.group(1).strip()
+            else:
+                scene = inner.split("·", 1)[0].strip()
+
+            characters_match = re.search(r'人物[：:]\s*([^\n]+)', block)
+            if characters_match:
+                characters = characters_match.group(1).strip()
+
+            if not re.search(r'📏\s*本小节总时长', block):
+                dur_match = re.search(r'(\d+(?:\.\d+)?)\s*秒', header) or re.search(
+                    r'(?:镜号|Shot)\s*\d+\s*[\(（](\d+(?:\.\d+)?)\s*秒', block
+                )
+                if dur_match:
+                    val = float(dur_match.group(1))
+                    dur = int(val) if val.is_integer() else val
+                    block = block.rstrip() + f"\n📏 本小节总时长:{dur} 秒"
+
+            sections.append({
+                "section_number": idx + 1,
+                "section_info": {
+                    "scene": scene,
+                    "characters": characters,
+                },
+                "full_text": block,
+            })
+
+        if sections:
+            logger.info(f"[storyboard][short_film] 按镜号小节解析到 {len(sections)} 节")
+        return sections
+
+    @staticmethod
+    def _parse_sections_from_response(
+        response: str,
+        custom_rules: Optional[List[Dict[str, Any]]] = None,
+        flow: str = "short_drama",
+        max_section_duration_sec: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """
         从 LLM 响应中解析小节数据
         支持两种格式：
@@ -1295,22 +2346,46 @@ class StoryboardService:
             return []
         
         text = response.strip()
+
+        max_sec = StoryboardService._normalize_section_duration_limit(
+            max_section_duration_sec
+        )
+
+        if flow == "short_film":
+            short_film_sections = StoryboardService._parse_short_film_sections(text)
+            if short_film_sections:
+                return StoryboardService._postprocess_text_sections(
+                    short_film_sections,
+                    max_section_duration_sec=max_sec,
+                )
         
         # 尝试1：解析 JSON 格式
         try:
             result = json.loads(text)
             if isinstance(result, list):
                 return StoryboardService._postprocess_text_sections(
-                    StoryboardService._convert_json_sections_to_text(result)
+                    StoryboardService._convert_json_sections_to_text(
+                        result,
+                        max_section_duration_sec=max_sec,
+                    ),
+                    max_section_duration_sec=max_sec,
                 )
             if isinstance(result, dict):
                 for key in ['sections', 'storyboards', 'scenes', 'data', 'results', 'list', 'items', 'shots']:
                     if key in result and isinstance(result[key], list):
                         return StoryboardService._postprocess_text_sections(
-                            StoryboardService._convert_json_sections_to_text(result[key])
+                            StoryboardService._convert_json_sections_to_text(
+                                result[key],
+                                max_section_duration_sec=max_sec,
+                            ),
+                            max_section_duration_sec=max_sec,
                         )
                 return StoryboardService._postprocess_text_sections(
-                    StoryboardService._convert_json_sections_to_text([result])
+                    StoryboardService._convert_json_sections_to_text(
+                        [result],
+                        max_section_duration_sec=max_sec,
+                    ),
+                    max_section_duration_sec=max_sec,
                 )
         except json.JSONDecodeError:
             pass
@@ -1391,16 +2466,28 @@ class StoryboardService:
                     result = json.loads(attempt)
                     if isinstance(result, list):
                         return StoryboardService._postprocess_text_sections(
-                            StoryboardService._convert_json_sections_to_text(result)
+                            StoryboardService._convert_json_sections_to_text(
+                                result,
+                                max_section_duration_sec=max_sec,
+                            ),
+                            max_section_duration_sec=max_sec,
                         )
                     if isinstance(result, dict):
                         for key in ['sections', 'storyboards', 'scenes', 'data', 'results', 'list', 'items', 'shots']:
                             if key in result and isinstance(result[key], list):
                                 return StoryboardService._postprocess_text_sections(
-                                    StoryboardService._convert_json_sections_to_text(result[key])
+                                    StoryboardService._convert_json_sections_to_text(
+                                        result[key],
+                                        max_section_duration_sec=max_sec,
+                                    ),
+                                    max_section_duration_sec=max_sec,
                                 )
                         return StoryboardService._postprocess_text_sections(
-                            StoryboardService._convert_json_sections_to_text([result])
+                            StoryboardService._convert_json_sections_to_text(
+                                [result],
+                                max_section_duration_sec=max_sec,
+                            ),
+                            max_section_duration_sec=max_sec,
                         )
                 except (json.JSONDecodeError, ValueError) as je:
                     logger.warning(f"[storyboard] JSON candidate 解析失败: {type(je).__name__}: {str(je)[:120]}")
@@ -1411,14 +2498,21 @@ class StoryboardService:
         if md_parsed:
             logger.warning(f"[storyboard] JSON 解析失败,用 Markdown 表格 fallback 解析到 {len(md_parsed)} 个小节")
             return StoryboardService._postprocess_text_sections(
-                StoryboardService._convert_json_sections_to_text(md_parsed)
+                StoryboardService._convert_json_sections_to_text(
+                    md_parsed,
+                    max_section_duration_sec=max_sec,
+                ),
+                max_section_duration_sec=max_sec,
             )
 
         # 尝试4:按文本格式解析（小节标记）
         logger.warning(f"[storyboard] 所有解析失败,回退到文本解析。response 前 200 字: {text[:200]!r}")
         parsed = StoryboardService._parse_text_sections(text, custom_rules=custom_rules)
-        # 对 text 格式结果再做一次"按 15s 拆分 + 时间码归零 + 追加总时长"后处理
-        return StoryboardService._postprocess_text_sections(parsed)
+        # 对 text 格式结果再按当前模板模型的时长能力做拆分与归零。
+        return StoryboardService._postprocess_text_sections(
+            parsed,
+            max_section_duration_sec=max_sec,
+        )
 
     @staticmethod
     def _parse_markdown_table(text: str) -> List[Dict[str, Any]]:
@@ -1512,8 +2606,130 @@ class StoryboardService:
             "shots": shots,
         }]
     
-    # 即梦单条视频最大时长(秒),超过此时长的小节需要按镜头时间码自动拆分
+    # 历史模板/缺失模型元数据时沿用 Seedance 2.0 的 15 秒能力。
+    # 实际生成时会根据分镜模板 model_family 动态切换(2.0=15s,2.5=30s)。
     MAX_SECTION_DURATION_SEC = 15
+    STRUCTURED_SHOT_HEADER_RE = re.compile(
+        r"(?m)^镜头(?P<number>\d+)｜(?P<timecode>[^｜\n]+)｜(?P<title>[^\n]+)\s*$"
+    )
+
+    @staticmethod
+    def _normalize_section_duration_limit(value: Optional[int]) -> int:
+        """Normalize a model-derived section limit while preserving legacy safety."""
+        try:
+            parsed = int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            parsed = 0
+        return parsed if parsed > 0 else StoryboardService.MAX_SECTION_DURATION_SEC
+
+    @staticmethod
+    def _section_duration_limit_for_template(template: Optional[Dict[str, Any]]) -> int:
+        """Resolve storyboard duration capability from its template model family."""
+        try:
+            from services.video_model_capabilities import get_video_model_capabilities
+
+            capabilities = get_video_model_capabilities(
+                (template or {}).get("model_family")
+            )
+            return StoryboardService._normalize_section_duration_limit(
+                capabilities.get("max_duration_seconds")
+            )
+        except Exception as exc:
+            logger.warning(
+                "[storyboard] 读取模板模型时长能力失败,回退 %ss: %s",
+                StoryboardService.MAX_SECTION_DURATION_SEC,
+                exc,
+            )
+            return StoryboardService.MAX_SECTION_DURATION_SEC
+
+    @staticmethod
+    def _validate_structured_section_duration(
+        full_text: str,
+        max_sec: int,
+    ) -> None:
+        """Reject malformed fixed-11-field sections instead of capping a number.
+
+        The legacy postprocessor can safely split one-line ``镜号N:[timecode]``
+        blocks. It cannot split the current multi-line 11-field protocol because
+        each child section needs freshly derived headers, S0/S1, whitelists and
+        continuity books. Those sections must be produced by the storyboard
+        compiler itself. If it emits a 22-second body and a 15-second footer, we
+        fail early rather than silently saving a truncated task.
+        """
+        text = full_text or ""
+        if (
+            "本镜人物白名单:" not in text
+            or "画面/构图提示词:" not in text
+            or "本镜人声审计:" not in text
+        ):
+            return
+
+        matches = list(StoryboardService.STRUCTURED_SHOT_HEADER_RE.finditer(text))
+        if not matches:
+            return
+
+        ranges: List[Tuple[float, float]] = []
+        for match in matches:
+            parsed = StoryboardService._parse_timecode_seconds(match.group("timecode"))
+            if parsed is None:
+                raise ValueError(
+                    f"结构化分镜镜头{match.group('number')}时间码无法解析:"
+                    f"{match.group('timecode')}"
+                )
+            ranges.append(parsed)
+
+        for idx in range(1, len(ranges)):
+            if abs(ranges[idx][0] - ranges[idx - 1][1]) > 0.051:
+                raise ValueError(
+                    "结构化分镜镜头时间码不连续:"
+                    f"{ranges[idx - 1][1]:.2f}->{ranges[idx][0]:.2f}"
+                )
+
+        section_duration = ranges[-1][1] - ranges[0][0]
+        first_nonempty = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        title_match = re.search(r"(\d+(?:\.\d+)?)\s*秒", first_nonempty)
+        title_duration = float(title_match.group(1)) if title_match else None
+        duration_markers = re.findall(
+            r"(?m)^\s*📏\s*本小节总时长[:：]\s*(\d+(?:\.\d+)?)\s*秒\s*$",
+            text,
+        )
+        if len(duration_markers) > 1:
+            raise ValueError("结构化分镜同一正式小节出现多个本小节总时长")
+        marker_duration = float(duration_markers[-1]) if duration_markers else None
+
+        errors: List[str] = []
+        if section_duration > float(max_sec) + 0.051:
+            errors.append(f"镜头合计{section_duration:.1f}秒超过{max_sec}秒")
+        if title_duration is not None:
+            if title_duration > float(max_sec) + 0.051:
+                errors.append(f"标题{title_duration:.1f}秒超过{max_sec}秒")
+            if abs(title_duration - section_duration) > 0.11:
+                errors.append(
+                    f"标题{title_duration:.1f}秒与镜头合计{section_duration:.1f}秒不一致"
+                )
+        if marker_duration is not None:
+            # Provider duration is integer seconds. A fractional visual span may
+            # therefore use ceil(span), but it may never truncate the visual body.
+            import math
+            if marker_duration + 0.051 < section_duration:
+                errors.append(
+                    f"末尾时长{marker_duration:.1f}秒短于镜头合计{section_duration:.1f}秒"
+                )
+            if marker_duration > float(max_sec) + 0.051:
+                errors.append(f"末尾时长{marker_duration:.1f}秒超过{max_sec}秒")
+            if marker_duration > math.ceil(section_duration) + 0.051:
+                errors.append(
+                    f"末尾时长{marker_duration:.1f}秒大于镜头合计向上取整"
+                    f"{math.ceil(section_duration)}秒"
+                )
+
+        if errors:
+            raise ValueError(
+                "结构化分镜未完成真实拆节，已阻止保存；"
+                + "；".join(errors)
+                + "。请让模板在正式序列化前按安全切点拆成多个完整小节，"
+                f"不得只把末尾时长改成{max_sec}秒。"
+            )
 
     @staticmethod
     def _parse_timecode_seconds(tc: str) -> Optional[tuple]:
@@ -1646,17 +2862,90 @@ class StoryboardService:
         return last_end - first_start
 
     @staticmethod
-    def _convert_json_sections_to_text(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _dialogue_items(dialogue: Any) -> List[Dict[str, str]]:
+        """统一解析 JSON 分镜中的台词/OS/画外音，供序列化和时长校验使用。"""
+        if not dialogue:
+            return []
+        if isinstance(dialogue, dict):
+            item = dialogue
+            text = str(item.get("content") or item.get("text") or "").strip()
+            return [{
+                "kind": str(item.get("type") or item.get("kind") or "台词").strip(),
+                "speaker": str(item.get("speaker") or item.get("character") or "").strip(),
+                "text": text,
+                "tone": str(item.get("tone") or "").strip(),
+            }] if text else []
+        if isinstance(dialogue, list):
+            result: List[Dict[str, str]] = []
+            for item in dialogue:
+                result.extend(StoryboardService._dialogue_items(item))
+            return result
+
+        raw = str(dialogue).strip()
+        if not raw:
+            return []
+        # 官方 JSON 通常返回“台词:角色:「内容」”；兼容旧模板的引号和裸文本。
+        quoted = re.findall(r"[「『“\"](.*?)[」』”\"]", raw, flags=re.S)
+        texts = [part.strip() for part in quoted if part.strip()]
+        if not texts:
+            texts = [re.sub(r"^(?:台词|内心OS|画外音)\s*[:：]?\s*", "", raw).strip()]
+        kind_match = re.match(r"^(台词|内心OS|画外音)\s*[:：]?", raw)
+        kind = kind_match.group(1) if kind_match else "台词"
+        speaker = ""
+        if kind_match:
+            remainder = raw[kind_match.end():]
+            speaker_match = re.match(r"([^:：「『“\"]+)\s*[:：]", remainder)
+            if speaker_match:
+                speaker = speaker_match.group(1).strip()
+        return [{"kind": kind, "speaker": speaker, "text": text, "tone": ""} for text in texts if text]
+
+    @staticmethod
+    def _dialogue_timing(dialogue: Any, shot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """按 v8 模板 §3.3 计算台词语速、基础时长、容量和句末气口。"""
+        items = StoryboardService._dialogue_items(dialogue)
+        if not items:
+            return None
+        text = "".join(item["text"] for item in items)
+        if not text:
+            return None
+        tone = " ".join([str(shot.get("tone") or "")] + [item.get("tone", "") for item in items])
+        signal = f"{tone} {text}"
+        slow = re.search(r"哭腔|虚弱|压抑|哽咽|沉思|暧昧|低声|轻声|苦涩|喃喃|悲", signal)
+        fast = re.search(r"争执|惊慌|质问|急促|愤怒|怒吼|咆哮|厉声|急切|慌张", signal)
+        speed = 4.5 if slow and not fast else (7.5 if fast else 6.0)
+        import math
+        base_duration = math.ceil(len(text) / speed * 2) / 2
+        # 气口不计入可容纳字数，但计入实际镜尾时长。
+        pause = 0.5 if re.search(r"质问|决绝|反转|愤怒|怒吼|咆哮|！|？", signal) else 0.3
+        capacity = math.floor(base_duration * speed)
+        return {
+            "items": items,
+            "speed": speed,
+            "chars": len(text),
+            "base_duration": base_duration,
+            "pause": pause,
+            "required_duration": base_duration + pause,
+            "capacity": capacity,
+        }
+
+    @staticmethod
+    def _convert_json_sections_to_text(
+        data: List[Dict[str, Any]],
+        max_section_duration_sec: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """
         将 JSON 格式的小节数据转换为文本格式
         每个小节包含完整的文本内容，方便用户直接复制使用
 
-        V2 新增:如果 shots 带 timecode 且总时长超过 15 秒,自动拆成多个小节
+        V2 新增:如果 shots 带 timecode 且总时长超过当前模型上限,自动拆成多个小节
         (无 timecode 的老模板输出完全保持原逻辑,不受影响)
         """
         result = []
+        max_sec = StoryboardService._normalize_section_duration_limit(
+            max_section_duration_sec
+        )
 
-        # 预处理:按 15s 规则自动拆分超长小节
+        # 预处理:按当前模板模型的时长上限自动拆分超长小节
         # 只在能够安全解析 timecode 的情况下拆(无 timecode 一律保持不拆,不影响旧模板)
         # 拆分后:每个子小节的 timecode 重新从 00:00 开始,即梦才认
         expanded = []
@@ -1665,7 +2954,63 @@ class StoryboardService:
                 expanded.append((idx, section, None))
                 continue
             shots = section.get("shots", [])
-            groups = StoryboardService._split_shots_by_duration(shots, StoryboardService.MAX_SECTION_DURATION_SEC)
+            # Official compute returns the documented JSON schema
+            # (`shot_size`, `camera_movement`, `visual`, `duration`), while
+            # older local providers use (`camera`, `description`, `timecode`).
+            # Normalise the former before serialising.  Without this bridge
+            # every valid official shot became the visibly empty `镜号N:;`.
+            normalised_shots = []
+            for index, raw_shot in enumerate(shots if isinstance(shots, list) else [], start=1):
+                if not isinstance(raw_shot, dict):
+                    continue
+                shot = dict(raw_shot)
+                if shot.get("shot_number") in (None, "") and shot.get("scene_number") in (None, ""):
+                    shot["shot_number"] = index
+                if not (shot.get("camera") or "").strip():
+                    parts = [
+                        str(shot.get("shot_size") or "").strip(),
+                        str(shot.get("camera_movement") or "").strip(),
+                    ]
+                    shot["camera"] = " · ".join(part for part in parts if part)
+                if not (shot.get("description") or "").strip():
+                    shot["description"] = str(
+                        shot.get("visual") or shot.get("prompt") or shot.get("content") or ""
+                    ).strip()
+                # 官方返回的 duration 常常统一为 3 秒，即使台词本身需要更长。
+                # 先按模板 §3.3 回算基础念白时长+句末气口，再重建连续时间码，
+                # 避免出现“台词 40 字但镜头只有 3 秒”的超速镜头。
+                timing = StoryboardService._dialogue_timing(shot.get("dialogue"), shot)
+                try:
+                    original_duration = float(shot.get("duration"))
+                except (TypeError, ValueError):
+                    original_duration = 0.0
+                if original_duration <= 0:
+                    existing_range = StoryboardService._parse_timecode_seconds(
+                        shot.get("timecode") or shot.get("time_range")
+                    )
+                    original_duration = (existing_range[1] - existing_range[0]) if existing_range else 0.0
+                shot["_speech_timing"] = timing
+                shot["duration"] = max(original_duration, timing["required_duration"] if timing else 0.0)
+                normalised_shots.append(shot)
+            elapsed = 0.0
+            for shot in normalised_shots:
+                duration = float(shot.get("duration") or 0.0)
+                if duration <= 0:
+                    continue
+                end = elapsed + duration
+                def _stamp(value: float) -> str:
+                    minutes, seconds = divmod(value, 60)
+                    return f"{int(minutes):02d}:{seconds:04.1f}".replace(".0", "")
+                shot["timecode"] = f"{_stamp(elapsed)}-{_stamp(end)}"
+                elapsed = end
+            shots = normalised_shots
+            # Keep the normalised form for the no-split path too.  Previously
+            # only the split path assigned `new_section["shots"]`, so a valid
+            # 15-second official section was later serialised from its old,
+            # incompatible shot keys and rendered as `镜号N:;`.
+            section = dict(section)
+            section["shots"] = shots
+            groups = StoryboardService._split_shots_by_duration(shots, max_sec)
             if len(groups) <= 1:
                 expanded.append((idx, section, None))
             else:
@@ -1685,13 +3030,57 @@ class StoryboardService:
             scene = section.get("scene", "")
             characters = section.get("characters", "")
             shots = section.get("shots", [])
+
+            def _display_value(value: Any) -> str:
+                """把 JSON 元数据转成可直接阅读的中文，而不是 Python repr。"""
+                if isinstance(value, list):
+                    if all(not isinstance(item, (dict, list)) for item in value):
+                        return ", ".join(str(item) for item in value)
+                    return json.dumps(value, ensure_ascii=False)
+                if isinstance(value, dict):
+                    return json.dumps(value, ensure_ascii=False)
+                return str(value).strip()
+
+            def _append_metadata(label: str, value: Any) -> None:
+                """保留场景 JSON 中的状态/光线/布局等字段，供前端和用户查看。"""
+                if value in (None, "", [], {}):
+                    return
+                if label == "本节结尾状态":
+                    # 状态链解析器和前端状态卡都以这个权威标记定位节尾状态。
+                    label = "🔗 本节结尾状态"
+                if isinstance(value, dict):
+                    lines.append(f"{label}:")
+                    for key, item in value.items():
+                        if item in (None, "", [], {}):
+                            continue
+                        if isinstance(item, dict):
+                            lines.append(f"  {key}:")
+                            for nested_key, nested_value in item.items():
+                                if nested_value not in (None, "", [], {}):
+                                    lines.append(f"    {nested_key} = {_display_value(nested_value)}")
+                        else:
+                            lines.append(f"  {key} = {_display_value(item)}")
+                    return
+                lines.append(f"{label}：{_display_value(value)}")
             
             # 重组为文本格式
             lines = []
-            if scene:
-                lines.append(f"场景：{scene}")
+            if isinstance(scene, dict):
+                # 官方算力返回的 scene 是结构化对象；逐字段展开，避免页面出现
+                # `{'场景': ..., '时间光线': ...}` 这种不可直接使用的 Python repr。
+                for key, value in scene.items():
+                    if key in ("人物", "本小节总时长"):
+                        continue
+                    _append_metadata(str(key), value)
+                scene_title = scene.get("场景") or scene.get("地点") or ""
+                if not characters:
+                    characters = scene.get("人物", "")
+            else:
+                scene_title = scene
+                if scene:
+                    lines.append(f"场景：{_display_value(scene)}")
             if characters:
-                lines.append(f"人物：{characters}")
+                lines.append(f"人物：{_display_value(characters)}")
             
             for shot in shots:
                 if not isinstance(shot, dict):
@@ -1721,20 +3110,47 @@ class StoryboardService:
                 if background and background != visual:
                     shot_text += f"。背景:{background}"
 
-                # dialogue 兼容 dict(V2)和 string(旧版)两种形式
+                # 模板中的镜头细节字段不能因为 JSON 转文本而丢失。
+                # 官方返回字段名可能是英文或中文，统一映射为可直接复制的中文行。
+                detail_fields = (
+                    ("站位", ("position", "blocking", "stage_position", "站位")),
+                    ("视线", ("eyeline", "gaze", "look", "视线")),
+                    ("动作描述", ("action", "action_description", "movement", "动作描述")),
+                    ("表演细节", ("performance", "acting", "expression", "表演细节")),
+                    ("质感锚定", ("texture_anchor", "texture", "quality_anchor", "质感锚定")),
+                    ("视觉钩子", ("visual_hook", "hook", "视觉钩子")),
+                    ("音效", ("sound", "audio", "sfx", "音效")),
+                )
+                for label, keys in detail_fields:
+                    detail = next((shot.get(key) for key in keys if shot.get(key) not in (None, "", [], {})), None)
+                    if detail is not None:
+                        shot_text += f"\n{label}:{_display_value(detail)}"
+
+                # dialogue 统一走 _dialogue_items，兼容 speaker/content、
+                # character/text、字符串和数组，避免官方返回字段变体导致台词消失。
                 if dialogue:
-                    if isinstance(dialogue, dict):
-                        sp = dialogue.get("speaker", "")
-                        ct = dialogue.get("content", "")
-                        tn = dialogue.get("tone", "")
-                        if ct:
-                            prefix = f"{sp}({tn})" if sp and tn else (sp or "")
-                            if prefix:
-                                shot_text += f' "{prefix}: {ct}"'
-                            else:
-                                shot_text += f' "{ct}"'
-                    elif isinstance(dialogue, str):
-                        shot_text += f' "{dialogue}"'
+                    dialogue_lines = []
+                    for item in StoryboardService._dialogue_items(dialogue):
+                        kind = item.get("kind") or "台词"
+                        speaker = item.get("speaker") or ""
+                        content = item.get("text") or ""
+                        if content:
+                            dialogue_lines.append(
+                                f"{kind}:{speaker}:「{content}」" if speaker else f"{kind}:「{content}」"
+                            )
+                    if dialogue_lines:
+                        shot_text += " " + " ".join(dialogue_lines)
+
+                    # 这是模板 §3.3.6 的强制交付字段。官方 JSON 只返回 dialogue
+                    # 和 duration 时，也由本地按同一公式补齐，不能因远端省略而丢失。
+                    timing = shot.get("_speech_timing") or StoryboardService._dialogue_timing(dialogue, shot)
+                    if timing:
+                        speed_text = f"{timing['speed']:g}"
+                        shot_text += (
+                            f"\n【语速】{speed_text}字/秒"
+                            f"\n【台词字数/容量】{timing['chars']}/{timing['capacity']}"
+                            f"\n【气口】约{timing['pause']:g}秒"
+                        )
 
                 shot_text += ";"
                 lines.append(shot_text)
@@ -1745,9 +3161,9 @@ class StoryboardService:
             if total_duration is not None and total_duration > 0:
                 # 即梦平台只接受整数秒视频时长,统一向上取整
                 # ceil 而不是 round 是为了不丢最后画面(14.5→15 而不是 14.5→14)
-                # 但不能超过 15 秒红线(即梦上限)
+                # 不能超过当前模板模型的单条视频上限
                 import math
-                dur_int = min(15, math.ceil(total_duration))
+                dur_int = min(max_sec, math.ceil(total_duration))
                 lines.append(f"📏 本小节总时长:{dur_int} 秒")
 
             full_text = "\n".join(lines)
@@ -1769,19 +3185,22 @@ class StoryboardService:
         return result
     
     @staticmethod
-    def _postprocess_text_sections(sections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """对 text 格式的 sections 做 15s 拆分 + 时间码归零 + 追加总时长
+    def _postprocess_text_sections(
+        sections: List[Dict[str, Any]],
+        max_section_duration_sec: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """按当前模板模型上限拆分 text sections、归零时间码并追加总时长。
 
         输入:[{section_number, section_info{scene,characters}, full_text}, ...]
         输出:同结构,但 full_text 中:
           - 每小节的镜号行时间码归零从 00:00 起
-          - 超过 15s 的小节会拆成多个子小节,section_number 按顺序重编号
+          - 超过当前模型上限的小节会拆成多个子小节,section_number 按顺序重编号
           - 末尾追加"📏 本小节总时长:X 秒"
 
         策略:逐行扫描每个 section 的 full_text,
           - 识别镜号行(正则匹配 "镜号N" + "[MM:SS-MM:SS]" 时间码)
           - 非镜号行作为"头部元数据"(场景/人物等)
-          - 按累计时长 ≤ 15s 切分镜号行,超长就另起子小节
+          - 按累计时长 ≤ 当前模型上限切分镜号行,超长就另起子小节
 
         若 full_text 里压根没有 timecode 格式的镜号行,完全保持原样(兼容旧模板)。
         """
@@ -1792,7 +3211,9 @@ class StoryboardService:
         # 兜底: LLM 经常输出 "镜号1 (3.5秒):" 或 "镜号1 (3秒):" 这种时长简写格式
         # 没有时间码就用累计起点逻辑反推时间码
         duration_short_pattern = re.compile(r'^(镜号\d+)\s*[\(（](\d+(?:\.\d+)?)\s*秒[\)）]\s*[:：](.*)$')
-        max_sec = StoryboardService.MAX_SECTION_DURATION_SEC
+        max_sec = StoryboardService._normalize_section_duration_limit(
+            max_section_duration_sec
+        )
         result = []
 
         def tc_to_sec(s: str) -> float:
@@ -1808,6 +3229,7 @@ class StoryboardService:
 
         for section in sections:
             full_text = section.get("full_text", "") or ""
+            StoryboardService._validate_structured_section_duration(full_text, max_sec)
             header_lines = []
             shot_entries = []  # [(prefix, start_sec, end_sec, suffix), ...]
 
@@ -1865,7 +3287,7 @@ class StoryboardService:
                 result.append(section)
                 continue
 
-            # 按累计 ≤ 15s 切组
+            # 按累计不超过当前模型上限切组
             groups = []
             current = []
             base = None
@@ -1911,10 +3333,10 @@ class StoryboardService:
                         new_prefix = prefix
                     new_lines.append(new_prefix + suffix)
 
-                # 追加总时长(即梦只接受整数秒,统一向上取整,不超过 15 秒上限)
+                # 追加总时长(平台只接受整数秒,统一向上取整,不超过当前模型上限)
                 if duration > 0:
                     import math
-                    dur_int = min(15, math.ceil(duration))
+                    dur_int = min(max_sec, math.ceil(duration))
                     # 先清理 new_lines 里已有的"📏 本小节总时长"行(LLM 可能已输出),防重复
                     new_lines = [l for l in new_lines if not re.match(r'^\s*📏\s*本小节总时长', l or '')]
                     new_lines.append(f"📏 本小节总时长:{dur_int} 秒")
@@ -1942,8 +3364,8 @@ class StoryboardService:
         # ══════════════════════════════════════════════════════════
         # 📏 最终兜底:
         #   1) 全局去重,保证每节只有 1 个 📏 本小节总时长
-        #   2) cap 到 15 秒(即梦平台硬上限)
-        #      LLM 经常无视模板要求写出 18/20/25 秒,这里强制截断
+        #   2) cap 到当前模板模型的上限
+        #      LLM 经常无视模板要求写出超长时长,这里按模型能力兜底
         # ══════════════════════════════════════════════════════════
         DUR_LINE_RE = re.compile(r'^\s*📏\s*本小节总时长[:：]\s*(\d+(?:\.\d+)?)\s*秒\s*$')
         for s in result:
@@ -1957,18 +3379,22 @@ class StoryboardService:
             if keep_idx is None:
                 continue
 
-            # cap 到 15:解析数字,> 15 强制改为 15
+            # cap 到当前模型上限
             m = DUR_LINE_RE.match(lines_in[keep_idx])
             if m:
                 try:
                     val = float(m.group(1))
-                    if val > 15:
-                        lines_in[keep_idx] = '📏 本小节总时长:15 秒'
-                        logger.info(f"[duration-cap] 总时长 {val} > 15,cap 到 15")
+                    if val > max_sec:
+                        lines_in[keep_idx] = f'📏 本小节总时长:{max_sec} 秒'
+                        logger.info(
+                            f"[duration-cap] 总时长 {val} > {max_sec},cap 到 {max_sec}"
+                        )
                     elif val != int(val):
                         # 0.5 类小数 → 向上取整(即梦只接受整数)
                         import math
-                        lines_in[keep_idx] = f'📏 本小节总时长:{min(15, math.ceil(val))} 秒'
+                        lines_in[keep_idx] = (
+                            f'📏 本小节总时长:{min(max_sec, math.ceil(val))} 秒'
+                        )
                 except Exception:
                     pass
 
@@ -2146,6 +3572,12 @@ class StoryboardService:
 
         if not matches:
             # 如果没有找到小节标记，将整个文本作为一个小节
+            if not StoryboardService._has_shot_marker(text):
+                logger.warning(
+                    "[storyboard] 文本响应无小节标记且无真实镜号，拒绝包装成成功小节: %r",
+                    text[:120],
+                )
+                return []
             return [{
                 "section_number": 1,
                 "section_info": {"scene": "", "characters": ""},
@@ -2411,63 +3843,12 @@ class StoryboardService:
         return sections
 
     @staticmethod
-    async def _generate_storyboards_scene_by_scene(
-        novel_id: int,
-        template_id: int,
-        llm_config_id: int,
-        scripts: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """整剧路径按剧本场景逐个生成，避免单次调用只覆盖第一个场景。
-
-        分镜模板的输入契约是“一个剧本场景”，把多章合并后再调用会让模型
-        只完成首节；逐场景调用还可以复用现有的状态链和场景边界判断。
-        """
-        saved_storyboards: List[Dict[str, Any]] = []
-        failures: List[str] = []
-        for script in scripts:
-            current_script_id = script.get("id")
-            scenes = StoryboardService.split_scenes_from_script(script.get("content", ""))
-            for scene in scenes:
-                result = await StoryboardService.generate_section_storyboards(
-                    novel_id=novel_id,
-                    template_id=template_id,
-                    llm_config_id=llm_config_id,
-                    scene_content=scene.get("content", ""),
-                    scene_title=scene.get("scene_title", "未命名场景"),
-                    section_number=1,
-                    script_id=current_script_id,
-                    scene_index=scene.get("index", 0),
-                    inherit_prev_state=True,
-                    cross_chapter_inherit=True,
-                    with_character_state=True,
-                )
-                if result.get("success"):
-                    saved_storyboards.extend(result.get("storyboards", []))
-                else:
-                    failures.append(
-                        f"{scene.get('scene_title', '未命名场景')}: {result.get('message', '生成失败')}"
-                    )
-
-        if failures:
-            return {
-                "success": False,
-                "count": len(saved_storyboards),
-                "message": f"有 {len(failures)} 个场景生成失败: {'; '.join(failures[:3])}",
-                "storyboards": saved_storyboards,
-            }
-        return {
-            "success": True,
-            "count": len(saved_storyboards),
-            "message": f"按场景成功生成 {len(saved_storyboards)} 个小节",
-            "storyboards": saved_storyboards,
-        }
-
-    @staticmethod
     async def generate_storyboards(
         novel_id: int,
         template_id: int,
         llm_config_id: int,
-        script_id: Optional[int] = None
+        script_id: Optional[int] = None,
+        use_scene_reference_image: bool = False,
     ) -> Dict[str, Any]:
         """
         生成分镜
@@ -2512,22 +3893,6 @@ class StoryboardService:
                         "message": "该小说没有可用的剧本内容",
                         "storyboards": []
                     }
-                # 整剧模板的输入契约是单场景。多章合并调用会导致模型只返回
-                # 第一场景；按场景串行生成，和前端逐场景生成路径保持一致。
-                scene_count = sum(
-                    len(StoryboardService.split_scenes_from_script(s.get("content", "")))
-                    for s in scripts
-                )
-                if scene_count > 1:
-                    logger.info(
-                        f"[storyboard] 检测到整剧 {len(scripts)} 个剧本/{scene_count} 个场景，切换逐场景生成"
-                    )
-                    return await StoryboardService._generate_storyboards_scene_by_scene(
-                        novel_id=novel_id,
-                        template_id=template_id,
-                        llm_config_id=llm_config_id,
-                        scripts=scripts,
-                    )
                 # 合并所有剧本内容
                 script_content = "\n\n".join([
                     f"【{s.get('chapter_title', '未命名章节')}】\n{s.get('content', '')}"
@@ -2554,6 +3919,15 @@ class StoryboardService:
                     "message": f"模板不存在: template_id={template_id}",
                     "storyboards": []
                 }
+            _flow = _storyboard_flow(template)
+            _max_section_duration_sec = (
+                StoryboardService._section_duration_limit_for_template(template)
+            )
+            logger.info(
+                f"[storyboard] 模板流程标签 flow={_flow}, template_id={template_id}, "
+                f"model_family={template.get('model_family') or 'seedance_2_0'}, "
+                f"section_limit={_max_section_duration_sec}s"
+            )
 
             # 上报使用计数(预置模板才计,异步失败静默)
             try:
@@ -2615,7 +3989,7 @@ class StoryboardService:
             
             # 如果仍然没有替换任何内容（模板中没有变量占位符），则将剧本内容追加到模板后面
             if prompt == template_content or not has_replacement:
-                prompt = f"{template_content}\n\n以下是需要转换为分镜的剧本内容：\n\n{script_content}"
+                prompt = _append_storyboard_script(template_content, script_content)
             
             logger.info(f"[regenerate-section] 构建的 prompt 长度: {len(prompt)}, 前200字: {prompt[:200]}")
             
@@ -2623,10 +3997,7 @@ class StoryboardService:
             try:
                 logger.info(f"[storyboard] 准备调用 LLM: config_id={llm_config_id}")
                 # 简化 system prompt，让提示词模板完全控制输出格式
-                messages = [
-                    {"role": "system", "content": "你是一位专业的分镜设计助手。\n\n【输出约束(必读)】\n1. 直接输出中文分镜内容,严禁输出任何思考过程(英文如 **Refining Novel to Script**、中文如 **剧本转化思考** 等加粗段落)\n2. 严禁在分镜前加任何元描述(如 'Here is the storyboard:' / '以下是分镜:' / '我来转换:')\n3. 第一个字符必须是场景标头(如 【内 xxx 日】)或节奏类型词,不允许任何前言/思考链"},
-                    {"role": "user", "content": prompt}
-                ]
+                messages = _storyboard_messages(prompt)
                 
                 logger.info(f"[storyboard] 即将调用 call_llm, config_id={llm_config_id}")
                 # 预置分镜模板走服务端拼装(整剧路径无状态继承:with_character_state=True 不追加禁止指令, inject_block 空)
@@ -2635,15 +4006,36 @@ class StoryboardService:
                     _assemble_payload = _build_storyboard_assemble_payload(
                         template, _asm_admin_id, variable_map, script_content, True, "",
                     )
-                response = await LLMService.call_llm_with_retry(
-                    config_id=llm_config_id,
-                    messages=messages,
-                    timeout=600,
-                    task_type="storyboard_generate",
-                    novel_id=novel_id,
-                    assemble_payload=_assemble_payload,
-                    allow_direct_storyboard=(_asm_mode == "legacy"),
-                )
+                _scene_references: List[Dict[str, Any]] = []
+                if use_scene_reference_image:
+                    _seen_element_ids = set()
+                    for _scene in StoryboardService.split_scenes_from_script(script_content)[:8]:
+                        _refs = await _prepare_scene_reference_safe(
+                            novel_id,
+                            str(_scene.get("scene_title") or ""),
+                            str(_scene.get("content") or ""),
+                            True,
+                        )
+                        for _ref in _refs:
+                            _element_id = _ref.get("element_id")
+                            if _element_id in _seen_element_ids:
+                                dispose_scene_references(_refs)
+                                continue
+                            _seen_element_ids.add(_element_id)
+                            _scene_references.append(_ref)
+                try:
+                    response = await LLMService.call_llm_with_retry(
+                        config_id=llm_config_id,
+                        messages=messages,
+                        timeout=STORYBOARD_LLM_TIMEOUT_SECONDS,
+                        task_type="storyboard_generate",
+                        novel_id=novel_id,
+                        assemble_payload=_assemble_payload,
+                        allow_direct_storyboard=(_asm_mode == "legacy"),
+                        ephemeral_images=_scene_references,
+                    )
+                finally:
+                    dispose_scene_references(_scene_references)
                 logger.info(f"[regenerate-section] LLM 调用完成，响应长度: {len(response) if response else 0}")
                 if response:
                     logger.info(f"[storyboard] 响应前500字: {response[:500]}")
@@ -2672,7 +4064,11 @@ class StoryboardService:
             
             # 5. 解析大模型返回的分镜列表（按小节组织）
             logger.info(f"[storyboard] 开始解析分镜响应")
-            sections_data = await StoryboardService._parse_sections_with_dynamic_rules(response)
+            sections_data = await StoryboardService._parse_sections_with_dynamic_rules(
+                response,
+                flow=_flow,
+                max_section_duration_sec=_max_section_duration_sec,
+            )
             logger.info(f"[storyboard] 解析到 {len(sections_data)} 个小节")
             
             if not sections_data:
@@ -2726,6 +4122,16 @@ class StoryboardService:
             db = await get_db()
             try:
                 saved_storyboards = []
+                cursor = await db.execute(
+                    "SELECT name, aliases FROM extracted_elements "
+                    "WHERE novel_id = ? AND element_type = 'character'",
+                    (novel_id,),
+                )
+                all_characters = [
+                    {"name": row[0], "aliases": row[1]}
+                    for row in await cursor.fetchall()
+                    if row[0]
+                ]
                 
                 for idx, section in enumerate(sections_data):
                     logger.info(f"[storyboard] 保存小节 {idx + 1}/{len(sections_data)}")
@@ -2747,8 +4153,19 @@ class StoryboardService:
                     scene_name = section_info.get("scene", "") or section.get("scene", "")
                     characters_str = section_info.get("characters", "") or section.get("characters", "")
                     
-                    # 人物提取（从 characters 字段或文本中）- 支持中英文逗号和顿号
-                    characters = StoryboardService._normalize_characters(characters_str)
+                    # 组合式模板显式白名单优先，避免台词/画外姓名污染人物素材。
+                    explicit_visible_chars = _extract_explicit_visible_character_names(
+                        full_text, all_characters
+                    )
+                    if explicit_visible_chars is not None:
+                        characters = explicit_visible_chars
+                        characters_str = ", ".join(characters)
+                    else:
+                        # 旧格式从 characters 字段提取，支持中英文逗号和顿号。
+                        characters = _canonicalize_character_names(
+                            StoryboardService._normalize_characters(characters_str),
+                            all_characters,
+                        )
                     
                     # 防御：如果 scene_name 为空，尝试从文本中提取场景标记
                     if not scene_name and full_text:
@@ -2775,10 +4192,6 @@ class StoryboardService:
                             if scene_name in title or title in scene_name:
                                 matched_scene_index = idx_val
                                 break
-                    # 生成结果必须可持久化:启动清理会删除 NULL scene_index 的脏分镜。
-                    # 当 LLM 场景标题与剧本标题无法匹配时,用本次合并结果的稳定序号兜底。
-                    if matched_scene_index is None:
-                        matched_scene_index = idx
                     
                     # 根据 matched_scene_index 确定 section_number（场景内递增）
                     if matched_scene_index is not None:
@@ -2859,6 +4272,7 @@ class StoryboardService:
         cross_chapter_inherit: bool = False,
         with_character_state: bool = True,
         avoid_same_shot_size: bool = True,
+        use_scene_reference_image: bool = False,
     ) -> Dict[str, Any]:
         """
         为单个场景生成分镜
@@ -2944,6 +4358,15 @@ class StoryboardService:
                     "storyboards": [],
                     "message": f"模板不存在: template_id={template_id}"
                 }
+            _flow = _storyboard_flow(template)
+            _max_section_duration_sec = (
+                StoryboardService._section_duration_limit_for_template(template)
+            )
+            logger.info(
+                f"[generate-section] 模板流程标签 flow={_flow}, template_id={template_id}, "
+                f"model_family={template.get('model_family') or 'seedance_2_0'}, "
+                f"section_limit={_max_section_duration_sec}s"
+            )
 
             # 上报使用计数(预置模板才计,异步失败静默)
             try:
@@ -3011,15 +4434,44 @@ class StoryboardService:
 
             # 如果仍然没有替换任何内容（模板中没有变量占位符），则将场景内容追加到模板后面
             if prompt == template_content or not has_replacement:
-                prompt = f"{template_content}\n\n以下是需要转换为分镜的剧本内容：\n\n{scene_content}"
+                prompt = _append_storyboard_script(template_content, scene_content)
 
             # v3.61.229: 关闭"生成人物状态"→ 不注入前序状态 + prompt 末尾追加最高优先级禁止指令
             if not with_character_state:
-                prompt = prompt + (
-                    "\n\n【本次最高优先级·覆盖模板】严禁输出任何人物状态块:不要写「场景起始状态:」、"
-                    "「🔗 本节结尾状态:」、以及姿态[/情绪[/伤势[/朝向关系[/持有道具[ 等状态行。"
-                    "即使上文模板要求生成人物状态,本次也一律省略,只输出场景标头 + 镜号分镜内容。"
-                )
+                prompt = prompt + _NO_STATE_INSTR
+
+            # 场景身份提前提取，供跨章节人物状态和末镜连续性共同使用。
+            # 取不到剧本标头时用前端传入的 scene_title 兜底。
+            _cur_scene_m = (
+                StoryboardService.SCENE_PATTERN.search(scene_content or "")
+                or StoryboardService.SCENE_PATTERN_GENERAL.search(scene_content or "")
+            )
+            _cur_scene_name = StoryboardService.normalize_scene_title(
+                _cur_scene_m.group(0) if _cur_scene_m else (scene_title or "")
+            )
+
+            # 场景时间线必须在 camera/state 两条跨章链路之前统一解析，避免两条链路
+            # 对“主线/回忆/梦境”得出不同结论。
+            _probe = (scene_content or "")[:300]
+            _tag_m = re.search(r'\[\s*时间线\s*[:：]\s*(\S+?)\s*\]', _probe)
+            _cn_to_en = {
+                "主线": "normal", "正常": "normal",
+                "回忆": "flashback", "梦境": "dream", "幻觉": "vision", "平行": "parallel",
+            }
+            cur_type = _cn_to_en.get(_tag_m.group(1).strip(), "normal") if _tag_m else "normal"
+            if script_id and scene_index is not None:
+                try:
+                    async with (await get_db()) as _db:
+                        async with _db.execute("SELECT scene_meta FROM scripts WHERE id=?", (script_id,)) as _c:
+                            _r = await _c.fetchone()
+                    if _r and _r["scene_meta"]:
+                        _meta = json.loads(_r["scene_meta"] or "{}")
+                        _entry = _meta.get(str(scene_index), {})
+                        _user_st = _entry.get("scene_type") if isinstance(_entry, dict) else None
+                        if _user_st in ("normal", "flashback", "dream", "vision", "parallel"):
+                            cur_type = _user_st
+                except Exception:
+                    pass
 
             if avoid_same_shot_size:
                 _camera_continuity = await _get_prev_section_tail_camera_continuity(
@@ -3028,6 +4480,8 @@ class StoryboardService:
                     scene_index=scene_index,
                     section_number=section_number,
                     allow_cross_script=cross_chapter_inherit,
+                    current_scene_name=_cur_scene_name,
+                    current_scene_type=cur_type,
                 )
                 if _camera_continuity and _asm_mode == "legacy":
                     logger.info("[camera-chain] legacy 自建模板跳过本地避重提示:核心规则仅在 admin-server assemble 拼装")
@@ -3039,29 +4493,6 @@ class StoryboardService:
             # v3.61.229: with_character_state=False 时整段跳过(不做状态继承注入)
             if inherit_prev_state and with_character_state:
                 try:
-                    # 检测本节 scene_type: 从 scene_content 的 [时间线:xxx] 标签 + scripts.scene_meta
-                    _probe = (scene_content or "")[:300]
-                    _tag_m = re.search(r'\[\s*时间线\s*[:：]\s*(\S+?)\s*\]', _probe)
-                    _cn_to_en = {
-                        "主线": "normal", "正常": "normal",
-                        "回忆": "flashback", "梦境": "dream", "幻觉": "vision", "平行": "parallel",
-                    }
-                    cur_type = _cn_to_en.get(_tag_m.group(1).strip(), "normal") if _tag_m else "normal"
-                    # 读 scripts.scene_meta 覆盖
-                    if script_id and scene_index is not None:
-                        try:
-                            _db = await get_db()
-                            async with _db.execute("SELECT scene_meta FROM scripts WHERE id=?", (script_id,)) as _c:
-                                _r = await _c.fetchone()
-                            await _db.close()
-                            if _r and _r["scene_meta"]:
-                                _meta = json.loads(_r["scene_meta"] or "{}")
-                                _entry = _meta.get(str(scene_index), {})
-                                _user_st = _entry.get("scene_type") if isinstance(_entry, dict) else None
-                                if _user_st and _user_st in ("normal", "flashback", "dream", "vision", "parallel"):
-                                    cur_type = _user_st
-                        except Exception:
-                            pass
                     logger.info(f"[state-chain] 本节 scene_type={cur_type},查找对应类型的上节 end_state")
 
                     prev_state = await StoryboardService._get_prev_section_end_state(
@@ -3071,6 +4502,7 @@ class StoryboardService:
                         section_number=section_number,
                         allow_cross_script=cross_chapter_inherit,
                         current_scene_type=cur_type,
+                        current_scene_name=_cur_scene_name,
                     )
                     if prev_state:
                         from services.state_extractor_service import format_state_for_prompt
@@ -3092,14 +4524,6 @@ class StoryboardService:
                         # 只允许伤势弱继承。查询失败也保守断开,避免把上一场姿态/朝向强灌进来。
                         # v3.61.250: 提取本节场景基名,供"同名续场景不 break"判据。
                         #   (续N) 在【】外,SCENE_PATTERN 只取【】内 → normalize 后是干净基名。
-                        _cur_scene_m = (
-                            StoryboardService.SCENE_PATTERN.search(scene_content or "")
-                            or StoryboardService.SCENE_PATTERN_GENERAL.search(scene_content or "")
-                        )
-                        _cur_scene_name = (
-                            StoryboardService.normalize_scene_title(_cur_scene_m.group(0))
-                            if _cur_scene_m else ""
-                        )
                         _scene_boundary_break, _diag_prev_si, _diag_prev_type = await _detect_scene_boundary_break(
                             novel_id=novel_id,
                             script_id=script_id,
@@ -3107,6 +4531,7 @@ class StoryboardService:
                             section_number=section_number,
                             scene_type=cur_type,
                             current_scene_name=_cur_scene_name,
+                            allow_cross_script=cross_chapter_inherit,
                         )
                         logger.info(
                             f"[state-chain] 边界检测 cur_type={cur_type}, scene_index={scene_index}, "
@@ -3160,10 +4585,7 @@ class StoryboardService:
             try:
                 print("[DEBUG] 准备调用 LLM: config_id={}".format(llm_config_id))
                 # 简化 system prompt，让提示词模板完全控制输出格式
-                messages = [
-                    {"role": "system", "content": "你是一位专业的分镜设计助手。\n\n【输出约束(必读)】\n1. 直接输出中文分镜内容,严禁输出任何思考过程(英文如 **Refining Novel to Script**、中文如 **剧本转化思考** 等加粗段落)\n2. 严禁在分镜前加任何元描述(如 'Here is the storyboard:' / '以下是分镜:' / '我来转换:')\n3. 第一个字符必须是场景标头(如 【内 xxx 日】)或节奏类型词,不允许任何前言/思考链"},
-                    {"role": "user", "content": prompt}
-                ]
+                messages = _storyboard_messages(prompt)
 
                 # 预置分镜模板:走服务端拼装(模板明文不出客户端);自建模板 _assemble_payload=None 走旧模式
                 _assemble_payload = None
@@ -3175,19 +4597,26 @@ class StoryboardService:
 
                 print("[DEBUG] 即将调用 call_llm, config_id={}".format(llm_config_id), flush=True)
                 # 使用 skip_auto_log_update=True，让 generate_section_storyboards 控制日志状态
-                result = await LLMService.call_llm_with_retry(
-                    config_id=llm_config_id,
-                    messages=messages,
-                    timeout=600,
-                    task_type="storyboard_generate",
-                    novel_id=novel_id,
-                    source_id=script_id,
-                    source_type="storyboard",
-                    source_scene_index=scene_index,
-                    skip_auto_log_update=True,
-                    assemble_payload=_assemble_payload,
-                    allow_direct_storyboard=(_asm_mode == "legacy"),
+                _scene_references = await _prepare_scene_reference_safe(
+                    novel_id, scene_title, scene_content, use_scene_reference_image
                 )
+                try:
+                    result = await LLMService.call_llm_with_retry(
+                        config_id=llm_config_id,
+                        messages=messages,
+                        timeout=STORYBOARD_LLM_TIMEOUT_SECONDS,
+                        task_type="storyboard_generate",
+                        novel_id=novel_id,
+                        source_id=script_id,
+                        source_type="storyboard",
+                        source_scene_index=scene_index,
+                        skip_auto_log_update=True,
+                        assemble_payload=_assemble_payload,
+                        allow_direct_storyboard=(_asm_mode == "legacy"),
+                        ephemeral_images=_scene_references,
+                    )
+                finally:
+                    dispose_scene_references(_scene_references)
                 # 返回值为 (content, log_id, token_info)
                 response = result[0]
                 log_id = result[1]
@@ -3198,10 +4627,11 @@ class StoryboardService:
                     print("[DEBUG] 响应前500字: {}".format(response[:500]), flush=True)
 
                 if not response or not response.strip():
-                    # 更新日志为成功但空内容
+                    # 空内容没有任何可落库分镜，必须记为 error，不能让前端显示“已完成”。
                     if log_id:
-                        await LogService.update_log_success(
+                        await LogService.update_log_error(
                             log_id=log_id,
+                            error_message="大模型返回空内容，未生成任何分镜",
                             output_content="",
                             input_tokens=token_info.get("input_tokens", 0),
                             output_tokens=token_info.get("output_tokens", 0),
@@ -3238,20 +4668,43 @@ class StoryboardService:
 
             # 4. 解析大模型返回的分镜列表（按小节组织）
             print("[DEBUG] 开始解析分镜响应", flush=True)
-            sections_data = await StoryboardService._parse_sections_with_dynamic_rules(response)
+            sections_data = await StoryboardService._parse_sections_with_dynamic_rules(
+                response,
+                flow=_flow,
+                max_section_duration_sec=_max_section_duration_sec,
+            )
+            # JSON/动态规则等解析路径也统一执行最终有效性校验。只有真正包含镜号的
+            # 小节才允许进入“删旧数据/写新数据”阶段。
+            parsed_count = len(sections_data)
+            sections_data = [
+                section for section in sections_data
+                if StoryboardService._has_shot_marker(section.get("full_text", ""))
+            ]
+            if len(sections_data) != parsed_count:
+                logger.warning(
+                    f"[storyboard] 过滤 {parsed_count - len(sections_data)} 个无镜号解析结果"
+                )
             print("[DEBUG] 解析到 {} 个小节".format(len(sections_data)), flush=True)
 
             if not sections_data:
                 # 解析失败，更新日志为 error
+                error_message = StoryboardService._build_no_storyboard_error_message(response)
                 if log_id:
-                    await LogService.update_log_error(log_id=log_id, error_message="无法解析大模型返回的分镜数据")
+                    await LogService.update_log_error(
+                        log_id=log_id,
+                        error_message=error_message,
+                        output_content=response,
+                        input_tokens=token_info.get("input_tokens", 0) if token_info else 0,
+                        output_tokens=token_info.get("output_tokens", 0) if token_info else 0,
+                        total_tokens=token_info.get("total_tokens", 0) if token_info else 0,
+                    )
                 return {
                     "success": False,
                     "count": 0,
                     "section_number": section_number,
                     "scene_title": scene_title,
                     "storyboards": [],
-                    "message": "无法解析大模型返回的分镜数据"
+                    "message": error_message
                 }
 
             # 5. 删除该场景的旧分镜数据（使用 scene_index 精确匹配）
@@ -3330,21 +4783,39 @@ class StoryboardService:
             finally:
                 await db.close()
 
-            # 8. 查询该小说的所有道具名（用于后续匹配）
+            # 8. 查询该小说的角色/道具（道具需保留别名，用于组合模板编号还原）
             db = await get_db()
             try:
                 cursor = await db.execute(
-                    "SELECT name FROM extracted_elements WHERE novel_id = ? AND element_type = 'prop'",
+                    """SELECT name, element_type, aliases FROM extracted_elements
+                       WHERE novel_id = ? AND element_type IN ('character', 'prop')""",
                     (novel_id,)
                 )
-                prop_rows = await cursor.fetchall()
-                all_props = [row[0] for row in prop_rows]
+                element_rows = await cursor.fetchall()
+                all_characters = [
+                    {"name": row[0], "aliases": row[2]}
+                    for row in element_rows
+                    if row[1] == 'character' and row[0]
+                ]
+                prop_elements = [
+                    {"name": row[0], "aliases": row[2]}
+                    for row in element_rows
+                    if row[1] == 'prop'
+                ]
+                all_props = [prop["name"] for prop in prop_elements]
+                logger.info(f"[storyboard] 查询到 {len(all_characters)} 个角色元素")
                 logger.info(f"[storyboard] 查询到 {len(all_props)} 个道具元素: {all_props}")
             finally:
                 await db.close()
 
             # 9. 保存分镜到数据库（每个小节作为一条记录）
             logger.info(f"[storyboard] 开始保存分镜到数据库，共 {len(sections_data)} 个小节")
+            prop_code_map = _build_prop_code_map(
+                [section.get("full_text", "") for section in sections_data],
+                prop_elements,
+            )
+            if prop_code_map:
+                logger.info(f"[storyboard] 恢复道具编号映射: {prop_code_map}")
 
             db = await get_db()
             try:
@@ -3382,25 +4853,49 @@ class StoryboardService:
                             scene_name = StoryboardService.normalize_scene_title(scene_match.group(0))
                             logger.warning(f"[storyboard] 从文本提取场景名: '{scene_name}'")
                     
-                    # 人物提取：优先使用 AI 返回的人物，不再从整个场景匹配
+                    # 人物提取：组合式模板的显式可见白名单拥有最高优先级。
+                    # 不能把台词/OS/关系说明里仅被提到、或明确标为画外的人物写进 characters，
+                    # 否则人物素材和俯视熔图都会把其误当成现场角色。
+                    explicit_visible_chars = _extract_explicit_visible_character_names(
+                        full_text, all_characters
+                    )
+
+                    # 旧格式再优先使用 AI 返回的人物，不再从整个场景匹配
                     # AI 返回的格式可能是 JSON 或文本，characters 字段位置不同：
                     # - JSON 格式：section["characters"] 直接在顶层
                     # - 文本格式：section["section_info"]["characters"] 在 section_info 中
                     ai_chars_str = section.get("section_info", {}).get("characters", "") or section.get("characters", "")
                     
-                    if ai_chars_str:
+                    if explicit_visible_chars is not None:
+                        characters = explicit_visible_chars
+                        logger.info(
+                            f"[storyboard] 小节 {idx + 1} 使用显式可见人物白名单: {characters}"
+                        )
+                    elif ai_chars_str:
                         # AI 返回了人物列表，直接使用
-                        characters = StoryboardService._normalize_characters(ai_chars_str)
+                        characters = _canonicalize_character_names(
+                            StoryboardService._normalize_characters(ai_chars_str),
+                            all_characters,
+                        )
                         logger.info(f"[storyboard] 小节 {idx + 1} 使用 AI 返回的人物: {characters}")
                     else:
                         # fallback: 从 description 文本的 "人物：xxx" 行提取
                         char_match = re.search(r'人物[：:]\s*(.+)', full_text)
                         if char_match:
-                            characters = StoryboardService._normalize_characters(char_match.group(1))
+                            characters = _canonicalize_character_names(
+                                StoryboardService._normalize_characters(char_match.group(1)),
+                                all_characters,
+                            )
                             logger.info(f"[storyboard] 小节 {idx + 1} 从文本提取人物: {characters}")
                         else:
-                            characters = []
-                            logger.info(f"[storyboard] 小节 {idx + 1} 未找到人物信息")
+                            characters = _match_section_character_names(full_text, all_characters)
+                            if characters:
+                                logger.warning(
+                                    f"[storyboard] 小节 {idx + 1} 缺少顶层人物字段,"
+                                    f"从当前小节正文兜底匹配: {characters}"
+                                )
+                            else:
+                                logger.info(f"[storyboard] 小节 {idx + 1} 未找到人物信息")
                     
                     characters_str = ", ".join(characters)
                     
@@ -3412,8 +4907,12 @@ class StoryboardService:
 
                     characters_json = json.dumps(characters)
                     scenes_json = json.dumps([scene_name] if scene_name else [])
-                    # 道具匹配：检查分镜文本中是否包含道具名
-                    matched_props = [p for p in all_props if p in full_text]
+                    # 道具匹配：优先读当前/启用清单，并还原 C01/D04 等局部编号。
+                    matched_props = _match_section_prop_names(
+                        full_text,
+                        prop_elements,
+                        prop_code_map,
+                    )
                     props_json = json.dumps(matched_props, ensure_ascii=False)
                     if matched_props:
                         logger.info(f"[storyboard] 小节 {idx + 1} 匹配到道具: {matched_props}")
@@ -3479,17 +4978,41 @@ class StoryboardService:
                         "scene_index": scene_index
                     })
 
+                if not saved_storyboards:
+                    await db.rollback()
+                    error_message = StoryboardService._build_no_storyboard_error_message(response)
+                    if log_id:
+                        await LogService.update_log_error(
+                            log_id=log_id,
+                            error_message=error_message,
+                            output_content=response,
+                            input_tokens=token_info.get("input_tokens", 0) if token_info else 0,
+                            output_tokens=token_info.get("output_tokens", 0) if token_info else 0,
+                            total_tokens=token_info.get("total_tokens", 0) if token_info else 0,
+                        )
+                    return {
+                        "success": False,
+                        "count": 0,
+                        "section_number": section_number,
+                        "scene_title": scene_title,
+                        "storyboards": [],
+                        "message": error_message,
+                    }
+
                 await db_commit_with_retry(db)
                 logger.info(f"[storyboard] 数据库 commit 成功，共保存 {len(saved_storyboards)} 个小节")
 
-                # 8a. 状态链:提取每个新保存小节的 end_state 并写库(异步调一次廉价 LLM)
-                # 失败不阻塞主流程(end_state 为 None 时后续查询会跳过)
-                try:
-                    await StoryboardService._extract_and_save_end_states(
-                        sections_data, saved_storyboards, llm_config_id
-                    )
-                except Exception as e:
-                    logger.warning(f"[state-chain] 提取 end_state 异常(不影响主流程): {e}")
+                # 8a. 状态链:提取每个新保存小节的 end_state 并写库(会按小节补调 LLM)。
+                # with_character_state=False 时必须彻底跳过,否则关掉开关仍会出现多次 state_extract 中转调用。
+                if with_character_state:
+                    try:
+                        await StoryboardService._extract_and_save_end_states(
+                            sections_data, saved_storyboards, llm_config_id
+                        )
+                    except Exception as e:
+                        logger.warning(f"[state-chain] 提取 end_state 异常(不影响主流程): {e}")
+                else:
+                    logger.info("[state-chain] with_character_state=False,跳过 end_state/section_start_state 提取")
 
                 # 8. 恢复旧分镜的媒体字段到新分镜（按顺序对应）
                 if old_media_data and saved_storyboards:
@@ -3653,6 +5176,19 @@ class StoryboardService:
                 except:
                     row_dict["auto_excluded_audios"] = []
                 try:
+                    row_dict["manual_audio_order"] = json.loads(row_dict.get("manual_audio_order", "[]") or "[]")
+                except:
+                    row_dict["manual_audio_order"] = []
+                for _jimeng_field in ("jimeng_image_characters", "jimeng_audio_characters"):
+                    _raw_jimeng_value = row_dict.get(_jimeng_field)
+                    if _raw_jimeng_value is None:
+                        row_dict[_jimeng_field] = None
+                    else:
+                        try:
+                            row_dict[_jimeng_field] = json.loads(_raw_jimeng_value or "[]")
+                        except Exception:
+                            row_dict[_jimeng_field] = None
+                try:
                     row_dict["section_info"] = json.loads(row_dict.get("section_info", "{}"))
                 except:
                     row_dict["section_info"] = {"scene": "", "characters": ""}
@@ -3782,6 +5318,19 @@ class StoryboardService:
                 except:
                     row_dict["auto_excluded_audios"] = []
                 try:
+                    row_dict["manual_audio_order"] = json.loads(row_dict.get("manual_audio_order", "[]") or "[]")
+                except:
+                    row_dict["manual_audio_order"] = []
+                for _jimeng_field in ("jimeng_image_characters", "jimeng_audio_characters"):
+                    _raw_jimeng_value = row_dict.get(_jimeng_field)
+                    if _raw_jimeng_value is None:
+                        row_dict[_jimeng_field] = None
+                    else:
+                        try:
+                            row_dict[_jimeng_field] = json.loads(_raw_jimeng_value or "[]")
+                        except Exception:
+                            row_dict[_jimeng_field] = None
+                try:
                     row_dict["section_info"] = json.loads(row_dict.get("section_info", "{}"))
                 except:
                     row_dict["section_info"] = {"scene": "", "characters": ""}
@@ -3816,10 +5365,11 @@ class StoryboardService:
         try:
             # 检查分镜是否存在
             cursor = await db.execute(
-                "SELECT id FROM storyboards WHERE id = ?",
+                "SELECT id, section_info FROM storyboards WHERE id = ?",
                 (storyboard_id,)
             )
-            if not await cursor.fetchone():
+            existing_row = await cursor.fetchone()
+            if not existing_row:
                 return None
             
             # 构建更新字段
@@ -3854,9 +5404,10 @@ class StoryboardService:
                     out.append(n)
                 return out
 
-            if "characters" in data:
+            _characters_dedup = _dedup_keep_first(data["characters"]) if "characters" in data else None
+            if _characters_dedup is not None:
                 updates.append("characters = ?")
-                params.append(json.dumps(_dedup_keep_first(data["characters"])))
+                params.append(json.dumps(_characters_dedup))
             if "scenes" in data:
                 updates.append("scenes = ?")
                 params.append(json.dumps(_dedup_keep_first(data["scenes"])))
@@ -3893,6 +5444,19 @@ class StoryboardService:
             if "auto_excluded_audios" in data:
                 updates.append("auto_excluded_audios = ?")
                 params.append(json.dumps(data["auto_excluded_audios"]))
+            if "manual_audio_order" in data:
+                updates.append("manual_audio_order = ?")
+                params.append(json.dumps(_dedup_keep_first(data["manual_audio_order"]), ensure_ascii=False))
+            for _jimeng_field in ("jimeng_image_characters", "jimeng_audio_characters"):
+                if _jimeng_field not in data:
+                    continue
+                updates.append(f"{_jimeng_field} = ?")
+                _jimeng_value = data[_jimeng_field]
+                params.append(
+                    None
+                    if _jimeng_value is None
+                    else json.dumps(_dedup_keep_first(_jimeng_value), ensure_ascii=False)
+                )
             if "section_start_state" in data:
                 updates.append("section_start_state = ?")
                 v = data["section_start_state"]
@@ -3915,9 +5479,22 @@ class StoryboardService:
             if "section_number" in data:
                 updates.append("section_number = ?")
                 params.append(data["section_number"])
-            if "section_info" in data:
+            # characters 是视频素材关联的唯一真值。用户在视频页手动增删人物时，
+            # 同步 section_info.characters，避免分组接口仍携带旧的 4 人名单。
+            _section_info_payload = data.get("section_info") if "section_info" in data else None
+            if _characters_dedup is not None:
+                if not isinstance(_section_info_payload, dict):
+                    try:
+                        _section_info_payload = json.loads(existing_row["section_info"] or "{}")
+                    except Exception:
+                        _section_info_payload = {}
+                _section_info_payload = dict(_section_info_payload)
+                _section_info_payload["characters"] = ", ".join(
+                    str(name).strip() for name in _characters_dedup if str(name).strip()
+                )
+            if _section_info_payload is not None:
                 updates.append("section_info = ?")
-                params.append(json.dumps(data["section_info"]))
+                params.append(json.dumps(_section_info_payload))
             if "style_prompt" in data:
                 updates.append("style_prompt = ?")
                 params.append(data["style_prompt"])
@@ -4107,6 +5684,15 @@ class StoryboardService:
                 )
             await db.commit()
 
+            if video_status in ('generating', 'done'):
+                try:
+                    await StoryboardService.clear_stale_chain_aborted_after(storyboard_id)
+                except Exception as e:
+                    import logging as _lg
+                    _lg.getLogger(__name__).warning(
+                        f"[chain-aborted-clear] 分镜 {storyboard_id} 清理旧中断状态失败(忽略): {e}"
+                    )
+
             # ★ 视频成功 hook:抽尾帧供下一镜接帧用(2026-04 串行尾帧模式)
             # 仅在 video_status='done' 且 video_url 是本地文件(/data/videos/xxx.mp4)时触发
             # 抽帧失败不影响主流程 — 静默 log,本镜 last_frame_path 留空
@@ -4205,6 +5791,54 @@ class StoryboardService:
             await db.close()
 
     @staticmethod
+    async def _maybe_upscale_last_frame_display(
+        storyboard_id: int,
+        display_path: str,
+    ) -> bool:
+        """Upscale the disposable display copy when the global toggle is enabled."""
+        try:
+            from services.settings_service import (
+                KEY_LASTFRAME_UPSCALE_ENABLED,
+                SettingsService,
+            )
+
+            enabled = await SettingsService.get_bool(
+                KEY_LASTFRAME_UPSCALE_ENABLED,
+                default=False,
+            )
+            if not enabled:
+                return False
+
+            from services.image_upscale_service import LocalImageUpscaler
+
+            result = await LocalImageUpscaler().upscale_2x(
+                display_path,
+                display_path,
+            )
+            if result.success:
+                logger.info(
+                    "[chain-frame-upscale] sb=%s success %s -> %s elapsed=%dms",
+                    storyboard_id,
+                    result.input_size,
+                    result.output_size,
+                    result.elapsed_ms,
+                )
+                return True
+
+            logger.warning(
+                "[chain-frame-upscale] sb=%s skipped; original display copy retained: %s",
+                storyboard_id,
+                result.message,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[chain-frame-upscale] sb=%s failed; original display copy retained: %s",
+                storyboard_id,
+                exc,
+            )
+        return False
+
+    @staticmethod
     async def _extract_and_save_last_frame(storyboard_id: int, video_url: str) -> None:
         """从生成完成的视频末尾抽 1 帧,存为 jpg,并 UPDATE storyboards.last_frame_path。
         失败不抛异常 — 视频本身依然 done,只是无法供下一镜接帧。
@@ -4248,12 +5882,23 @@ class StoryboardService:
             return
 
         # 把原图复制一份到 out_path(展示版),按需在副本上加水印
+        display_copy_ready = False
+        display_filename = out_filename
         try:
             import shutil as _shutil
             _shutil.copyfile(orig_path, out_path)
+            display_copy_ready = True
         except Exception as _cp_err:
             log.warning(f"[chain-frame] 分镜 {storyboard_id} 复制原图到展示版失败: {_cp_err}")
-            out_path = orig_path  # 兜底,展示版直接用原图
+            out_path = orig_path  # 兜底只展示原图,后续禁止修改它
+            display_filename = orig_filename
+
+        # 超分只处理展示/接帧副本。失败时服务会保留复制后的原尺寸图片。
+        if display_copy_ready:
+            await StoryboardService._maybe_upscale_last_frame_display(
+                storyboard_id,
+                out_path,
+            )
 
         # ★ 2026-04 v3.59.41:如果用户开了「尾帧 AI 水印」,展示版加水印
         # 跟人物角色图一致 — 即梦审核检测到水印 = 合规标识 → 跳过涉嫌真人检查 → 降低拒绝率
@@ -4265,7 +5910,7 @@ class StoryboardService:
                 KEY_LASTFRAME_WATERMARK_ENABLED,
                 KEY_IMAGE_WATERMARK_FACE_ENABLED,
             )
-            if await SettingsService.get_bool(KEY_LASTFRAME_WATERMARK_ENABLED, default=False):
+            if display_copy_ready and await SettingsService.get_bool(KEY_LASTFRAME_WATERMARK_ENABLED, default=False):
                 from services.watermark_service import add_ai_watermark
                 # v3.59.45:面部覆盖模式同步生效到尾帧
                 face_mode = await SettingsService.get_bool(KEY_IMAGE_WATERMARK_FACE_ENABLED, default=False)
@@ -4274,7 +5919,7 @@ class StoryboardService:
         except Exception as _wm_err:
             log.warning(f"[chain-frame] 分镜 {storyboard_id} 尾帧后处理失败(已忽略): {_wm_err}")
 
-        rel_path = f'/data/frames/{out_filename}'
+        rel_path = f'/data/frames/{display_filename}'
         rel_orig_path = f'/data/frames/{orig_filename}'
         # 用独立 connection 更新(主调用方的 db 已经 commit 并即将 close)
         db = await get_db()
@@ -4291,6 +5936,133 @@ class StoryboardService:
             # 用户可在卡片上勾选/取消使用,描述也在卡片上编辑(per 生成单次有效)
         finally:
             await db.close()
+
+    @staticmethod
+    async def capture_custom_last_frame(storyboard_id: int, capture_time: float) -> Dict[str, Any]:
+        """Replace a storyboard tail frame with a user-selected video timestamp."""
+        import math as _math
+        import os as _os
+        import shutil as _shutil
+        import uuid as _uuid
+        from services.video_service import VideoService
+        from utils.paths import get_data_dir, resolve_db_path
+
+        try:
+            target_seconds = float(capture_time)
+        except (TypeError, ValueError):
+            raise ValueError("取帧时间无效")
+        if not _math.isfinite(target_seconds) or target_seconds < 0:
+            raise ValueError("取帧时间必须是大于等于 0 的有效秒数")
+
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                "SELECT id, video_url FROM storyboards WHERE id = ?",
+                (storyboard_id,),
+            )
+            row = await cursor.fetchone()
+        finally:
+            await db.close()
+        if not row:
+            raise LookupError("分镜不存在")
+        video_url = (row["video_url"] or "").strip()
+        if not video_url:
+            raise ValueError("该分镜还没有可取帧的视频")
+        abs_video_path = resolve_db_path(video_url)
+        if not abs_video_path or not _os.path.exists(abs_video_path):
+            raise FileNotFoundError(f"视频文件不存在: {video_url}")
+
+        frames_dir = _os.path.join(get_data_dir(), "frames")
+        _os.makedirs(frames_dir, exist_ok=True)
+        orig_filename = f"storyboard_{storyboard_id}_last_orig.jpg"
+        out_filename = f"storyboard_{storyboard_id}_last.jpg"
+        orig_path = _os.path.join(frames_dir, orig_filename)
+        out_path = _os.path.join(frames_dir, out_filename)
+        token = _uuid.uuid4().hex[:10]
+        temp_orig = _os.path.join(frames_dir, f"storyboard_{storyboard_id}_{token}_orig.jpg")
+        temp_out = _os.path.join(frames_dir, f"storyboard_{storyboard_id}_{token}_display.jpg")
+
+        upscaled = False
+        try:
+            ok = await VideoService().extract_frame_at(
+                abs_video_path,
+                temp_orig,
+                target_seconds,
+                timeout=30,
+            )
+            if not ok:
+                raise RuntimeError(f"无法从 {target_seconds:.1f} 秒截取画面,请调整时间点后重试")
+
+            _shutil.copyfile(temp_orig, temp_out)
+            upscaled = await StoryboardService._maybe_upscale_last_frame_display(
+                storyboard_id,
+                temp_out,
+            )
+            try:
+                from services.settings_service import (
+                    SettingsService,
+                    KEY_LASTFRAME_WATERMARK_ENABLED,
+                    KEY_IMAGE_WATERMARK_FACE_ENABLED,
+                )
+                if await SettingsService.get_bool(KEY_LASTFRAME_WATERMARK_ENABLED, default=False):
+                    from services.watermark_service import add_ai_watermark
+                    face_mode = await SettingsService.get_bool(
+                        KEY_IMAGE_WATERMARK_FACE_ENABLED,
+                        default=False,
+                    )
+                    add_ai_watermark(temp_out, face_mode=face_mode)
+            except Exception as watermark_error:
+                logger.warning(
+                    "[custom-last-frame] sb=%s 水印处理失败,继续保存无水印展示图: %s",
+                    storyboard_id,
+                    watermark_error,
+                )
+
+            _os.replace(temp_orig, orig_path)
+            _os.replace(temp_out, out_path)
+        finally:
+            for temp_path in (temp_orig, temp_out):
+                try:
+                    if _os.path.exists(temp_path):
+                        _os.remove(temp_path)
+                except OSError:
+                    pass
+
+        rel_path = f"/data/frames/{out_filename}"
+        rel_orig_path = f"/data/frames/{orig_filename}"
+        db = await get_db()
+        try:
+            await db.execute(
+                "UPDATE storyboards SET "
+                "last_frame_path = ?, last_frame_orig_path = ?, "
+                "last_frame_volc_asset_id = NULL, last_frame_volc_asset_uri = NULL, "
+                "last_frame_volc_asset_status = NULL, last_frame_volc_asset_group_id = NULL "
+                "WHERE id = ?",
+                (rel_path, rel_orig_path, storyboard_id),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+        last_frame_mtime = int(_os.path.getmtime(out_path))
+        logger.info(
+            "[custom-last-frame] sb=%s t=%.3fs saved=%s; cleared stale volc asset",
+            storyboard_id,
+            target_seconds,
+            rel_path,
+        )
+        return {
+            "success": True,
+            "message": (
+                f"已将 {target_seconds:.1f} 秒画面设为尾帧"
+                + ("，并完成本地 2 倍超分" if upscaled else "")
+            ),
+            "upscaled": upscaled,
+            "last_frame_path": rel_path,
+            "last_frame_orig_path": rel_orig_path,
+            "last_frame_mtime": last_frame_mtime,
+            "capture_time": target_seconds,
+        }
 
     DEFAULT_CHAIN_FRAME_DESC = (
         "此图为上一视频的尾帧参考图,本镜从此画面故事的延续,保持场景与角色一致,不重新诠释画风/材质"
@@ -4364,7 +6136,11 @@ class StoryboardService:
                     nxt_scenes = json.loads(nxt["scenes"] or "[]")
                 except Exception:
                     nxt_scenes = []
-                if prev_scenes and nxt_scenes and prev_scenes[0] == nxt_scenes[0]:
+                if (
+                    prev_scenes
+                    and nxt_scenes
+                    and _normalize_chain_scene_name(prev_scenes[0]) == _normalize_chain_scene_name(nxt_scenes[0])
+                ):
                     connectable = True
             if not connectable:
                 log.info(
@@ -4424,10 +6200,96 @@ class StoryboardService:
                 (submit_id, video_status, now_beijing_str(), effective_provider, storyboard_id)
             )
             await db.commit()
+            if video_status in ("generating", "done"):
+                try:
+                    await StoryboardService.clear_stale_chain_aborted_after(storyboard_id)
+                except Exception as e:
+                    import logging as _lg
+                    _lg.getLogger(__name__).warning(
+                        f"[chain-aborted-clear] 分镜 {storyboard_id} 清理旧中断状态失败(忽略): {e}"
+                    )
             return True
         except Exception as e:
             print(f"更新 submit_id 失败: {e}")
             return False
+        finally:
+            await db.close()
+
+    @staticmethod
+    async def clear_stale_chain_aborted_after(storyboard_id: int) -> int:
+        """前置镜重新生成/成功后,清理它造成的旧 chain_aborted 后续镜。
+
+        chain_aborted 是"等前置镜修好"的阻塞态,不是永久失败态。用户重试前置镜后,
+        旧的"前置分镜 #x-y 失败"应恢复为 pending,否则页面会出现前置镜正在生成/已成功,
+        后续镜仍显示"已中断"的陈旧状态。
+        """
+        db = await get_db()
+        try:
+            cur = await db.execute(
+                "SELECT id, novel_id, script_id, scene_index, section_number, sort_order "
+                "FROM storyboards WHERE id = ?",
+                (storyboard_id,),
+            )
+            base = await cur.fetchone()
+            if not base:
+                return 0
+
+            label = None
+            try:
+                if base["scene_index"] is not None and base["section_number"] is not None:
+                    label = f"#{int(base['scene_index']) + 1}-{int(base['section_number'])}"
+            except Exception:
+                label = None
+
+            needles = [f"id #{storyboard_id}", f"#{storyboard_id}"]
+            if label:
+                needles.insert(0, label)
+
+            def order_key(row: Any) -> tuple:
+                scene_index = row["scene_index"]
+                section_number = row["section_number"]
+                sort_order = row["sort_order"]
+                return (
+                    int(scene_index) if scene_index is not None else 999999,
+                    int(section_number) if section_number is not None else 0,
+                    int(sort_order) if sort_order is not None else 0,
+                    int(row["id"]),
+                )
+
+            base_order = order_key(base)
+            cur = await db.execute(
+                "SELECT id, scene_index, section_number, sort_order, video_fail_reason "
+                "FROM storyboards "
+                "WHERE novel_id = ? AND script_id IS ? "
+                "  AND video_status = 'chain_aborted' "
+                "  AND video_fail_reason IS NOT NULL",
+                (base["novel_id"], base["script_id"]),
+            )
+            rows = await cur.fetchall()
+            targets = []
+            for row in rows:
+                reason = row["video_fail_reason"] or ""
+                if order_key(row) <= base_order:
+                    continue
+                if any(n in reason for n in needles):
+                    targets.append(row["id"])
+
+            if not targets:
+                return 0
+
+            placeholders = ",".join("?" * len(targets))
+            await db.execute(
+                f"UPDATE storyboards "
+                f"SET video_status = 'pending', video_fail_reason = NULL "
+                f"WHERE id IN ({placeholders}) AND video_status = 'chain_aborted'",
+                targets,
+            )
+            await db.commit()
+            logger.info(
+                f"[chain-aborted-clear] sb={storyboard_id}"
+                f"{f' label={label}' if label else ''} cleared={len(targets)} targets={targets}"
+            )
+            return len(targets)
         finally:
             await db.close()
 
@@ -4440,6 +6302,7 @@ class StoryboardService:
         section_number: int,
         allow_cross_script: bool = False,
         current_scene_type: str = 'normal',
+        current_scene_name: Optional[str] = None,
     ) -> Optional[Dict[str, str]]:
         """查找当前小节之前的累积 end_state(挂起状态语义),注入到 LLM prompt。
 
@@ -4509,22 +6372,53 @@ class StoryboardService:
                 )
                 return accumulated
 
-            # 兜底:跨章节(需用户显式允许)
+            # 兜底:跨章节(需用户显式允许),且只用于本章首场首节。
+            # 跨章节采用严格门禁:
+            # - 同场景 + 同时段 + 同时间线 → 继承完整状态
+            # - 场景/时段/主线-回忆-梦境任一不一致,或场景身份缺失 → 完全断开
+            # 注意:同章换场仍保留原有“弱继承·只留伤势”,这里只收紧跨章首节。
             if allow_cross_script:
-                async with db.execute(
-                    "SELECT end_state FROM storyboards "
-                    "WHERE novel_id=? AND script_id<? AND script_id IS NOT NULL "
-                    "AND end_state IS NOT NULL AND end_state != '' "
-                    "ORDER BY script_id DESC, scene_index DESC, section_number DESC LIMIT 1",
-                    (novel_id, script_id)
-                ) as cur:
-                    row = await cur.fetchone()
-                    if row and row["end_state"]:
-                        try:
-                            logger.info(f"[state-chain] 启用跨章节继承,从上一章取 end_state")
-                            return json.loads(row["end_state"])
-                        except Exception:
-                            pass
+                if cur_scene_idx != 0 or cur_section != 1:
+                    logger.info(
+                        f"[state-chain] 跳过跨章节继承:当前不是本章首场首节 "
+                        f"(scene_index={cur_scene_idx}, section={cur_section})"
+                    )
+                    return None
+                row = await _get_previous_script_tail_row(db, novel_id, script_id)
+                if not row:
+                    return None
+                prev_scene = _scene_from_section_info(row["section_info"])
+                current_identity = _normalize_scene_identity(current_scene_name)
+                prev_type = (row["scene_type"] or "normal").lower()
+                current_type = (current_scene_type or "normal").lower()
+                if not _can_strong_inherit_across_scripts(
+                    prev_scene,
+                    current_identity,
+                    prev_type,
+                    current_type,
+                ):
+                    logger.info(
+                        "[state-chain] 跨章节场景/时段/时间线不一致,人物状态完全断开(伤势也不继承): "
+                        f"prev='{prev_scene or '未知'}'({prev_type}) → "
+                        f"cur='{current_identity or '未知'}'({current_type})"
+                    )
+                    return None
+                raw_state = row["end_state"]
+                if not raw_state or raw_state in ("", "{}"):
+                    logger.info(
+                        f"[state-chain] 真实上一章末节 script={row['script_id']} 无 end_state,不向更早章节回溯"
+                    )
+                    return None
+                try:
+                    state = json.loads(raw_state)
+                    if isinstance(state, dict):
+                        logger.info(
+                            f"[state-chain] 跨章节严格同场继承: '{prev_scene}' → '{current_identity}',"
+                            f"从 script={row['script_id']} 取 end_state"
+                        )
+                        return state
+                except Exception:
+                    pass
         finally:
             await db.close()
         return None
@@ -4867,13 +6761,29 @@ class StoryboardService:
 
                         def _rewrite_block(text: str) -> tuple:
                             """把 text 里所有「场景起始状态:」块清掉,在第一个块原位插入唯一新块。
-                            返回 (new_text, match_count)。无块时返回 (text, 0)。
+                            返回 (new_text, match_count)。无块时把新块插到第一个镜号前。
                             防御性:虽然实测 description / prompt 通常只 1 个块,但 LLM 偶尔
                             会把 chain-header 抄进去出现 ≥2 个块 → 此算法都能兜住。
                             """
+                            text = text or ""
                             ms = list(block_re.finditer(text or ""))
                             if not ms:
-                                return text, 0
+                                # 短片/部分新模板可能没有输出"场景起始状态"块,但 DB 已经算出了
+                                # section_start_state。为了让分镜正文和视频生成链路都能看到开头人物
+                                # 状态,主动插到第一条镜号前;无镜号时放在节头之后。
+                                shot_m = re.search(r'(?m)^\s*(?:(?:镜号\s*)?\d+\s*[\.、:：)]|镜号\s*\d+)', text)
+                                if shot_m:
+                                    insert_at = shot_m.start()
+                                    prefix = text[:insert_at].rstrip()
+                                    suffix = text[insert_at:].lstrip("\n")
+                                    return f"{prefix}\n{new_block}\n{suffix}", 0
+                                header_m = re.match(r'^\s*【[^\n]+】\s*\n?', text)
+                                if header_m:
+                                    insert_at = header_m.end()
+                                    prefix = text[:insert_at].rstrip()
+                                    suffix = text[insert_at:].lstrip("\n")
+                                    return f"{prefix}\n{new_block}\n{suffix}", 0
+                                return f"{new_block}\n{text}".rstrip(), 0
                             sentinel = "\x00__START_STATE_PLACEHOLDER__\x00"
                             first = ms[0]
                             t = text[:first.start()] + sentinel + text[first.end():]
@@ -4899,6 +6809,11 @@ class StoryboardService:
                                 sid,
                             )
                         )
+                        # Do not hold SQLite's write transaction while the next
+                        # end_state extraction awaits an LLM call. Otherwise the
+                        # logs page and other readers can sit behind busy_timeout
+                        # for up to a minute during short_film batches.
+                        await db.commit()
 
                         # 日志:报告每个字段处理了几个块
                         if desc_n == 0 and prompt_n == 0:
@@ -4986,6 +6901,7 @@ class StoryboardService:
                             "UPDATE storyboards SET end_state=? WHERE id=?",
                             (json.dumps(end_state, ensure_ascii=False), sid)
                         )
+                        await db.commit()
                     except Exception as e:
                         logger.warning(f"[state-chain] 写 end_state 失败 sb={sid}: {e}")
                     # 只有主时间线节(normal)的 end_state 回写主累积状态
@@ -5072,6 +6988,7 @@ class StoryboardService:
         cross_chapter_inherit: bool = False,
         with_character_state: bool = True,
         avoid_same_shot_size: bool = True,
+        use_scene_reference_image: bool = False,
     ) -> Dict[str, Any]:
         """
         重新生成单个小节的分镜
@@ -5114,6 +7031,15 @@ class StoryboardService:
                     "storyboard": None,
                     "message": f"模板不存在: template_id={template_id}"
                 }
+            _flow = _storyboard_flow(template)
+            _max_section_duration_sec = (
+                StoryboardService._section_duration_limit_for_template(template)
+            )
+            logger.info(
+                f"[regenerate-section] 模板流程标签 flow={_flow}, template_id={template_id}, "
+                f"model_family={template.get('model_family') or 'seedance_2_0'}, "
+                f"section_limit={_max_section_duration_sec}s"
+            )
 
             # 上报使用计数(预置模板才计,异步失败静默)
             try:
@@ -5172,34 +7098,46 @@ class StoryboardService:
                         has_replacement = True
 
             if prompt == template_content or not has_replacement:
-                prompt = f"{template_content}\n\n以下是需要转换为分镜的剧本内容：\n\n{scene_content}"
+                prompt = _append_storyboard_script(template_content, scene_content)
 
             # v3.61.229: 关闭"生成人物状态"→ 不注入前序状态 + prompt 追加最高优先级禁止指令
             if not with_character_state:
-                prompt = prompt + (
-                    "\n\n【本次最高优先级·覆盖模板】严禁输出任何人物状态块:不要写「场景起始状态:」、"
-                    "「🔗 本节结尾状态:」、以及姿态[/情绪[/伤势[/朝向关系[/持有道具[ 等状态行。"
-                    "即使上文模板要求生成人物状态,本次也一律省略,只输出场景标头 + 镜号分镜内容。"
-                )
+                prompt = prompt + _NO_STATE_INSTR
+
+            _cur_scene_m_re = (
+                StoryboardService.SCENE_PATTERN.search(scene_content or "")
+                or StoryboardService.SCENE_PATTERN_GENERAL.search(scene_content or "")
+            )
+            _cur_scene_name_re = StoryboardService.normalize_scene_title(
+                _cur_scene_m_re.group(0) if _cur_scene_m_re else (scene_title or "")
+            )
 
             _regen_scene_idx = None
+            _regen_script_id = script_id
+            _regen_scene_type = "normal"
+            try:
+                async with (await get_db()) as _sb_meta_db:
+                    async with _sb_meta_db.execute(
+                        "SELECT script_id, scene_index, scene_type FROM storyboards WHERE id=?",
+                        (storyboard_id,),
+                    ) as _sb_meta_cur:
+                        _sb_meta_row = await _sb_meta_cur.fetchone()
+                if _sb_meta_row:
+                    _regen_script_id = _sb_meta_row["script_id"] or _regen_script_id
+                    _regen_scene_idx = _sb_meta_row["scene_index"]
+                    _regen_scene_type = (_sb_meta_row["scene_type"] or "normal").lower()
+            except Exception as _e:
+                logger.warning(f"[state-chain][regenerate] 反查 scene_index/scene_type 失败(忽略): {_e}")
+
             if avoid_same_shot_size:
-                try:
-                    async with (await get_db()) as _cam_db:
-                        async with _cam_db.execute(
-                            "SELECT scene_index FROM storyboards WHERE id=?",
-                            (storyboard_id,),
-                        ) as _cam_cur:
-                            _cam_row = await _cam_cur.fetchone()
-                            _regen_scene_idx = _cam_row["scene_index"] if _cam_row else None
-                except Exception as _e:
-                    logger.warning(f"[camera-chain][regenerate] 反查 scene_index 失败(忽略): {_e}")
                 _camera_continuity = await _get_prev_section_tail_camera_continuity(
                     novel_id=novel_id,
                     script_id=script_id,
                     scene_index=_regen_scene_idx,
                     section_number=section_number,
                     allow_cross_script=cross_chapter_inherit,
+                    current_scene_name=_cur_scene_name_re,
+                    current_scene_type=_regen_scene_type,
                 )
                 if _camera_continuity and _asm_mode == "legacy":
                     logger.info("[camera-chain][regenerate] legacy 自建模板跳过本地避重提示:核心规则仅在 admin-server assemble 拼装")
@@ -5211,15 +7149,8 @@ class StoryboardService:
             # v3.61.229: with_character_state=False 时整段跳过
             if inherit_prev_state and with_character_state:
                 try:
-                    # 用 storyboard_id 反查 scene_index + scene_type
-                    async with (await get_db()) as _sb_db:
-                        async with _sb_db.execute(
-                            "SELECT scene_index, scene_type FROM storyboards WHERE id=?",
-                            (storyboard_id,)
-                        ) as _c:
-                            _r = await _c.fetchone()
-                            _scene_idx = _r["scene_index"] if _r else None
-                            _cur_type = (_r["scene_type"] or "normal").lower() if _r and "scene_type" in _r.keys() else "normal"
+                    _scene_idx = _regen_scene_idx
+                    _cur_type = _regen_scene_type
                     logger.info(f"[state-chain][regenerate] 本节 scene_type={_cur_type}")
 
                     prev_state = await StoryboardService._get_prev_section_end_state(
@@ -5229,6 +7160,7 @@ class StoryboardService:
                         section_number=section_number,
                         allow_cross_script=cross_chapter_inherit,
                         current_scene_type=_cur_type,
+                        current_scene_name=_cur_scene_name_re,
                     )
                     if prev_state:
                         from services.state_extractor_service import format_state_for_prompt
@@ -5246,14 +7178,6 @@ class StoryboardService:
 
                         # v3.61.241: 单节重生同样按场景/时间线边界断开强继承。
                         # v3.61.250: 同步传本节场景基名,保证单节重生与首次生成同名续场景判据一致。
-                        _cur_scene_m_re = (
-                            StoryboardService.SCENE_PATTERN.search(scene_content or "")
-                            or StoryboardService.SCENE_PATTERN_GENERAL.search(scene_content or "")
-                        )
-                        _cur_scene_name_re = (
-                            StoryboardService.normalize_scene_title(_cur_scene_m_re.group(0))
-                            if _cur_scene_m_re else ""
-                        )
                         _scene_boundary_break_re, _diag_prev_si_re, _diag_prev_type_re = await _detect_scene_boundary_break(
                             novel_id=novel_id,
                             script_id=script_id,
@@ -5261,6 +7185,7 @@ class StoryboardService:
                             section_number=section_number,
                             scene_type=_cur_type,
                             current_scene_name=_cur_scene_name_re,
+                            allow_cross_script=cross_chapter_inherit,
                         )
                         logger.info(
                             f"[state-chain][regenerate] 边界检测 _cur_type={_cur_type}, _scene_idx={_scene_idx}, "
@@ -5307,10 +7232,7 @@ class StoryboardService:
             # 3. 调用大模型生成分镜
             try:
                 logger.info(f"[regenerate-section] 准备调用 LLM: config_id={llm_config_id}")
-                messages = [
-                    {"role": "system", "content": "你是一位专业的分镜设计助手。\n\n【输出约束(必读)】\n1. 直接输出中文分镜内容,严禁输出任何思考过程(英文如 **Refining Novel to Script**、中文如 **剧本转化思考** 等加粗段落)\n2. 严禁在分镜前加任何元描述(如 'Here is the storyboard:' / '以下是分镜:' / '我来转换:')\n3. 第一个字符必须是场景标头(如 【内 xxx 日】)或节奏类型词,不允许任何前言/思考链"},
-                    {"role": "user", "content": prompt}
-                ]
+                messages = _storyboard_messages(prompt)
 
                 # 预置分镜模板走服务端拼装(模板明文不出客户端);自建模板 None 走旧模式
                 _assemble_payload = None
@@ -5320,15 +7242,22 @@ class StoryboardService:
                         with_character_state, _assemble_inject_block, _camera_continuity,
                     )
 
-                response = await LLMService.call_llm_with_retry(
-                    config_id=llm_config_id,
-                    messages=messages,
-                    timeout=600,
-                    task_type="storyboard_generate",
-                    novel_id=novel_id,
-                    assemble_payload=_assemble_payload,
-                    allow_direct_storyboard=(_asm_mode == "legacy"),
+                _scene_references = await _prepare_scene_reference_safe(
+                    novel_id, scene_title, scene_content, use_scene_reference_image
                 )
+                try:
+                    response = await LLMService.call_llm_with_retry(
+                        config_id=llm_config_id,
+                        messages=messages,
+                        timeout=STORYBOARD_LLM_TIMEOUT_SECONDS,
+                        task_type="storyboard_generate",
+                        novel_id=novel_id,
+                        assemble_payload=_assemble_payload,
+                        allow_direct_storyboard=(_asm_mode == "legacy"),
+                        ephemeral_images=_scene_references,
+                    )
+                finally:
+                    dispose_scene_references(_scene_references)
                 logger.info(f"[regenerate-section] LLM 调用完成，响应长度: {len(response) if response else 0}")
 
                 if not response or not response.strip():
@@ -5356,7 +7285,11 @@ class StoryboardService:
 
             # 4. 解析大模型返回的分镜列表
             logger.info(f"[regenerate-section] 开始解析分镜响应")
-            sections_data = await StoryboardService._parse_sections_with_dynamic_rules(response)
+            sections_data = await StoryboardService._parse_sections_with_dynamic_rules(
+                response,
+                flow=_flow,
+                max_section_duration_sec=_max_section_duration_sec,
+            )
             logger.info(f"[regenerate-section] 解析到 {len(sections_data)} 个小节")
 
             if not sections_data:
@@ -5371,15 +7304,42 @@ class StoryboardService:
             # 改为使用该条分镜自己的人物信息
             logger.info(f"[regenerate-section] 跳过场景级别的人物匹配，改用分镜自己的人物")
 
-            # 5.5 查询该小说的所有道具名（用于后续匹配）
+            # 5.5 查询角色/道具及同场景已有分镜。重新生成后半节时，新响应可能
+            # 只写 C01，需从同批前节的“C01暗朱绳”恢复编号映射。
             db = await get_db()
             try:
                 cursor = await db.execute(
-                    "SELECT name FROM extracted_elements WHERE novel_id = ? AND element_type = 'prop'",
+                    """SELECT name, element_type, aliases FROM extracted_elements
+                       WHERE novel_id = ? AND element_type IN ('character', 'prop')""",
                     (novel_id,)
                 )
-                prop_rows = await cursor.fetchall()
-                all_props = [row[0] for row in prop_rows]
+                element_rows = await cursor.fetchall()
+                all_characters = [
+                    {"name": row[0], "aliases": row[2]}
+                    for row in element_rows
+                    if row[1] == 'character' and row[0]
+                ]
+                prop_elements = [
+                    {"name": row[0], "aliases": row[2]}
+                    for row in element_rows
+                    if row[1] == 'prop'
+                ]
+                all_props = [prop["name"] for prop in prop_elements]
+                sibling_prop_texts: List[str] = []
+                if _regen_script_id is not None and _regen_scene_idx is not None:
+                    sibling_cursor = await db.execute(
+                        """SELECT description, prompt FROM storyboards
+                           WHERE novel_id = ? AND script_id = ? AND scene_index = ?
+                           ORDER BY section_number, sort_order, id""",
+                        (novel_id, _regen_script_id, _regen_scene_idx),
+                    )
+                    sibling_rows = await sibling_cursor.fetchall()
+                    sibling_prop_texts = [
+                        (row[0] or row[1] or "")
+                        for row in sibling_rows
+                        if (row[0] or row[1])
+                    ]
+                logger.info(f"[regenerate-section] 查询到 {len(all_characters)} 个角色元素")
                 logger.info(f"[regenerate-section] 查询到 {len(all_props)} 个道具元素")
             finally:
                 await db.close()
@@ -5420,25 +7380,45 @@ class StoryboardService:
                     scene_name = StoryboardService.normalize_scene_title(scene_match.group(0))
                     logger.warning(f"[regenerate-section] 从文本提取场景名: '{scene_name}'")
 
-            # 人物提取：优先使用 AI 返回的人物，不再从整个场景匹配
+            # 组合式模板显式可见白名单优先，避免台词/OS/画外姓名污染。
+            explicit_visible_chars = _extract_explicit_visible_character_names(
+                full_text, all_characters
+            )
+
+            # 旧格式再优先使用 AI 返回的人物，不再从整个场景匹配
             # AI 返回的格式可能是 JSON 或文本，characters 字段位置不同：
             # - JSON 格式：section["characters"] 直接在顶层
             # - 文本格式：section["section_info"]["characters"] 在 section_info 中
             ai_chars_str = section.get("section_info", {}).get("characters", "") or section.get("characters", "")
             
-            if ai_chars_str:
+            if explicit_visible_chars is not None:
+                characters = explicit_visible_chars
+                logger.info(f"[regenerate-section] 使用显式可见人物白名单: {characters}")
+            elif ai_chars_str:
                 # AI 返回了人物列表，直接使用
-                characters = StoryboardService._normalize_characters(ai_chars_str)
+                characters = _canonicalize_character_names(
+                    StoryboardService._normalize_characters(ai_chars_str),
+                    all_characters,
+                )
                 logger.info(f"[regenerate-section] 使用 AI 返回的人物: {characters}")
             else:
                 # fallback: 从 description 文本的 "人物：xxx" 行提取
                 char_match = re.search(r'人物[：:]\s*(.+)', full_text)
                 if char_match:
-                    characters = StoryboardService._normalize_characters(char_match.group(1))
+                    characters = _canonicalize_character_names(
+                        StoryboardService._normalize_characters(char_match.group(1)),
+                        all_characters,
+                    )
                     logger.info(f"[regenerate-section] 从文本提取人物: {characters}")
                 else:
-                    characters = []
-                    logger.info(f"[regenerate-section] 未找到人物信息")
+                    characters = _match_section_character_names(full_text, all_characters)
+                    if characters:
+                        logger.warning(
+                            f"[regenerate-section] 缺少顶层人物字段,"
+                            f"从当前小节正文兜底匹配: {characters}"
+                        )
+                    else:
+                        logger.info(f"[regenerate-section] 未找到人物信息")
             
             characters_str = ", ".join(characters)
 
@@ -5450,8 +7430,17 @@ class StoryboardService:
 
             characters_json = json.dumps(characters)
             scenes_json = json.dumps([scene_name] if scene_name else [])
-            # 道具匹配：检查分镜文本中是否包含道具名
-            matched_props = [p for p in all_props if p in full_text]
+            prop_code_map = _build_prop_code_map(
+                sibling_prop_texts + [full_text],
+                prop_elements,
+            )
+            if prop_code_map:
+                logger.info(f"[regenerate-section] 恢复道具编号映射: {prop_code_map}")
+            matched_props = _match_section_prop_names(
+                full_text,
+                prop_elements,
+                prop_code_map,
+            )
             props_json = json.dumps(matched_props, ensure_ascii=False)
             if matched_props:
                 logger.info(f"[regenerate-section] 匹配到道具: {matched_props}")
@@ -5474,17 +7463,29 @@ class StoryboardService:
                         "message": f"分镜不存在: storyboard_id={storyboard_id}"
                     }
 
-                # 更新分镜内容
-                await db.execute(
-                    """
-                    UPDATE storyboards
-                    SET description = ?, prompt = ?, characters = ?, scenes = ?, 
-                        props = ?, section_info = ?
-                    WHERE id = ?
-                    """,
-                    (full_text, full_text, characters_json, scenes_json, 
-                     props_json, section_info_json, storyboard_id)
-                )
+                # 更新分镜内容。关闭人物状态时同步清理旧状态字段,避免文本已剥状态但 UI 仍显示旧的"X 人状态"。
+                if with_character_state:
+                    await db.execute(
+                        """
+                        UPDATE storyboards
+                        SET description = ?, prompt = ?, characters = ?, scenes = ?,
+                            props = ?, section_info = ?
+                        WHERE id = ?
+                        """,
+                        (full_text, full_text, characters_json, scenes_json,
+                         props_json, section_info_json, storyboard_id)
+                    )
+                else:
+                    await db.execute(
+                        """
+                        UPDATE storyboards
+                        SET description = ?, prompt = ?, characters = ?, scenes = ?,
+                            props = ?, section_info = ?, section_start_state = NULL, end_state = NULL
+                        WHERE id = ?
+                        """,
+                        (full_text, full_text, characters_json, scenes_json,
+                         props_json, section_info_json, storyboard_id)
+                    )
                 await db.commit()
                 logger.info(f"[regenerate-section] 分镜 {storyboard_id} 更新成功")
 
@@ -5498,8 +7499,11 @@ class StoryboardService:
                     "scenes": [scene_name] if scene_name else [],
                     "props": matched_props,
                     "section_number": section_number,
-                    "section_info": section_info
+                    "section_info": section_info,
                 }
+                if not with_character_state:
+                    updated_storyboard["section_start_state"] = None
+                    updated_storyboard["end_state"] = None
 
                 return {
                     "success": True,
@@ -5618,7 +7622,13 @@ class StoryboardService:
             await db.close()
 
     @staticmethod
-    async def recover_from_log(log_id: int, novel_id: int, script_id: int, scene_index: int) -> bool:
+    async def recover_from_log(
+        log_id: int,
+        novel_id: int,
+        script_id: int,
+        scene_index: int,
+        template_id: Optional[int] = None,
+    ) -> bool:
         """
         从成功的日志中恢复缺失的分镜数据
         
@@ -5627,6 +7637,7 @@ class StoryboardService:
             novel_id: 小说ID
             script_id: 剧本ID
             scene_index: 场景索引
+            template_id: 可选的当前分镜模板ID;用于短剧/短片恢复链路分流
             
         Returns:
             是否成功恢复
@@ -5651,13 +7662,59 @@ class StoryboardService:
             logger.warning(f"[storyboard] recover_from_log: 日志 {log_id} 没有 output_content")
             return False
         
-        # 2. 解析分镜内容
-        sections = await StoryboardService._parse_sections_with_dynamic_rules(output_content)
+        # 2. 恢复路径也要沿用生成时的模板分流。日志表没有 template_id,
+        # 优先从同场景已有分镜反查;没有则保持旧链路默认值。
+        recovery_template_id = template_id
+        _flow = "short_drama"
+        _max_section_duration_sec = StoryboardService.MAX_SECTION_DURATION_SEC
+        if not recovery_template_id:
+            db = await get_db()
+            try:
+                cursor = await db.execute(
+                    """
+                    SELECT template_id
+                    FROM storyboards
+                    WHERE novel_id = ? AND script_id = ? AND scene_index = ?
+                      AND template_id IS NOT NULL
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (novel_id, script_id, scene_index),
+                )
+                row = await cursor.fetchone()
+                if row:
+                    recovery_template_id = row["template_id"] if "template_id" in row.keys() else row[0]
+            finally:
+                await db.close()
+        if recovery_template_id:
+            try:
+                template = await get_template_by_id(recovery_template_id, meta_only=True)
+                if template:
+                    _flow = _storyboard_flow(template)
+                    _max_section_duration_sec = (
+                        StoryboardService._section_duration_limit_for_template(template)
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[storyboard] recover_from_log: 模板 {recovery_template_id} 流程标签读取失败,使用默认短剧链路: {e}"
+                )
+        logger.info(
+            f"[storyboard] recover_from_log: 解析 flow={_flow}, "
+            f"template_id={recovery_template_id}, "
+            f"section_limit={_max_section_duration_sec}s"
+        )
+
+        # 3. 解析分镜内容
+        sections = await StoryboardService._parse_sections_with_dynamic_rules(
+            output_content,
+            flow=_flow,
+            max_section_duration_sec=_max_section_duration_sec,
+        )
         if not sections:
             logger.warning(f"[storyboard] recover_from_log: 无法从日志 {log_id} 解析分镜内容")
             return False
         
-        # 3. 获取剧本场景列表用于匹配
+        # 4. 获取剧本场景列表用于匹配
         script = await ScriptService.get_script(script_id)
         if not script:
             logger.warning(f"[storyboard] recover_from_log: 剧本 {script_id} 不存在")
@@ -5671,7 +7728,7 @@ class StoryboardService:
             normalized = StoryboardService.normalize_scene_title(s.get('scene_title', ''))
             scene_list.append(normalized)
         
-        # 4. 检查是否已有分镜
+        # 5. 检查是否已有分镜
         db = await get_db()
         try:
             cursor = await db.execute(
@@ -5685,7 +7742,7 @@ class StoryboardService:
                 # 已有分镜，检查是否需要补充
                 logger.info(f"[storyboard] recover_from_log: 场景 {scene_index} 已有 {existing_count} 条分镜")
             
-            # 5. 查询该场景的最大 section_number
+            # 6. 查询该场景的最大 section_number
             cursor = await db.execute(
                 "SELECT MAX(section_number) FROM storyboards WHERE novel_id = ? AND script_id = ? AND scene_index = ?",
                 (novel_id, script_id, scene_index)
@@ -5693,8 +7750,18 @@ class StoryboardService:
             row = await cursor.fetchone()
             max_section = row[0] if row and row[0] is not None else 0
             
-            # 6. 保存分镜
+            # 7. 保存分镜
             saved_count = 0
+            cursor = await db.execute(
+                "SELECT name, aliases FROM extracted_elements "
+                "WHERE novel_id = ? AND element_type = 'character'",
+                (novel_id,),
+            )
+            all_characters = [
+                {"name": row[0], "aliases": row[1]}
+                for row in await cursor.fetchall()
+                if row[0]
+            ]
             for idx, section in enumerate(sections):
                 full_text = section.get('full_text', '')
                 if not full_text:
@@ -5718,8 +7785,19 @@ class StoryboardService:
                 scene_name = section.get('section_info', {}).get('scene', '')
                 characters_str = section.get('section_info', {}).get('characters', '')
                 
-                # 标准化人物
-                characters = StoryboardService._normalize_characters(characters_str)
+                # 恢复日志也必须尊重显式可见白名单，不能把旧日志里的被提及姓名重新污染回来。
+                explicit_visible_chars = _extract_explicit_visible_character_names(
+                    full_text, all_characters
+                )
+                if explicit_visible_chars is not None:
+                    characters = explicit_visible_chars
+                    characters_str = ", ".join(characters)
+                else:
+                    characters = _canonicalize_character_names(
+                        StoryboardService._normalize_characters(characters_str),
+                        all_characters,
+                    )
+                    characters_str = ", ".join(characters)
                 characters_json = json.dumps(characters, ensure_ascii=False)
                 scenes_json = json.dumps([scene_name] if scene_name else [], ensure_ascii=False)
                 props_json = json.dumps([], ensure_ascii=False)
@@ -5737,7 +7815,7 @@ class StoryboardService:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (novel_id, script_id, 1, full_text, full_text,
-                     characters_json, scenes_json, props_json, idx, new_section_number, section_info_json, scene_index, template_id, now_beijing_str())
+                     characters_json, scenes_json, props_json, idx, new_section_number, section_info_json, scene_index, recovery_template_id, now_beijing_str())
                 )
                 saved_count += 1
             
@@ -5875,6 +7953,164 @@ class StoryboardService:
                 "fixed_count": 0,
                 "message": f"修复失败: {str(e)}"
             }
+
+
+# ============================================================================
+# 启动迁移:修复新组合式模板曾被误保存为 [] 的人物关联
+# ============================================================================
+#
+# 只扫描 characters 为空的分镜，并且只在当前 prompt/description 的显式
+# “实际出镜 / 本镜可见人物”白名单能够映射到人物素材库时回填。明确写“无”
+# 或无法可靠解析的记录一律不动，避免把画外发声人物误绑成视觉人物。
+async def repair_empty_storyboard_character_associations() -> dict:
+    """回填因白名单格式/云端人物昵称映射问题丢失的 characters。"""
+    from database.db import get_db
+
+    stats = {
+        "scanned": 0,
+        "repaired": 0,
+        "repaired_from_legacy": 0,
+        "skipped_explicit_empty": 0,
+        "skipped_unresolved": 0,
+    }
+    character_elements_by_novel: Dict[int, List[Dict[str, Any]]] = {}
+
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT id, novel_id, prompt, description, section_info "
+            "FROM storyboards "
+            "WHERE characters IS NULL "
+            "OR LOWER(TRIM(characters)) IN ('', '[]', 'null')"
+        )
+        rows = await cursor.fetchall()
+        stats["scanned"] = len(rows)
+        if not rows:
+            logger.info(
+                "[migrate] repair_empty_storyboard_character_associations: 无候选 row,跳过"
+            )
+            return stats
+
+        for row in rows:
+            novel_id = row["novel_id"]
+            if novel_id not in character_elements_by_novel:
+                element_cursor = await db.execute(
+                    "SELECT name, aliases FROM extracted_elements "
+                    "WHERE novel_id = ? AND element_type = 'character' "
+                    "AND name IS NOT NULL AND TRIM(name) != '' "
+                    "ORDER BY id ASC",
+                    (novel_id,),
+                )
+                character_elements_by_novel[novel_id] = [
+                    {"name": element_row[0], "aliases": element_row[1]}
+                    for element_row in await element_cursor.fetchall()
+                    if element_row[0]
+                ]
+
+            known_characters = character_elements_by_novel[novel_id]
+            storyboard_text = (
+                str(row["prompt"] or "").strip()
+                or str(row["description"] or "").strip()
+            )
+            visible_names = _extract_explicit_visible_character_names(
+                storyboard_text,
+                known_characters,
+            )
+            if not visible_names:
+                if visible_names == []:
+                    stats["skipped_explicit_empty"] += 1
+                    continue
+
+                # 老模板没有“实际出镜/本镜白名单”，优先使用保存时留下的
+                # section_info.characters，其次只读独占行“人物:...”。不从全文
+                # 扫台词，避免把被提及或纯画外角色补成视觉人物。
+                has_explicit_visual_field = bool(
+                    re.search(
+                        r"(?:本节)?实际出镜\s*(?:=|＝|[:：])"
+                        r"|本镜人物白名单\s*(?:=|＝|[:：])",
+                        storyboard_text,
+                    )
+                )
+                legacy_names: List[str] = []
+                if not has_explicit_visual_field:
+                    try:
+                        legacy_section_info = json.loads(row["section_info"] or "{}")
+                    except Exception:
+                        legacy_section_info = {}
+                    if isinstance(legacy_section_info, dict):
+                        legacy_names = _canonicalize_character_names(
+                            StoryboardService._normalize_characters(
+                                legacy_section_info.get("characters", "")
+                            ),
+                            known_characters,
+                            preserve_unknown=False,
+                        )
+
+                    if not legacy_names:
+                        legacy_values = re.findall(
+                            r"(?m)^\s*人物[：:]\s*(?!S0\s*(?:=|＝))([^\n]+)$",
+                            storyboard_text,
+                        )
+                        for legacy_value in legacy_values:
+                            resolved = _canonicalize_character_names(
+                                StoryboardService._normalize_characters(legacy_value),
+                                known_characters,
+                                preserve_unknown=False,
+                            )
+                            for name in resolved:
+                                if name not in legacy_names:
+                                    legacy_names.append(name)
+
+                if not legacy_names:
+                    stats["skipped_unresolved"] += 1
+                    continue
+                visible_names = legacy_names
+                stats["repaired_from_legacy"] += 1
+
+            try:
+                section_info = json.loads(row["section_info"] or "{}")
+            except Exception:
+                section_info = {}
+            if not isinstance(section_info, dict):
+                section_info = {}
+            section_info["characters"] = ", ".join(visible_names)
+
+            await db.execute(
+                "UPDATE storyboards SET characters = ?, section_info = ? WHERE id = ?",
+                (
+                    json.dumps(visible_names, ensure_ascii=False),
+                    json.dumps(section_info, ensure_ascii=False),
+                    row["id"],
+                ),
+            )
+            stats["repaired"] += 1
+            logger.info(
+                "[migrate] sb=%s 回填人物关联: %s",
+                row["id"],
+                visible_names,
+            )
+
+        if stats["repaired"]:
+            await db.commit()
+    except Exception as exc:
+        logger.error(
+            "[migrate] repair_empty_storyboard_character_associations 失败: %s",
+            exc,
+        )
+    finally:
+        await db.close()
+
+    logger.info(
+        "[migrate] repair_empty_storyboard_character_associations 完成: "
+        "扫描 %s 条,修复 %s 条(其中老模板 %s 条),"
+        "跳过(明确无人) %s 条,跳过(无法可靠解析) %s 条",
+        stats["scanned"],
+        stats["repaired"],
+        stats["repaired_from_legacy"],
+        stats["skipped_explicit_empty"],
+        stats["skipped_unresolved"],
+    )
+    return stats
 
 
 # ============================================================================

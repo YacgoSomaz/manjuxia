@@ -5,6 +5,7 @@ from database.db import get_db
 from services.log_service import LogService
 from models.llm_logs import LLMLogListResponse, LLMLogDetailResponse, LLMLogDeleteRequest
 from utils.paths import get_data_dir
+from utils.log_sanitizer import should_preserve_full_input_prompt
 from utils.timezone import now_beijing_strf
 from utils.ssl_helper import get_aiohttp_connector
 
@@ -17,7 +18,9 @@ async def interrupt_log(log_id: int):
     db = await get_db()
     try:
         async with db.execute(
-            "SELECT id, status, task_type FROM llm_logs WHERE id = ?", (log_id,)
+            "SELECT id, status, task_type, source_type, source_id, source_scene_index, novel_id, remote_url "
+            "FROM llm_logs WHERE id = ?",
+            (log_id,),
         ) as cursor:
             log = await cursor.fetchone()
         if not log:
@@ -25,14 +28,68 @@ async def interrupt_log(log_id: int):
         if log["status"] != "running":
             raise HTTPException(status_code=400, detail="只能中断运行中的任务")
 
+        cancelled_count = 0
+        if (
+            log["task_type"] == "storyboard_generate"
+            and log["source_type"] == "storyboard"
+            and log["novel_id"] is not None
+            and log["source_id"] is not None
+            and log["source_scene_index"] is not None
+        ):
+            # 日志页的中断必须先取消真实 asyncio 任务。范围精确到小说+剧本+场景，
+            # 不能沿用章节级取消，否则会误伤同章正在生成的其他场景。
+            from services.storyboard_service import cancel_generation_tasks
+            cancelled_count = await cancel_generation_tasks(
+                int(log["novel_id"]),
+                int(log["source_id"]),
+                scene_index=int(log["source_scene_index"]),
+            )
+
         now = now_beijing_strf()
         await db.execute(
             "UPDATE llm_logs SET status = 'error', error_message = '用户手动中断', end_time = ? WHERE id = ?",
             (now, log_id)
         )
+        if (
+            log["task_type"] == "video_generation"
+            and log["source_type"] == "storyboard"
+            and log["source_id"]
+        ):
+            storyboard_id = int(log["source_id"])
+            reason = "用户从日志页手动中断视频生成,本地状态已释放"
+            await db.execute(
+                """
+                UPDATE storyboards
+                SET video_status = 'failed',
+                    video_fail_reason = ?,
+                    submit_id = CASE
+                        WHEN COALESCE(video_provider, 'jimeng') = 'jimeng' THEN NULL
+                        ELSE submit_id
+                    END
+                WHERE id = ?
+                  AND video_status IN ('generating', 'queued')
+                """,
+                (reason, storyboard_id),
+            )
+            await db.execute(
+                """
+                UPDATE video_task_queue
+                SET status = 'aborted',
+                    finished_at = ?,
+                    error_code = 'USER_ABORTED',
+                    error_message = ?
+                WHERE storyboard_id = ?
+                  AND status IN ('queued', 'generating')
+                """,
+                (now, reason, storyboard_id),
+            )
         await db.commit()
 
-        return {"status": "ok", "message": "任务已中断"}
+        return {
+            "status": "ok",
+            "message": "任务已中断",
+            "cancelled_task_count": cancelled_count,
+        }
     finally:
         await db.close()
 
@@ -54,6 +111,7 @@ async def redownload_image(log_id: int):
     from services.extraction_service import ExtractionService
     import uuid
     import re
+    import json
 
     log = await LogService.get_log_detail(log_id)
     if not log:
@@ -64,15 +122,115 @@ async def redownload_image(log_id: int):
     if not remote_url:
         raise HTTPException(status_code=400, detail="该任务未保存 remote_url,无法重下")
 
-    # 尝试从 chapter_title 解析 element_id + element_type
-    # 格式: "元素ID: 214, 类型: character"
+    # 优先使用日志里的结构化来源字段；旧日志再从 chapter_title 兼容解析。
     element_id = None
     element_type = None
+    source_type = str(log.get("source_type") or "")
+    if log.get("source_id") and source_type.startswith("extracted_element:"):
+        try:
+            element_id = int(log["source_id"])
+            element_type = source_type.split(":", 1)[1] or None
+        except (TypeError, ValueError):
+            element_id = None
     chapter_title = log.get("chapter_title") or ""
-    m = re.search(r"元素ID:\s*(\d+)\s*,\s*类型:\s*(\w+)", chapter_title)
-    if m:
-        element_id = int(m.group(1))
-        element_type = m.group(2)
+    if element_id is None:
+        m = re.search(r"元素ID:\s*(\d+)\s*,\s*类型:\s*(\w+)", chapter_title)
+        if m:
+            element_id = int(m.group(1))
+            element_type = m.group(2)
+
+    # Cool 新日志同时保存 task_id + 结果 URL:
+    #   cool-task:<task_id>|<result_url>
+    # 重下时先向任务接口刷新 URL；查询接口临时不可用时仍可回退已保存 URL。
+    cool_task_ref = ImageService._parse_cool_remote_ref(remote_url)
+    cool_refresh_note = ""
+    if cool_task_ref:
+        task_id, saved_url = cool_task_ref
+        remote_url = saved_url
+        from services.llm_service import LLMService
+        all_image_cfgs = await LLMService.get_all(config_type="image")
+        cfg_summary = next(
+            (c for c in all_image_cfgs if c.get("name") == log.get("config_name")),
+            None,
+        )
+        if not cfg_summary and str(log.get("provider_code") or "").lower() == "cool":
+            cool_cfgs = [
+                c for c in all_image_cfgs
+                if str(c.get("provider_code") or "").lower() == "cool"
+            ]
+            if len(cool_cfgs) == 1:
+                cfg_summary = cool_cfgs[0]
+        cfg = None
+        if cfg_summary and cfg_summary.get("id") is not None:
+            try:
+                # get_all() 为列表展示会刻意隐藏 api_key；按 id 再拉一次明文配置。
+                cfg = await LLMService.get_by_id(int(cfg_summary["id"]))
+            except Exception:
+                cfg = None
+                cool_refresh_note = "Cool 配置刷新失败，已回退原结果地址"
+        if cfg:
+            import aiohttp
+            base_url = (cfg.get("base_url") or "https://api.mjapi.cc.cd").rstrip("/")
+            if base_url.endswith("/v1"):
+                detail_url = f"{base_url}/cool/task/{task_id}"
+            else:
+                detail_url = f"{base_url}/v1/cool/task/{task_id}"
+            headers = {
+                "Authorization": f"Bearer {cfg.get('api_key') or ''}",
+                "Accept": "application/json",
+            }
+            try:
+                async with aiohttp.ClientSession(
+                    connector=get_aiohttp_connector(),
+                    timeout=aiohttp.ClientTimeout(total=30, connect=10),
+                ) as session:
+                    async with session.get(detail_url, headers=headers) as resp:
+                        body = await resp.text()
+                        if resp.status == 200:
+                            data = json.loads(body)
+                            status = str(data.get("status") or "").lower()
+                            refreshed_url = (data.get("result") or {}).get("url")
+                            if status == "success" and refreshed_url:
+                                remote_url = refreshed_url
+                                cool_refresh_note = "已刷新 Cool 任务结果地址"
+                                await LogService.update_log_remote_url(
+                                    log_id=log_id,
+                                    remote_url=ImageService._build_cool_remote_ref(
+                                        task_id, refreshed_url
+                                    ),
+                                )
+                            elif not remote_url and status in ("pending", "running", ""):
+                                raise HTTPException(
+                                    status_code=425,
+                                    detail=f"Cool 任务仍在处理中({status or '未知状态'}),请稍后再点重下",
+                                )
+                            elif not remote_url and status == "failed":
+                                raise HTTPException(
+                                    status_code=502,
+                                    detail=f"Cool 任务失败:{data.get('error') or '未知错误'}",
+                                )
+                        elif not remote_url:
+                            raise HTTPException(
+                                status_code=502,
+                                detail=f"Cool 任务查询 HTTP {resp.status},且没有可回退的结果地址",
+                            )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                if not remote_url:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Cool 任务地址刷新失败:{type(exc).__name__}: {exc}",
+                    )
+                cool_refresh_note = "Cool 任务刷新失败，已回退原结果地址"
+        elif not remote_url:
+            raise HTTPException(
+                status_code=400,
+                detail=f"找不到原始 Cool 配置 '{log.get('config_name')}',无法刷新任务地址",
+            )
+
+        if not remote_url:
+            raise HTTPException(status_code=502, detail="Cool 任务没有可下载的结果地址")
 
     # 🆕 柏拉图异步任务的 task_id 反查:remote_url 形如 "bltcy-task:abc123|generate"
     # 服务端任务可能还在排队/已完成/已失败,我们去拉一次状态再决定怎么走
@@ -82,7 +240,13 @@ async def redownload_image(log_id: int):
         # 找原始 config(用 config_name 反查 api_key + base_url)
         from services.llm_service import LLMService
         all_image_cfgs = await LLMService.get_all(config_type="image")
-        cfg = next((c for c in all_image_cfgs if c.get("name") == log.get("config_name")), None)
+        cfg_summary = next(
+            (c for c in all_image_cfgs if c.get("name") == log.get("config_name")),
+            None,
+        )
+        cfg = None
+        if cfg_summary and cfg_summary.get("id") is not None:
+            cfg = await LLMService.get_by_id(int(cfg_summary["id"]))
         if not cfg:
             raise HTTPException(status_code=400, detail=f"找不到原始配置 '{log.get('config_name')}',无法反查 task_id")
         # 调柏拉图查询接口
@@ -128,9 +292,23 @@ async def redownload_image(log_id: int):
     else:
         filename = f"redownload_{log_id}_{uuid.uuid4().hex[:8]}{ext}"
 
-    local_path = await ImageService._download_image(remote_url, filename)
+    download_diagnostics = {}
+    local_path = await ImageService._download_image(
+        remote_url,
+        filename,
+        retry_404_delays=[1, 3, 8, 15],
+        diagnostics=download_diagnostics,
+    )
     if not local_path:
-        raise HTTPException(status_code=502, detail="下载失败(URL 可能已过期,服务商图片 URL 通常仅 2 小时有效)")
+        error_detail = download_diagnostics.get("error") or "网络、磁盘或远程地址异常"
+        note = f"；{cool_refresh_note}" if cool_refresh_note else ""
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"图片重下失败:{error_detail}{note}。"
+                "远端文件可能仍在同步、地址已过期，或当前网络无法访问图片 CDN。"
+            ),
+        )
 
     # 更新 llm_logs 为 success
     await LogService.update_log_success(
@@ -162,7 +340,11 @@ async def redownload_image(log_id: int):
         "image_url": local_path,
         "element_restored": element_restored,
         "element_id": element_id,
-        "message": "图片重下成功" + ("(已回写元素)" if element_restored else "(未关联元素或元素已删)")
+        "message": (
+            "图片重下成功"
+            + (f"（{cool_refresh_note}）" if cool_refresh_note else "")
+            + ("(已回写元素)" if element_restored else "(未关联元素或元素已删)")
+        )
     }
 
 
@@ -269,8 +451,12 @@ async def get_log_detail(log_id: int):
     log = await LogService.get_log_detail(log_id)
     if not log:
         raise HTTPException(status_code=404, detail="日志不存在")
-    # input_prompt 可能包含渲染后的模板内容，截断保护
-    if log.get("input_prompt") and len(log["input_prompt"]) > 100:
+    # 仅视频生成展示实际发给第三方的完整文字参数；其他任务继续保护模板内容。
+    if (
+        not should_preserve_full_input_prompt(log.get("task_type"))
+        and log.get("input_prompt")
+        and len(log["input_prompt"]) > 100
+    ):
         log["input_prompt"] = log["input_prompt"][:100] + "...(内容已隐藏)"
     return log
 

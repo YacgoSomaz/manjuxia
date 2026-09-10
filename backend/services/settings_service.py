@@ -61,6 +61,9 @@ KEY_IMAGE_WATERMARK_ENABLED = "image.watermark_enabled"
 # 之前一个开关同管生图+尾帧,用户反馈想分开控制(尾帧/生图各自决定要不要打 AI 标识)
 KEY_LASTFRAME_WATERMARK_ENABLED = "lastframe.watermark_enabled"
 
+# 尾帧本地 2 倍超分开关。默认关闭；开启后只处理展示/接帧副本，原始抽帧永久保留。
+KEY_LASTFRAME_UPSCALE_ENABLED = "lastframe.upscale_enabled"
+
 # v3.61.132: "按说话人过滤音频"自动开关
 # 开 → 视频生成时自动屏蔽 prompt 里没台词/OS/画外音 的角色音频(种菜模式)
 # 关 → 老行为,全部带音频(默认)

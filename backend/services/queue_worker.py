@@ -28,6 +28,7 @@ from services.queue_service import (
 )
 
 logger = logging.getLogger(__name__)
+PERSISTENT_LOCAL_VIDEO_PROVIDERS = {"pippit_cli", "minimax_h3"}
 
 
 # ===================== 事件总线(SSE 用) =====================
@@ -86,6 +87,8 @@ class QueueWorker:
         self._stop = asyncio.Event()
         # v3.60.25: 冻结时间戳(asyncio loop time);< 当前时间则正常工作,> 当前时间则不派任何新任务
         self._freeze_until: float = 0.0
+        # submit_id -> (active?, expires_at). Used only by the Jimeng capacity gate.
+        self._jimeng_capacity_cache: Dict[str, tuple] = {}
 
     def freeze(self, seconds: float = 30.0):
         """v3.60.25: 冻结派单循环 N 秒,期间不派任何新任务
@@ -140,13 +143,17 @@ class QueueWorker:
         gen_items = data.get(STATUS_GENERATING, [])
         q_items = data.get(STATUS_QUEUED, [])
         logger.info(
-            f"[queue_worker] 启动恢复(保守模式): generating={len(gen_items)} queued={len(q_items)} 一律标 aborted"
+            f"[queue_worker] 启动恢复(保守模式): generating={len(gen_items)} queued={len(q_items)};"
+            " local-key provider queued items are kept, other queued items are aborted"
         )
 
         # generating 项: 先查即梦,如果已成功就保住(避免漏掉视频)
         for item in gen_items:
             try:
-                await self._reconcile_generating_conservative(item)
+                if (item.get("provider") or "jimeng").lower() in PERSISTENT_LOCAL_VIDEO_PROVIDERS:
+                    await self._reconcile_local_provider_generating_on_startup(item)
+                else:
+                    await self._reconcile_generating_conservative(item)
             except Exception as e:
                 logger.error(f"[queue_worker] 恢复 generating 项 {item['id']} 失败: {e}", exc_info=True)
                 await queue_service.mark_aborted(
@@ -154,15 +161,91 @@ class QueueWorker:
                 )
                 await self._publish_update(item["id"])
 
-        # queued 项: 全部 aborted
+        # queued items: keep Pippit batch work; abort other providers conservatively.
         for item in q_items:
             try:
+                if (item.get("provider") or "jimeng").lower() in PERSISTENT_LOCAL_VIDEO_PROVIDERS:
+                    # 本机凭证型 provider 的参数与凭证都可在重启后恢复，保留等待项。
+                    logger.info(
+                        "[queue_worker] keep local-provider queued item on startup: "
+                        "provider=%s item_id=%s storyboard_id=%s",
+                        item.get("provider"), item.get("id"), item.get("storyboard_id"),
+                    )
+                    await self._publish_update(item["id"])
+                    continue
                 await queue_service.mark_aborted(
                     item["id"], "应用重启 - 等待项已重置,如需继续请重新加入队列"
                 )
                 await self._publish_update(item["id"])
             except Exception as e:
                 logger.warning(f"[queue_worker] 标记 queued 项 {item['id']} aborted 失败: {e}")
+
+    async def _reconcile_local_provider_generating_on_startup(self, item: Dict[str, Any]):
+        """用 storyboards.submit_id 恢复本机凭证型 provider 的在途任务。"""
+        item_id = item["id"]
+        sb_id = item["storyboard_id"]
+        provider_type = (item.get("provider") or "").lower()
+        from database.db import get_db as _gdb
+
+        db = await _gdb()
+        try:
+            cur = await db.execute(
+                "SELECT submit_id, video_status, video_url, last_frame_path, video_fail_reason "
+                "FROM storyboards WHERE id = ?",
+                (sb_id,),
+            )
+            row = await cur.fetchone()
+        finally:
+            await db.close()
+
+        if not row:
+            await queue_service.mark_failed(item_id, ERR_UNKNOWN, "storyboard 已被删除")
+            await self._publish_update(item_id)
+            return
+
+        sb_status = (row["video_status"] or "").lower()
+        if sb_status in ("done", "failed", "download_failed", "chain_aborted"):
+            await self._sync_storyboard_to_queue(item)
+            await self._publish_update(item_id)
+            return
+
+        submit_id = (row["submit_id"] or "").strip()
+        if not submit_id:
+            await queue_service.mark_aborted(
+                item_id,
+                f"应用重启 - {provider_type or '本机渠道'}任务缺少 submit_id,无法恢复",
+            )
+            await self._publish_update(item_id)
+            return
+
+        try:
+            from api.video import _poll_storyboard_via_ark
+            res = await _poll_storyboard_via_ark(
+                sb_id,
+                submit_id,
+                provider_type=provider_type,
+                local_api_key=None,
+            )
+        except Exception as e:
+            # Network/API failures should not discard an already submitted
+            # Pippit job. Keep it generating; page refresh/sync can retry.
+            logger.warning(
+                "[queue_worker] local-provider startup reconcile failed provider=%s item_id=%s sb=%s: %s",
+                provider_type, item_id, sb_id, e,
+            )
+            await self._publish_update(item_id)
+            return
+
+        result_status = ((res or {}).get("video_status") or "").lower()
+        if result_status in ("done", "failed", "download_failed", "chain_aborted"):
+            await self._sync_storyboard_to_queue(item)
+        else:
+            logger.info(
+                "[queue_worker] local-provider startup reconcile keeps running: "
+                "provider=%s item_id=%s storyboard_id=%s status=%s",
+                provider_type, item_id, sb_id, result_status or "generating",
+            )
+        await self._publish_update(item_id)
 
     async def _reconcile_generating_conservative(self, item: Dict[str, Any]):
         """generating 项: 只看是否已成功,成功就保住 done(避免漏视频),其它一律 aborted"""
@@ -406,6 +489,62 @@ class QueueWorker:
             return
         await self._publish_update(item_id)
 
+        # v3.61.296: worker 提交前最后一道防重复保险。
+        # 正常由 idx_queue_active_storyboard_unique 保证同一 storyboard 只有一条活跃队列行；
+        # 如果历史脏数据/索引创建失败导致仍有重复活跃行,这里直接中止当前行,避免再打一次 CLI。
+        other_active = await queue_service.get_other_active_by_storyboard(sb_id, item_id)
+        if other_active:
+            logger.warning(
+                f"[queue_worker] 检测到重复活跃队列 storyboard={sb_id}, "
+                f"current={item_id}, other={other_active.get('id')}({other_active.get('status')}), "
+                "当前项不提交 CLI"
+            )
+            await queue_service.mark_aborted(
+                item_id,
+                f"同一分镜已有活跃队列项 #{other_active.get('id')},已跳过重复提交",
+                reset_storyboard=False,
+            )
+            await self._publish_update(item_id)
+            return
+
+        provider_type = (item.get("provider") or "jimeng").lower()
+        storyboard_claim = await queue_service.claim_storyboard_for_queue_submit(
+            item_id,
+            sb_id,
+            provider=provider_type,
+            video_config_id=item.get("video_config_id"),
+        )
+        if not storyboard_claim.get("claimed"):
+            existing_submit_id = storyboard_claim.get("existing_submit_id")
+            current_status = (storyboard_claim.get("current_status") or "").lower()
+            reason = storyboard_claim.get("reason") or "unknown"
+            if existing_submit_id:
+                logger.warning(
+                    f"[queue_worker] 分镜 {sb_id} 已有 submit_id={existing_submit_id},"
+                    f" item={item_id} 不重复提交,接管轮询"
+                )
+                await self._wait_and_sync_after_submit(item, sb_id, abort_event)
+                return
+            if current_status in ("done", "download_failed", "failed", "chain_aborted"):
+                logger.info(
+                    f"[queue_worker] 分镜 {sb_id} 已是终态 {current_status},"
+                    f" item={item_id} 同步队列状态"
+                )
+                await self._sync_storyboard_to_queue(item)
+                await self._publish_update(item_id)
+                return
+            logger.warning(
+                f"[queue_worker] 分镜 {sb_id} 已有提交占位/生成状态,"
+                f" item={item_id} reason={reason},当前项不重复提交"
+            )
+            await queue_service.mark_aborted(
+                item_id,
+                "同一分镜已有提交占位或生成任务,已跳过重复提交",
+                reset_storyboard=False,
+            )
+            await self._publish_update(item_id)
+            return
+
         # 实时读最新 storyboard prompt(允许用户改了道具图后等待项使用新参考)
         prompt, params, video_config_id = await self._load_runtime_params(item)
 
@@ -413,8 +552,18 @@ class QueueWorker:
         # 跟老路径 _process_batch_generation 一致 — 否则全队列都用入队时的顶部 duration,
         # 实际每条分镜的剧本时长不一样会错配
         try:
-            from api.video import _extract_section_duration as _esd
-            sec_dur = _esd(prompt)
+            from api.video import (
+                _extract_declared_section_duration as _declared_duration,
+                _extract_section_duration as _esd,
+            )
+            # MiniMax H3 的上限是 15 秒，不能复用老 helper 的“静默截到
+            # 15 秒”行为；保留真实声明值，让提交校验明确拦截并提示拆镜。
+            if provider_type == "minimax_h3":
+                import math
+                raw_declared = _declared_duration(prompt)
+                sec_dur = math.ceil(raw_declared) if raw_declared is not None else _esd(prompt)
+            else:
+                sec_dur = _esd(prompt)
             if sec_dur is not None:
                 if params is None:
                     params = {}
@@ -441,9 +590,9 @@ class QueueWorker:
         # v3.61.0: 按 provider 路由
         # v3.61.168: cool 跟 volcengine_ark 都走 _submit_via_ark(内部已按 _infer_cloud_provider 分流到 CoolVideoProvider)
         # v3.61.173: 加 xinglian(星链云 SD2 系列),同样走云端 HTTP 路径
-        provider_type = (item.get("provider") or "jimeng").lower()
-        if provider_type in ("volcengine_ark", "cool", "xinglian"):
-            # 云端 HTTP API 路径(ark / cool / xinglian)
+        # v3.61.301: pippit_cli 复用统一 provider 提交/轮询,但不依赖云端配置
+        if provider_type in ("volcengine_ark", "cool", "xinglian", "pippit_cli", "minimax_h3"):
+            # 统一 provider 路径(ark / cool / xinglian / pippit_cli / minimax_h3)
             ok = await self._submit_via_ark(item, sb_id, prompt, params, abort_event)
             if not ok:
                 return  # 已在内部标过状态
@@ -462,6 +611,7 @@ class QueueWorker:
                         sb_id, prompt, video_config_id, params,
                         bool(item["use_chain_frame"]),
                         item.get("chain_frame_desc"),
+                        start_background_reconcile=False,
                     )
                 except Exception as e:
                     err_code, err_msg = _classify_error(str(e))
@@ -522,16 +672,29 @@ class QueueWorker:
                 except asyncio.TimeoutError:
                     pass
 
+        await self._wait_and_sync_after_submit(item, sb_id, abort_event)
+
+    async def _wait_and_sync_after_submit(
+        self,
+        item: Dict[str, Any],
+        sb_id: int,
+        abort_event: asyncio.Event,
+    ) -> None:
+        """Wait storyboard terminal status and sync it back to the queue item."""
+        item_id = item["id"]
         # v3.60.2 关键修复:_process_video_generation 只提交不等待,
         # 必须轮询 storyboard 状态等其真正进终态(done/failed/chain_aborted),
         # 否则 worker 立刻读到 generating 会被误标 failed
+        provider = (item.get("provider") or "jimeng").lower()
+        wait_timeout_seconds = 8 * 60 * 60 if provider in ("jimeng", "pippit_cli") else 5 * 60 * 60
+        wait_timeout_label = "8小时" if provider in ("jimeng", "pippit_cli") else "5小时"
         settled_status = await self._wait_storyboard_settled(
-            sb_id, abort_event, timeout_seconds=5 * 60 * 60  # v3.61.88: 60 分钟 → 5 小时兜底(普通账号即梦排队 3 小时常见)
+            sb_id, abort_event, timeout_seconds=wait_timeout_seconds  # v3.61.336: 即梦/小云雀最长等待 8 小时
         )
 
         if settled_status is None:
             # 超时
-            await self._handle_failure(item, ERR_TIMEOUT, "等待生成超时(>5小时)")
+            await self._handle_failure(item, ERR_TIMEOUT, f"等待生成超时(>{wait_timeout_label})")
             await self._publish_update(item_id)
             return
 
@@ -575,47 +738,94 @@ class QueueWorker:
             await self._publish_update(item["id"])
             return False
 
-        # 1. 取云端视频配置(火山方舟 / Cool 中转)
+        provider_type = (item.get("provider") or "jimeng").lower()
+
+        # 1. 取云端视频配置(火山方舟 / Cool 中转)。小云雀 CLI 与
+        # MiniMax H3 都读取本机凭证，不依赖云端模型配置。
         # v3.61.169: 文案 generic 化(此时 cloud_cfg 还没拿到,无法判断真 provider)
-        try:
-            cloud_cfg = await get_active_config(
-                config_id=item.get("video_config_id"),
-                config_type="video",
-            )
-        except Exception as e:
-            await self._handle_failure(
-                item, "AUTH",
-                f"无法获取云端视频配置: {e}"[:300],
-            )
-            await self._publish_update(item["id"])
-            return False
-
-        if not cloud_cfg:
-            await self._handle_failure(
-                item, "AUTH",
-                "未配置云端视频模型(火山方舟 / Cool 中转),请到千山AI个人中心添加",
-            )
-            await self._publish_update(item["id"])
-            return False
-
-        provider_cfg = {
-            "id": cloud_cfg.get("id"),
-            "name": cloud_cfg.get("name"),
-            "base_url": cloud_cfg.get("baseUrl"),
-            "api_key": cloud_cfg.get("apiKey"),
-            "model_name": cloud_cfg.get("modelName"),
-            "extra_params": cloud_cfg.get("extraParams") or {},
-        }
-
-        # v3.61.168 + 169 + 170: 按 cloud config 推断真 provider type — 提到 collect 之前
-        # 这样 collect 才能按 provider 分流 asset:// URI(cool 不认 asset://,得降级用原图)
         from api.video import (
             _infer_cloud_provider, _collect_storyboard_assets_for_ark,
             _build_final_video_prompt, _log_video_submit_start, _log_video_submit_end,
-            _log_video_submitted,
+            _log_video_submitted, _pippit_provider_config, _minimax_provider_config,
         )
-        _resolved_provider_type = _infer_cloud_provider(cloud_cfg)
-        _provider_friendly = {"cool": "Cool 中转", "volcengine_ark": "火山方舟", "xinglian": "星链云"}.get(_resolved_provider_type, _resolved_provider_type)
+        if provider_type == "minimax_h3":
+            cloud_cfg = {
+                "id": None,
+                "name": "MiniMax H3",
+                "baseUrl": "https://api.minimaxi.com",
+                "apiKey": "",
+                "modelName": "MiniMax-H3",
+                "providerCode": "minimax_h3",
+                "extraParams": {},
+            }
+            provider_cfg = await _minimax_provider_config()
+            _resolved_provider_type = "minimax_h3"
+        elif provider_type == "pippit_cli":
+            cloud_cfg = {
+                "id": None,
+                "name": "小云雀 CLI",
+                "baseUrl": "",
+                "apiKey": "",
+                "modelName": (params or {}).get("model") or (params or {}).get("model_version") or "",
+                "providerCode": "pippit_cli",
+                "extraParams": {},
+            }
+            provider_cfg = await _pippit_provider_config()
+            _resolved_provider_type = "pippit_cli"
+        else:
+            try:
+                cloud_cfg = await get_active_config(
+                    config_id=item.get("video_config_id"),
+                    config_type="video",
+                )
+            except Exception as e:
+                await self._handle_failure(
+                    item, "AUTH",
+                    f"无法获取云端视频配置: {e}"[:300],
+                )
+                await self._publish_update(item["id"])
+                return False
+
+            if not cloud_cfg:
+                await self._handle_failure(
+                    item, "AUTH",
+                    "未配置云端视频模型(火山方舟 / Cool 中转),请到千山AI个人中心添加",
+                )
+                await self._publish_update(item["id"])
+                return False
+
+            provider_cfg = {
+                "id": cloud_cfg.get("id"),
+                "name": cloud_cfg.get("name"),
+                "base_url": cloud_cfg.get("baseUrl"),
+                "api_key": cloud_cfg.get("apiKey"),
+                "model_name": cloud_cfg.get("modelName"),
+                "extra_params": cloud_cfg.get("extraParams") or {},
+            }
+
+            # v3.61.168 + 169 + 170: 按 cloud config 推断真 provider type — 提到 collect 之前
+            # 这样 collect 才能按 provider 分流 asset:// URI(cool 不认 asset://,得降级用原图)
+            _resolved_provider_type = _infer_cloud_provider(cloud_cfg)
+        _provider_friendly = {
+            "cool": "Cool 中转",
+            "volcengine_ark": "火山方舟",
+            "xinglian": "星链云",
+            "pippit_cli": "小云雀 CLI",
+            "minimax_h3": "MiniMax H3",
+        }.get(_resolved_provider_type, _resolved_provider_type)
+        from services.video_model_capabilities import get_video_model_capabilities
+
+        # 当前只有即梦/小云雀预留 Seedance 2.5；此队列方法覆盖小云雀，
+        # 其余云端 provider 继续使用 Seedance 2.0 能力。
+        _model_for_caps = (
+            (params or {}).get("model") or (params or {}).get("model_version")
+            if _resolved_provider_type == "pippit_cli"
+            else "seedance_2_0"
+        )
+        _material_caps = get_video_model_capabilities(
+            _model_for_caps,
+            _resolved_provider_type,
+        )
 
         # 2. 准备图片/音频列表 — v3.61.12 复用 video.py 的统一函数(含尾帧 + 自定义参考图 + 三级匹配)
         # v3.61.134: 修 4-tuple unpack + 传 prompt 给 collect(让"种菜模式"在队列路径也生效)
@@ -625,12 +835,36 @@ class QueueWorker:
             use_chain_frame=bool(item.get("use_chain_frame")),
             prompt_for_speakers=prompt or "",
             provider_type=_resolved_provider_type,
+            max_images=int(_material_caps["max_images"]),
+            # MiniMax H3 由 provider 返回明确的素材超限错误，不静默丢图。
+            apply_image_limit=(_resolved_provider_type != "minimax_h3"),
         )
 
         # 3. 透传 use_chain_frame → return_last_frame
         ark_params = dict(params or {})
         if item.get("use_chain_frame"):
             ark_params["use_chain_frame"] = True
+        if _resolved_provider_type == "minimax_h3":
+            ark_params["model"] = "MiniMax-H3"
+            ark_params["resolution"] = "2K"
+            try:
+                h3_duration = int(ark_params.get("duration") or 5)
+            except (TypeError, ValueError):
+                h3_duration = 5
+            if h3_duration < 4 or h3_duration > 15:
+                err_msg = (
+                    f"当前分镜时长 {h3_duration} 秒，MiniMax H3 仅支持 4-15 秒。"
+                    "请先拆分分镜；系统不会静默截断时长。"
+                )
+                try:
+                    await StoryboardService.update_video_status(
+                        sb_id, "failed", fail_reason=err_msg
+                    )
+                except Exception:
+                    pass
+                await self._handle_failure(item, "INVALID_PARAM", err_msg)
+                await self._publish_update(item["id"])
+                return False
 
         # v3.61.181: 队列路径以前直接透传 raw prompt → cool / xinglian / ark 收到没拼装的 prompt
         #            ★ 缺 style_prefix / start_state / file_refs,还残留 🔗 + 📏 元数据
@@ -638,11 +872,13 @@ class QueueWorker:
         final_prompt = await _build_final_video_prompt(
             storyboard_id=sb_id,
             raw_prompt=prompt or "",
-            image_items=_image_labels[:9],
-            audio_items=_audio_labels[:3],
+            image_items=_image_labels[: int(_material_caps["max_images"])],
+            audio_items=_audio_labels[: int(_material_caps["max_audios"])],
             with_file_refs=True,
             log_prefix=f"queue/{_resolved_provider_type}",
             ref_at=(_resolved_provider_type == "cool"),  # v3.61.214: 仅 cool 用 @图片N / @音频N
+            provider_type=_resolved_provider_type,
+            separate_audio_order=(_resolved_provider_type == "minimax_h3"),
         )
 
         # v3.61.183: 视频提交日志(create_log)— 进上游前记一条 running
@@ -786,7 +1022,7 @@ class QueueWorker:
                     # v3.61.158:加 id / element_type / active_variant_id,给 helper 用
                     cur = await db.execute(
                         """SELECT id, element_type, finished_image, image_url, grid_image,
-                               reference_image, audio_file, description,
+                               reference_image, audio_file, voice_id, description,
                                image_prompt, image_status,
                                volc_asset_id, volc_asset_uri, volc_asset_status, volc_asset_group_id,
                                active_variant_id
@@ -801,6 +1037,32 @@ class QueueWorker:
                     # v3.61.158:人物走 active variant fallback(字段级 merge)
                     el_dict = dict(el)
                     if etype == "character":
+                        if not el_dict.get("audio_file") and el_dict.get("voice_id"):
+                            try:
+                                from services import voice_service
+                                from utils.timezone import now_beijing_str
+                                ncur = await db.execute("SELECT name FROM novels WHERE id = ?", (novel_id,))
+                                nrow = await ncur.fetchone()
+                                novel_name = None
+                                if nrow:
+                                    try:
+                                        novel_name = nrow["name"]
+                                    except Exception:
+                                        novel_name = None
+                                audio_file = await voice_service.materialize_voice_audio_file(
+                                    el_dict.get("voice_id"),
+                                    novel_name,
+                                    name,
+                                )
+                                if audio_file:
+                                    await db.execute(
+                                        "UPDATE extracted_elements SET audio_file = ?, updated_at = ? WHERE id = ?",
+                                        (audio_file, now_beijing_str(), el_dict.get("id")),
+                                    )
+                                    await db.commit()
+                                    el_dict["audio_file"] = audio_file
+                            except Exception as e:
+                                logger.warning("[queue_worker] 音色音频自动补齐失败 element=%s: %s", el_dict.get("id"), e)
                         from services.extraction_service import ExtractionService as _ES
                         el_dict = await _ES.resolve_active_character_asset(el_dict)
                     img = (
@@ -833,7 +1095,7 @@ class QueueWorker:
     ):
         """v3.60.17: 提交前主动等即梦那边有空位
 
-        调 dreamina list_tasks,看当前 status='processing' 任务数;
+        调 dreamina list_tasks,看当前活跃任务数;
         如果 >= max_concurrent 就等,直到有空位再返回。
         v3.61.257(codex P1):取消"最多等 10 分钟后硬放行"——硬放行会突破即梦并发、白扣额度。
           现在只在以下情况返回:有空位 / abort_event 触发 / list_tasks 查询失败(兜底)。
@@ -853,14 +1115,19 @@ class QueueWorker:
             if abort_event.is_set():
                 return
             try:
-                res = await vs.list_tasks(status="processing")
-                tasks = (res.get("data") or {}).get("tasks") or []
+                from api.video import _extract_task_list, _is_jimeng_active_task_entry
+
+                res = await vs.list_tasks(limit=50)
+                tasks = [
+                    t for t in _extract_task_list(res.get("data"))
+                    if isinstance(t, dict) and _is_jimeng_active_task_entry(t)
+                ]
                 raw_count = len(tasks) if isinstance(tasks, list) else 0
-                # v3.61.80: 本地终态兜底
-                # 即梦的 list_tasks 偶尔会有 stale entry(我们这边 storyboard 已 done/失败,
-                # 但即梦那边几十秒~几分钟没把它移出 processing),导致下一个 sb 一直拿不到空位
-                # 解决:拿 list_tasks 里的 submit_id 去 storyboards 表对一遍,本地终态的直接扣掉
-                active_count = await self._discount_stale_jimeng_tasks(tasks, raw_count)
+                # list_task can include stale local CLI querying rows. Capacity
+                # checks must confirm candidates with query_result and only count
+                # tasks that are truly Generating; Queueing/querying ghosts do not
+                # occupy the local gate.
+                active_count = await self._confirm_jimeng_capacity_count(vs, tasks, raw_count)
             except Exception as e:
                 # 查询失败才兜底放行(让后续 1310 重试兜住),否则会卡死整条小说队列
                 logger.debug(f"[queue_worker] list_tasks 查容量失败,兜底放行: {e}")
@@ -873,8 +1140,16 @@ class QueueWorker:
                 return
             if not warned:
                 logger.info(
-                    f"[queue_worker] 任务 {item['id']} 即梦端有 {active_count} 个任务在跑,"
-                    f"等待空位(含可能的已中断幽灵任务,即梦无法取消、会自然跑完)..."
+                    f"[queue_worker] 任务 {item['id']} 即梦端有 {active_count} 个任务正在 Generating,"
+                    f"等待空位(query_result 复核; Queueing/querying 不占坑)..."
+                )
+                await event_bus.publish(
+                    "queue.alert",
+                    {
+                        "code": "JIMENG_CAPACITY_WAIT",
+                        "item_id": item["id"],
+                        "message": f"检测到即梦已有 {active_count} 个任务正在生成,等待空位中",
+                    },
                 )
                 warned = True
             try:
@@ -886,28 +1161,18 @@ class QueueWorker:
                 if waited % 120 < check_interval:
                     logger.warning(
                         f"[queue_worker] 任务 {item['id']} 已等即梦释放配额 {int(waited)}s,"
-                        f"即梦端仍有 {active_count} 个在跑,继续等(不硬放行以免并发突破)"
+                        f"query_result 复核仍有 {active_count} 个 Generating,继续等"
                     )
 
-    async def _discount_stale_jimeng_tasks(self, tasks, raw_count: int) -> int:
-        """v3.61.80: 用本地 storyboards 终态扣减即梦 stale 的 processing 计数
+    async def _local_terminal_jimeng_submit_ids(self, submit_ids: List[str]) -> Set[str]:
+        """Return submit_ids whose local storyboard is already terminal.
 
-        - 即梦 list_tasks 返回 processing 列表
-        - 拿这些 submit_id 去 storyboards 表查 video_status
-        - 只有"能证明即梦远端已经完成"的本地状态才扣减(done/completed/success/download_failed)
-        - 返回真正还在跑的数量
+        This is a cheap first pass before query_result. It covers normal stale
+        list_task lag for tasks still present in the local DB.
         """
-        if not isinstance(tasks, list) or raw_count == 0:
-            return 0
-        submit_ids = []
-        for t in tasks:
-            if not isinstance(t, dict):
-                continue
-            sid = t.get("submit_id") or t.get("id")
-            if sid:
-                submit_ids.append(str(sid))
+        submit_ids = [str(s).strip() for s in submit_ids if str(s or "").strip()]
         if not submit_ids:
-            return raw_count
+            return set()
         try:
             from database.db import get_db
             placeholders = ",".join("?" * len(submit_ids))
@@ -922,27 +1187,114 @@ class QueueWorker:
             finally:
                 await db.close()
         except Exception as e:
-            logger.debug(f"[queue_worker] 本地 storyboards 终态扣减查询失败,按即梦原始计数: {e}")
-            return raw_count
-        # v3.61.257 codex P1:扣减集合只能含"远端确实已完成"的状态。
-        #   download_failed = 即梦上游成功、仅本地下载失败 → 远端已释放,可扣。
-        #   ⛔ chain_aborted(本地中断,即梦无法取消、后台仍在跑)和 failed(可能是本地超时/本地失败,
-        #      即梦远端可能仍在 processing)都不能扣 —— 否则幽灵任务不占槽,会放行下一个导致即梦并发突破、白扣额度。
+            logger.debug(f"[queue_worker] 本地 storyboards 终态扣减查询失败: {e}")
+            return set()
+
         terminal = {"done", "completed", "success", "download_failed"}
-        stale = 0
+        stale: Set[str] = set()
         for r in rows:
             try:
+                sid = str(r["submit_id"] or "").strip()
                 st = (r["video_status"] or "").lower()
             except Exception:
-                st = ""
-            if st in terminal:
-                stale += 1
-        if stale > 0:
+                continue
+            if sid and st in terminal:
+                stale.add(sid)
+        return stale
+
+    async def _jimeng_capacity_query_active(self, vs, submit_id: str) -> Optional[bool]:
+        """query_result-backed active check for the capacity gate.
+
+        True means query_result.queue_info.queue_status is Generating and should
+        occupy a slot. Queueing/querying does not occupy the local gate. False
+        means terminal/zombie/non-occupying. None means query inconclusive; the
+        capacity gate does not count it, relying on the submit path's 1310 retry.
+        """
+        submit_id = str(submit_id or "").strip()
+        if not submit_id:
+            return None
+        now = asyncio.get_running_loop().time()
+        cached = self._jimeng_capacity_cache.get(submit_id)
+        if cached and now < float(cached[1]):
+            return cached[0]
+        res = None
+        try:
+            from api.video import _jimeng_query_result_occupies_capacity
+            res = await vs.query_result(submit_id)
+            active = _jimeng_query_result_occupies_capacity(res)
+        except Exception as e:
+            logger.debug(f"[queue_worker] query_result 复核容量失败 submit_id={submit_id}: {e}")
+            active = None
+
+        data = res.get("data") if isinstance(res, dict) else None
+        queue_info = data.get("queue_info") if isinstance(data, dict) else None
+        logger.info(
+            "[queue_worker] 即梦容量复核 submit_id=%s occupies=%s gen_status=%s "
+            "queue_status=%s queue_idx=%s queue_length=%s",
+            submit_id,
+            active,
+            data.get("gen_status") if isinstance(data, dict) else None,
+            queue_info.get("queue_status") if isinstance(queue_info, dict) else None,
+            queue_info.get("queue_idx") if isinstance(queue_info, dict) else None,
+            queue_info.get("queue_length") if isinstance(queue_info, dict) else None,
+        )
+
+        ttl = 20.0 if active is True else (180.0 if active is False else 10.0)
+        self._jimeng_capacity_cache[submit_id] = (active, now + ttl)
+        if len(self._jimeng_capacity_cache) > 100:
+            expired = [k for k, v in self._jimeng_capacity_cache.items() if now >= float(v[1])]
+            for k in expired:
+                self._jimeng_capacity_cache.pop(k, None)
+        return active
+
+    async def _confirm_jimeng_capacity_count(self, vs, tasks, raw_count: int) -> int:
+        """Count only Jimeng tasks query_result confirms as truly Generating."""
+        if not isinstance(tasks, list) or raw_count == 0:
+            return 0
+        submit_ids = []
+        for t in tasks:
+            if not isinstance(t, dict):
+                continue
+            try:
+                from api.video import _jimeng_task_id
+                sid = _jimeng_task_id(t)
+            except Exception:
+                sid = t.get("submit_id") or t.get("id")
+            if sid:
+                sid = str(sid)
+                if sid not in submit_ids:
+                    submit_ids.append(sid)
+        if not submit_ids:
+            return 0
+
+        local_terminal = await self._local_terminal_jimeng_submit_ids(submit_ids)
+        active_ids: List[str] = []
+        terminal_ids: List[str] = []
+        unknown_ids: List[str] = []
+        for sid in submit_ids:
+            if sid in local_terminal:
+                terminal_ids.append(sid)
+                continue
+            active = await self._jimeng_capacity_query_active(vs, sid)
+            if active is True:
+                active_ids.append(sid)
+            elif active is False:
+                terminal_ids.append(sid)
+            else:
+                unknown_ids.append(sid)
+
+        stale = len(terminal_ids)
+        if stale:
             logger.info(
-                f"[queue_worker] 即梦 list_tasks 返回 {raw_count} 个 processing,"
-                f"其中 {stale} 个本地已终态(stale),实际占用 {raw_count - stale}"
+                f"[queue_worker] 即梦 list_task 返回 {raw_count} 个候选,"
+                f"query_result/本地终态扣掉 {stale} 个非占坑项,实际 Generating 占用 {len(active_ids)}"
             )
-        return max(0, raw_count - stale)
+        if unknown_ids:
+            logger.info(
+                f"[queue_worker] 即梦容量复核有 {len(unknown_ids)} 个候选状态不明,"
+                f"不计入容量占用: {unknown_ids[:5]}"
+            )
+        return len(active_ids)
 
     async def _wait_storyboard_settled(
         self,

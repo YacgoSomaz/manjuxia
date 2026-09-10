@@ -27,7 +27,6 @@ from typing import Optional, List, Dict, Any
 
 import aiohttp
 from utils.ssl_helper import get_aiohttp_connector
-from services.trusted_providers import require_trusted_model_url
 
 from .base import VideoProviderBase, ProviderType, SubmitResult, QueryResult
 from utils.paths import resolve_db_path
@@ -63,7 +62,7 @@ class CoolVideoProvider(VideoProviderBase):
 
     def __init__(self, config: dict):
         super().__init__(config)
-        self.base_url = require_trusted_model_url(config.get("base_url") or DEFAULT_BASE_URL)
+        self.base_url = (config.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
         self.api_key = config.get("api_key") or ""
         extra = config.get("extra_params") or {}
         if isinstance(extra, str):

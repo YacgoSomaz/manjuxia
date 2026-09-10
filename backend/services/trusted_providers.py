@@ -24,6 +24,10 @@ TRUSTED_MODEL_HOSTS = {
     "generativelanguage.googleapis.com",
 }
 
+# The deployed TaiHang New API relay currently exposes only this HTTP endpoint.
+# Keep this exception exact rather than relaxing the custom-relay HTTPS policy.
+TRUSTED_HTTP_MODEL_HOSTS = {"120.209.70.196"}
+
 
 def _is_loopback(hostname: str) -> bool:
     if hostname.lower() == "localhost":
@@ -63,6 +67,10 @@ def require_trusted_model_url(value: str) -> str:
     if _is_loopback(hostname):
         if parsed.scheme not in {"http", "https"}:
             raise ValueError("本机模型地址必须使用 HTTP 或 HTTPS")
+        return raw
+    if hostname in TRUSTED_HTTP_MODEL_HOSTS:
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError("模型地址必须使用 HTTP 或 HTTPS")
         return raw
     if parsed.scheme != "https":
         raise ValueError("模型地址必须使用 HTTPS")

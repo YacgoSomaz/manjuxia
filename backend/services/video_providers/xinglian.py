@@ -43,7 +43,6 @@ from typing import Optional, List, Dict, Any
 
 import aiohttp
 from utils.ssl_helper import get_aiohttp_connector
-from services.trusted_providers import require_trusted_model_url
 
 from .base import VideoProviderBase, ProviderType, SubmitResult, QueryResult
 from utils.paths import resolve_db_path
@@ -53,6 +52,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://www.vjimeng.vip"
 
+# 星链云所有模型提交后统一等待 30 分钟返回 task_id。
+# 这是“提交接口”的等待上限，不是视频生成完成的轮询上限。
+XINGLIAN_SUBMIT_TIMEOUT_SECONDS = 30 * 60
+
 # 模型能力 — 基于 demo HTML 第 212-219 行 modelSupports() 实现
 MODEL_CAPS = {
     "sd2-720p-fast": {
@@ -60,42 +63,36 @@ MODEL_CAPS = {
         "supports_image": True,
         "supports_audio": True,
         "max_images": 0,         # 0 = 无上限
-        "default_timeout_min": 5,
     },
     "sd2-720p": {
         "duration_range": (4, 15),
         "supports_image": True,
         "supports_audio": True,
         "max_images": 0,
-        "default_timeout_min": 10,
     },
     "sd2-1080p-fast": {
         "duration_range": (4, 15),
         "supports_image": True,
         "supports_audio": True,
         "max_images": 0,
-        "default_timeout_min": 8,
     },
     "sd2-1080p": {
         "duration_range": (4, 15),
         "supports_image": True,
         "supports_audio": True,
         "max_images": 0,
-        "default_timeout_min": 15,
     },
     "sd2-720p-min-fast": {
         "duration_range": (5, 15),
         "supports_image": True,
         "supports_audio": False,
         "max_images": 4,
-        "default_timeout_min": 5,
     },
     "sd2-720p-min": {
         "duration_range": (5, 15),
         "supports_image": True,
         "supports_audio": False,
         "max_images": 4,
-        "default_timeout_min": 10,
     },
 }
 
@@ -157,6 +154,14 @@ class XinglianVideoProvider(VideoProviderBase):
             self.model_id = raw_model
             logger.warning(f"[xinglian] 非 sd2- 前缀模型 {raw_model!r},按透传处理")
 
+    def _submit_timeout_seconds(self, caps: dict, params: Optional[Dict[str, Any]]) -> int:
+        """所有星链云模型的 submit 请求统一等待 30 分钟返回 task_id。
+
+        保留参数是为了兼容现有调用签名；模型能力和 extra_params 不再覆盖该值，
+        避免同一渠道因模型或历史配置不同而提前超时。
+        """
+        return XINGLIAN_SUBMIT_TIMEOUT_SECONDS
+
     @staticmethod
     def _normalize_base_url(raw: Optional[str]) -> str:
         """规范化 base_url:
@@ -165,11 +170,11 @@ class XinglianVideoProvider(VideoProviderBase):
           - 削末尾 /v1(用户可能填了 https://www.vjimeng.vip/v1)
         """
         if not raw:
-            return require_trusted_model_url(DEFAULT_BASE_URL)
+            return DEFAULT_BASE_URL
         s = raw.strip().rstrip("/")
         if s.endswith("/v1"):
             s = s[:-3]
-        return require_trusted_model_url(s)
+        return s
 
     # ==================== HTTP 工具 ====================
     def _headers(self) -> dict:
@@ -617,13 +622,31 @@ class XinglianVideoProvider(VideoProviderBase):
             },
         }
 
+        submit_timeout = self._submit_timeout_seconds(caps, params)
         try:
-            resp = await self._post("/v1/video/submit/generate", payload, timeout=120)
-        except Exception as e:
-            logger.error(f"[xinglian] submit 网络异常: {e}", exc_info=True)
+            resp = await self._post("/v1/video/submit/generate", payload, timeout=submit_timeout)
+        except asyncio.TimeoutError:
+            logger.error(
+                f"[xinglian] submit 超时: {submit_timeout}s 内未返回 task_id",
+                exc_info=True,
+            )
             return SubmitResult(
                 success=False,
-                fail_reason=f"星链云 网络异常: {e}",
+                fail_reason=(
+                    f"星链云提交超时: 已等待 {submit_timeout} 秒仍未返回任务 ID。"
+                    "这通常是星链云上游排队/网络抖动导致,本地无法确认任务是否已被上游受理。"
+                    "请先到星链云后台查看是否已有对应任务,没有再重新生成。"
+                ),
+                # 不用 TIMEOUT/NETWORK,避免全局队列在任务状态不确定时自动重提导致重复扣费。
+                error_code="SUBMIT_TIMEOUT_UNCONFIRMED",
+                sanitized_payload=sanitized_payload_full,
+            )
+        except Exception as e:
+            logger.error(f"[xinglian] submit 网络异常: {e}", exc_info=True)
+            detail = str(e).strip() or type(e).__name__
+            return SubmitResult(
+                success=False,
+                fail_reason=f"星链云 网络异常: {detail}",
                 error_code="NETWORK",
                 sanitized_payload=sanitized_payload_full,
             )

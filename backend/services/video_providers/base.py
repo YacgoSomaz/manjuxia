@@ -11,6 +11,7 @@ from typing import Optional, List, Dict, Any
 class ProviderType:
     JIMENG = "jimeng"
     VOLCENGINE_ARK = "volcengine_ark"
+    MINIMAX_H3 = "minimax_h3"
 
 
 # ==================== 数据类 ====================

@@ -12,6 +12,22 @@ class ExtractionRequest(BaseModel):
     chapter_ids: Optional[List[int]] = None  # 可选，指定章节范围
 
 
+class OfficialExtractionPromptRequest(BaseModel):
+    """构造开发环境官方语言算力的提取素材。"""
+    novel_id: int
+    element_type: str
+    template_id: int
+    chapter_ids: Optional[List[int]] = None
+
+
+class OfficialExtractionResultRequest(BaseModel):
+    """官方语言任务完成后提交给本地后端的结构化文本。"""
+    novel_id: int
+    element_type: str
+    chapter_ids: Optional[List[int]] = None
+    content: str
+
+
 class ExtractedElementCreate(BaseModel):
     """创建提取元素"""
     novel_id: int
@@ -57,9 +73,11 @@ class ExtractedElementResponse(BaseModel):
     # v3.61.147:VR 720° 全景图(equirectangular 2:1 等距柱状投影)
     # 用户点"全景生成宫格"会从此图按 yaw 多视角采样拼成 grid_image
     panorama_url: Optional[str] = None
+    # 运行时状态：由 extraction API 的任务注册表注入，刷新页面后可恢复转圈。
+    panorama_generating: bool = False
     # 音频文件
     audio_file: Optional[str] = None
-    # 角色绑定音色,用于后续 TTS/配音流程。
+    # v3.61.x:角色绑定的音色 voice_id(TTS 用,跟 audio_file 即梦参考音频相互独立)
     voice_id: Optional[str] = None
     # v3.61.158:人物马甲(变体)— 当前激活的马甲 id;NULL = 用本体
     active_variant_id: Optional[int] = None

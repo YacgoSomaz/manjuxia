@@ -1,6 +1,7 @@
 import json
 import asyncio
 import httpx
+import copy
 from typing import List, Dict, Any, Optional
 from openai import AsyncOpenAI, Timeout
 from database.db import get_db
@@ -34,6 +35,66 @@ from services.secure_secrets import decrypt_secret, encrypt_secret, is_encrypted
 from utils.timezone import now_beijing_str
 from utils.ssl_helper import get_aiohttp_connector
 
+
+def _attach_ephemeral_images(
+    messages: List[Dict[str, Any]],
+    references: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Attach in-memory references to the final user message without mutation."""
+    attached = copy.deepcopy(messages)
+    valid = [ref for ref in (references or []) if str(ref.get("data_url") or "").startswith("data:image/")]
+    if not valid:
+        return attached
+    target_index = next(
+        (idx for idx in range(len(attached) - 1, -1, -1) if attached[idx].get("role") == "user"),
+        None,
+    )
+    if target_index is None:
+        attached.append({"role": "user", "content": []})
+        target_index = len(attached) - 1
+    original = attached[target_index].get("content", "")
+    if isinstance(original, list):
+        content = original
+    else:
+        content = [{"type": "text", "text": str(original or "")}]
+    for ref in valid:
+        label = str(ref.get("label") or "临时场景参考图")
+        instruction = str(ref.get("instruction") or "仅参考场景空间与美术，不照抄图中文字。")
+        content.append({"type": "text", "text": f"\n【{label}】{instruction}"})
+        content.append({"type": "image_url", "image_url": {"url": ref["data_url"]}})
+    attached[target_index]["content"] = content
+    return attached
+
+
+def _redact_multimodal_messages_for_log(
+    messages: List[Dict[str, Any]],
+    reference_count: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Return a log-safe copy that never persists base64 reference images."""
+    redacted = copy.deepcopy(messages)
+    found = 0
+    for message in redacted:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        safe_parts = []
+        message_found = 0
+        for part in content:
+            if not isinstance(part, dict):
+                safe_parts.append(part)
+                continue
+            if part.get("type") == "image_url" or "inlineData" in part or "inline_data" in part:
+                found += 1
+                message_found += 1
+                continue
+            safe_parts.append(part)
+        if message_found:
+            safe_parts.append({"type": "text", "text": "【临时图片已脱敏，未写入日志】"})
+        message["content"] = safe_parts
+    if reference_count and not found:
+        redacted.append({"role": "system", "content": f"【{reference_count} 张临时图片已脱敏，未写入日志】"})
+    return redacted
+
 import os as _os
 import time as _time
 import uuid as _uuid
@@ -50,9 +111,10 @@ _proxy_enabled_cache = {"value": False, "exp": 0.0}
 _PROXY_ENABLED_TTL = 60  # 秒
 _proxy_logger = _logging.getLogger(__name__)
 
-# 分镜通常需要一次返回多个场景小节。旧配置的 4096 会在长剧本上稳定截断，
-# 但不能把这个上限套到小上下文模型上；仅对上下文足够大的分镜配置做保守提升。
-_STORYBOARD_OUTPUT_TOKEN_FLOOR = 24576
+# DeepSeek V4 Flash 把隐藏推理 token 和最终正文共同计入 max_tokens。
+# 生产追踪中单次完整分镜曾消耗超过 32K completion tokens，因此 16K/24K
+# 会在正文中途稳定截断。仅对上下文足够大的分镜模型提升到 64K。
+_STORYBOARD_OUTPUT_TOKEN_FLOOR = 65536
 
 
 def _effective_storyboard_max_tokens(config: dict, task_type: str,
@@ -73,11 +135,12 @@ def _effective_storyboard_max_tokens(config: dict, task_type: str,
         context_window = int(config.get("context_window") or 0)
     except (TypeError, ValueError):
         context_window = 0
-    if configured >= _STORYBOARD_OUTPUT_TOKEN_FLOOR or context_window < 32768:
+    if configured >= _STORYBOARD_OUTPUT_TOKEN_FLOOR or context_window < 65536:
         return configured
-    # 留出输入上下文，避免把小于 32K 的模型推到边界；DeepSeek 的本地配置
-    # 是 131K 上下文，因此这里会从历史 4096 自动提升到 24576。
-    return min(_STORYBOARD_OUTPUT_TOKEN_FLOOR, max(256, context_window - 8192))
+    # 为完整模板和剧本至少保留 32K 输入上下文。DeepSeek V4 是 131K
+    # 上下文，因此会从历史低值自动提升到 65536；64K 上下文模型最多
+    # 提升到 32768，避免输入和输出互相挤占。
+    return min(_STORYBOARD_OUTPUT_TOKEN_FLOOR, max(configured, context_window - 32768))
 
 
 class _ProxyHardError(Exception):
@@ -89,6 +152,10 @@ class _ProxyHardError(Exception):
 
 async def _is_llm_proxy_enabled() -> bool:
     """拉 admin 云端开关(带 60s 缓存)。任何异常 → 视为关(走直连)。"""
+    # The migration build never routes local model traffic through the
+    # production admin proxy.
+    if not cloud_enabled():
+        return False
     now = _time.time()
     if _proxy_enabled_cache["exp"] > now:
         return _proxy_enabled_cache["value"]
@@ -241,8 +308,27 @@ class LLMService:
         config = dict(row)
         config["api_key"] = decrypt_secret(config.get("api_key") or "")
         config["extra_params"] = config.get("extra_params") or "{}"
-        config["api_style"] = "auto"
-        config["provider_code"] = "deepseek" if "deepseek" in (config.get("base_url") or "").lower() else "openai_compat"
+        base_url = (config.get("base_url") or "").lower()
+        if "deepseek" in base_url:
+            provider_code = "deepseek"
+        elif "ark.cn-" in base_url and "volces.com" in base_url:
+            provider_code = "volcengine"
+        elif "lingyaai" in base_url:
+            provider_code = "lingya"
+        elif "bltcy" in base_url:
+            provider_code = "bltcy"
+        elif "geek" in base_url:
+            provider_code = "geek"
+        elif "daydreaming.work" in base_url:
+            provider_code = "1day"
+        else:
+            provider_code = "openai_compat"
+        config["provider_code"] = provider_code
+        config["api_style"] = config.get("api_style") or (
+            "openai_images"
+            if config.get("config_type") == "image" and provider_code == "volcengine"
+            else "auto"
+        )
         if mask_key:
             key = config.get("api_key") or ""
             config["api_key"] = f"{key[:4]}****{key[-4:]}" if len(key) > 8 else "********"
@@ -683,6 +769,10 @@ class LLMService:
     async def get_by_id(config_id: int, *, local_only: bool = False) -> Optional[Dict[str, Any]]:
         """获取单个配置(含明文 api_key,供 LLM 调用)。
         v3.59.60:云端化 — 走 cloud_llm_sync.get_active_config(),不再读本地 sqlite。
+
+        本地配置管理器保存的配置仍然只存在本机。商业版开启云端后，业务页面
+        会先查询云端配置；云端没有该 ID 时必须继续查询本地，否则“测试”能
+        读到本地配置，真正生成图片时却会报“配置 ID 不存在”。
         """
         if local_only or not cloud_enabled():
             return await LLMService._get_local_by_id(config_id)
@@ -698,7 +788,12 @@ class LLMService:
                     if cfg:
                         break
             if not cfg:
-                return None
+                local = await LLMService._get_local_by_id(config_id)
+                if local:
+                    logging.getLogger(__name__).info(
+                        f"[LLMService.get_by_id] 云端无配置，使用本地配置 id={config_id}"
+                    )
+                return local
             return _cloud_to_legacy_dict(cfg, with_api_key=True)
         except Exception as e:
             logging.getLogger(__name__).warning(
@@ -828,6 +923,33 @@ class LLMService:
         if not config:
             return {"success": False, "message": "配置不存在"}
 
+        # 视频模型不是 OpenAI Chat 模型，不能用 /chat/completions 探测。
+        # 之前这里把 video 配置落入通用分支，火山方舟会返回 500，其他视频
+        # 网关则会报协议错误。复用各 Provider 的无扣费凭证探测接口。
+        if config.get("config_type") == "video":
+            try:
+                from services.video_providers import get_provider
+                base_url = (config.get("base_url") or "").lower()
+                model = (config.get("model_name") or "").lower()
+                provider_code = (config.get("provider_code") or "").lower()
+                if provider_code in {"newapi", "new_api", "taihang"} or "120.209.70.196" in base_url or "newapi" in base_url:
+                    provider_type = "newapi"
+                elif "minimax" in base_url or "minimax" in model:
+                    provider_type = "minimax_h3"
+                elif provider_code in {"cool", "xinglian", "pippit_cli", "minimax_h3"}:
+                    provider_type = provider_code
+                else:
+                    provider_type = "volcengine_ark"
+                provider = get_provider(provider_type, config)
+                result = await provider.check_login()
+                return {
+                    "success": bool(result.get("success")),
+                    "message": result.get("message") or ("连接成功" if result.get("success") else "连接失败"),
+                    "response": result,
+                }
+            except Exception as e:
+                return {"success": False, "message": f"视频模型连接失败: {type(e).__name__}: {e}"}
+
         # 图像模型:调 ImageService.generate_image 用固定 prompt 真实生图
         if config.get("config_type") == "image":
             from services.image_service import ImageService
@@ -838,6 +960,7 @@ class LLMService:
                     element_id=None,
                     element_type=None,
                     novel_id=None,
+                    local_only=local_only,
                 )
                 if result.get("success"):
                     return {
@@ -911,14 +1034,28 @@ class LLMService:
                 temperature=0.7
             )
 
+            # OpenAI-compatible gateways are not required to return an SDK
+            # ChatCompletion object: some video/LLM relays return plain text
+            # (or a decoded string) for the tiny probe request.  Treat that as
+            # a valid response instead of dereferencing ``response.usage``.
+            response_text = ""
+            if isinstance(response, str):
+                response_text = response
+            else:
+                try:
+                    response_text = response.choices[0].message.content if response.choices else ""
+                except (AttributeError, IndexError, TypeError):
+                    response_text = str(response or "")
+
             # 记录测试连接日志
             input_tokens = 0
             output_tokens = 0
             total_tokens = 0
-            if response.usage:
-                input_tokens = response.usage.prompt_tokens or 0
-                output_tokens = response.usage.completion_tokens or 0
-                total_tokens = response.usage.total_tokens or 0
+            usage = getattr(response, "usage", None)
+            if usage:
+                input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                output_tokens = getattr(usage, "completion_tokens", 0) or 0
+                total_tokens = getattr(usage, "total_tokens", 0) or 0
 
             log_id = await LogService.create_log(
                 task_type="test",
@@ -930,7 +1067,7 @@ class LLMService:
             )
             await LogService.update_log_success(
                 log_id=log_id,
-                output_content=response.choices[0].message.content if response.choices else "",
+                output_content=response_text,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens
@@ -939,7 +1076,7 @@ class LLMService:
             return {
                 "success": True,
                 "message": "连接成功",
-                "response": response.choices[0].message.content if response.choices else "无响应内容"
+                "response": response_text or "无响应内容"
             }
         except asyncio.TimeoutError:
             return {
@@ -1034,6 +1171,7 @@ class LLMService:
         skip_auto_log_update: bool = False,
         assemble_payload: Optional[dict] = None,
         allow_direct_storyboard: bool = False,
+        ephemeral_images: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """统一的大模型调用方法，默认300秒（5分钟）超时
         
@@ -1055,6 +1193,20 @@ class LLMService:
         if not config:
             raise ValueError(f"配置ID {config_id} 不存在")
 
+        messages_for_call = messages
+        # 分镜服务会把场景参考图作为一次性参数传进来。DeepSeek Chat 是纯文本
+        # 接口，不能接收 image_url 内容块；保留完整文本提示词并忽略参考图即可。
+        # 其它 OpenAI 兼容视觉模型可使用内存 Data URL，调用结束后上层立即销毁。
+        if ephemeral_images:
+            _model_lower = str(config.get("model_name") or "").lower()
+            if "deepseek" in _model_lower:
+                _proxy_logger.info(
+                    "DeepSeek text-only storyboard call ignores %s ephemeral scene reference(s)",
+                    len(ephemeral_images),
+                )
+            else:
+                messages_for_call = _attach_ephemeral_images(messages, ephemeral_images)
+
         # 长分镜不能沿用旧的 4096 默认值，否则模型通常在返回半截 JSON/半截小节时
         # 被服务端判为成功；大上下文配置自动补足，显式 max_tokens 仍由调用方控制。
         max_tokens = _effective_storyboard_max_tokens(config, task_type, max_tokens)
@@ -1068,7 +1220,9 @@ class LLMService:
             config_name=config.get("name", ""),
             provider_code=config.get("provider_code", ""),
             base_url=config.get("base_url", ""),
-            input_prompt=messages,
+            input_prompt=_redact_multimodal_messages_for_log(
+                messages_for_call, len(ephemeral_images or [])
+            ),
             novel_id=novel_id,
             chapter_title=chapter_title,
             source_id=source_id,
@@ -1099,7 +1253,7 @@ class LLMService:
             if _proxy_on:
                 try:
                     _content, _it, _ot, _tt = await _call_llm_via_admin_proxy(
-                        config=config, messages=messages,
+                        config=config, messages=messages_for_call,
                         temperature=temperature, max_tokens=max_tokens, task_type=task_type,
                         assemble_payload=assemble_payload,
                     )
@@ -1152,7 +1306,7 @@ class LLMService:
                         base_url=config["base_url"],
                         api_key=config["api_key"],
                         model=config["model_name"],
-                        messages=messages,
+                        messages=messages_for_call,
                         timeout=timeout,
                     ),
                     timeout=timeout + 60.0,
@@ -1211,7 +1365,7 @@ class LLMService:
                         base_url=config["base_url"],
                         api_key=config["api_key"],
                         model=config["model_name"],
-                        messages=messages,
+                        messages=messages_for_call,
                         temperature=temperature if temperature is not None else config["temperature"],
                         max_tokens=max_tokens if max_tokens is not None else config.get("max_tokens") or 60000,
                         extra_params=extra_params,
@@ -1277,7 +1431,7 @@ class LLMService:
         # 构建请求参数
         request_params = {
             "model": config["model_name"],
-            "messages": messages,
+            "messages": messages_for_call,
             "temperature": temperature if temperature is not None else config["temperature"],
             "max_tokens": max_tokens if max_tokens is not None else config.get("max_tokens"),
             **top_extras
@@ -1500,8 +1654,9 @@ _MODEL_TOKEN_HINTS = [
     ("gpt-5",             16384, 200000),
     ("gpt-4o",            16384, 128000),
     ("gpt-4-turbo",       4096,  128000),   # 真 4K 上限
+    ("deepseek-v4-flash", 65536, 131072),
     ("deepseek-v4-pro",   32768, 131072),
-    ("deepseek-v4",       16384, 131072),
+    ("deepseek-v4",       32768, 131072),
     ("deepseek-reasoner", 16384, 65536),
     ("deepseek-chat",     8192,  65536),
     ("qwen-max",          8192,  32768),

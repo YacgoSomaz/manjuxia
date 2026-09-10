@@ -1,7 +1,8 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, Form
+from fastapi.responses import PlainTextResponse
 from starlette.requests import Request
 from pydantic import BaseModel, field_validator
-from typing import Optional, List, Dict, Any  # v3.61.184 hotfix: 加 Dict/Any(_build_file_refs / _build_video_payload_log / _log_video_submit_end 用)
+from typing import Optional, List, Dict, Any, Tuple  # v3.61.184 hotfix: 加 Dict/Any(_build_file_refs / _build_video_payload_log / _log_video_submit_end 用)
 from datetime import datetime, timedelta
 import asyncio
 import logging
@@ -9,31 +10,63 @@ import json
 import os
 import uuid
 import re
+import mimetypes
 import aiofiles
 import shutil
 from utils.ssl_helper import get_aiohttp_connector
 
 from services.video_service import VideoService
-from services.storyboard_service import StoryboardService
+from services.storyboard_service import StoryboardService, _match_section_prop_names
 from database.db import get_db
 from utils.paths import get_data_dir, media_subdir, resolve_db_path
-from utils.timezone import now_beijing
+from utils.timezone import now_beijing, now_beijing_str
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/video", tags=["video"])
 video_service = VideoService()
-
-# 千山同源的本地小云雀 CLI 适配。漫剧虾仍以本地模型配置为主，
-# 这里的 Access Key 只存本机 app_settings，不参与云端模型配置同步。
-CONFIG_VIDEO_PROVIDERS = ("volcengine_ark", "cool", "xinglian")
-UNIFIED_VIDEO_PROVIDERS = CONFIG_VIDEO_PROVIDERS + ("pippit_cli",)
+_JIMENG_GHOST_MISS_COUNTS: Dict[str, int] = {}
+_AUDIO_DURATION_CACHE: Dict[str, Tuple[int, int, Optional[float]]] = {}
+# 即梦普通 2.0 偶发 query_result 一直返回 querying,但真实排队任务在 list_task 里的
+# gen_status 可能也是 querying,并不出现在 --gen_status=processing 过滤结果里。
+# 强幽灵判定不能依赖 processing 过滤。真实排队任务可能很久才有结果,
+# 只有超过 6 小时且 query_result.queue_info 连续为空时才释放本地状态。
+_JIMENG_STRONG_GHOST_MIN_SECONDS = 6 * 60 * 60
+_JIMENG_GHOST_MISS_LIMIT = 3
+CONFIG_VIDEO_PROVIDERS = ("volcengine_ark", "cool", "xinglian", "newapi")
+UNIFIED_VIDEO_PROVIDERS = CONFIG_VIDEO_PROVIDERS + ("pippit_cli", "minimax_h3")
 PROVIDER_FRIENDLY = {
     "cool": "Cool API",
     "volcengine_ark": "火山方舟",
     "xinglian": "星链云",
+    "newapi": "New API 中转",
     "pippit_cli": "小云雀 CLI",
+    "minimax_h3": "MiniMax H3",
 }
 PIPPIT_ACCESS_KEY_SETTING = "pippit.access_key"
+MINIMAX_API_KEY_SETTING = "minimax.api_key"
+
+
+def _cached_audio_duration_seconds(file_path: str) -> Optional[float]:
+    """Probe a local audio once per file version for submission prechecks."""
+    try:
+        normalized = os.path.abspath(file_path)
+        stat = os.stat(normalized)
+        cache_key = os.path.normcase(normalized)
+        cached = _AUDIO_DURATION_CACHE.get(cache_key)
+        version = (int(stat.st_mtime_ns), int(stat.st_size))
+        if cached and cached[:2] == version:
+            return cached[2]
+        from api.extraction import _probe_audio_duration_seconds
+
+        duration = _probe_audio_duration_seconds(normalized)
+        _AUDIO_DURATION_CACHE[cache_key] = (version[0], version[1], duration)
+        if len(_AUDIO_DURATION_CACHE) > 1000:
+            oldest_key = next(iter(_AUDIO_DURATION_CACHE))
+            if oldest_key != cache_key:
+                _AUDIO_DURATION_CACHE.pop(oldest_key, None)
+        return duration
+    except Exception:
+        return None
 
 
 def _mask_secret(value: str) -> str:
@@ -60,7 +93,7 @@ async def _set_app_setting(key: str, value: str) -> None:
     try:
         await db.execute(
             "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now', '+8 hours')) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now', '+8 hours')",
             (key, value),
         )
         await db.commit()
@@ -70,8 +103,11 @@ async def _set_app_setting(key: str, value: str) -> None:
 
 def _env_pippit_access_key() -> str:
     for name in (
-        "PIPPIT_ACCESS_KEY", "PIPPIT_API_KEY", "PIPPIT_TOOL_ACCESS_KEY",
-        "XIAOYUNQUE_ACCESS_KEY", "XIAOYUNQUE_API_KEY",
+        "PIPPIT_ACCESS_KEY",
+        "PIPPIT_API_KEY",
+        "PIPPIT_TOOL_ACCESS_KEY",
+        "XIAOYUNQUE_ACCESS_KEY",
+        "XIAOYUNQUE_API_KEY",
     ):
         value = os.environ.get(name)
         if value and value.strip():
@@ -80,12 +116,330 @@ def _env_pippit_access_key() -> str:
 
 
 async def _get_pippit_access_key() -> str:
+    # Env wins so deployments can override local SQLite settings.
     return _env_pippit_access_key() or (await _get_app_setting(PIPPIT_ACCESS_KEY_SETTING)).strip()
 
 
 async def _pippit_provider_config() -> Dict[str, Any]:
     access_key = await _get_pippit_access_key()
     return {"access_key": access_key} if access_key else {}
+
+
+def _env_minimax_api_key() -> str:
+    for name in ("MINIMAX_API_KEY", "MINIMAX_ACCESS_KEY", "MINIMAX_SECRET_KEY"):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return ""
+
+
+async def _get_minimax_api_key() -> str:
+    # 部署环境变量优先；桌面端默认读取本机 app_settings。
+    return _env_minimax_api_key() or (await _get_app_setting(MINIMAX_API_KEY_SETTING)).strip()
+
+
+async def _minimax_provider_config() -> Dict[str, Any]:
+    api_key = await _get_minimax_api_key()
+    return {
+        "api_key": api_key,
+        "base_url": "https://api.minimaxi.com",
+        "model_name": "MiniMax-H3",
+        "name": "MiniMax H3",
+    }
+
+
+def _is_jimeng_active_queue_status(value: Any) -> bool:
+    """query_result.queue_info.queue_status 表示当前 submit_id 的队列态。
+
+    这个字段比全局 list_task 更贴近当前任务。若它明确表示排队/生成中,
+    不应再用任务列表反查缺失把任务判成幽灵。
+    """
+    text = str(value or "").strip().lower()
+    return text in {
+        "queueing", "queue", "queued", "waiting", "inqueue",
+        "querying", "generating", "generation", "running", "processing", "process",
+    }
+
+
+def _extract_task_list(data) -> list:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        if data.get("submit_id") or data.get("id") or data.get("task_id"):
+            return [data]
+        tasks = data.get("tasks") or data.get("data") or []
+        if isinstance(tasks, dict) and (
+            tasks.get("submit_id") or tasks.get("id") or tasks.get("task_id")
+        ):
+            return [tasks]
+        return tasks if isinstance(tasks, list) else []
+    return []
+
+
+_JIMENG_TERMINAL_TASK_STATUSES = {
+    "success", "succeeded",
+    "finish", "finished",
+    "complete", "completed",
+    "fail", "failed", "error",
+    "cancel", "canceled", "cancelled",
+}
+
+
+def _jimeng_task_id(task: Dict[str, Any]) -> str:
+    return str(task.get("submit_id") or task.get("id") or task.get("task_id") or "").strip()
+
+
+def _is_jimeng_active_task_entry(task: Dict[str, Any]) -> bool:
+    """判断 list_task 里的匹配任务是否仍应视为远端活任务。
+
+    list_task 的字段在 CLI 版本间不完全稳定。匹配到 submit_id 但没有状态字段时,
+    为避免误杀真实排队任务,保守视为活跃；只有明确终态才返回 False。
+    """
+    raw_statuses = [
+        task.get("gen_status"),
+        task.get("status"),
+        task.get("task_status"),
+        task.get("queue_status"),
+    ]
+    statuses = [str(s).strip().lower() for s in raw_statuses if str(s or "").strip()]
+    if not statuses:
+        return True
+    if any(s in _JIMENG_TERMINAL_TASK_STATUSES for s in statuses):
+        return False
+    if any(_is_jimeng_active_queue_status(s) for s in statuses):
+        return True
+    # 未知状态宁可保留到 query_result / 8 小时硬上限处理,不在这里释放本地状态。
+    return True
+
+
+def _jimeng_query_result_is_active(result: Dict[str, Any]) -> Optional[bool]:
+    """Interpret dreamina query_result as remote liveness.
+
+    This intentionally treats Queueing/querying as active so poll/ghost logic
+    does not release real long-running Jimeng tasks. Do not use it for the local
+    capacity gate, where only queue_info.queue_status=Generating should count.
+    """
+    if not isinstance(result, dict) or not result.get("success"):
+        return None
+    data = result.get("data") or {}
+    if not isinstance(data, dict):
+        return None
+
+    raw_statuses = [
+        data.get("gen_status"),
+        data.get("status"),
+        data.get("task_status"),
+    ]
+    queue_info = data.get("queue_info")
+    if isinstance(queue_info, dict):
+        raw_statuses.extend([
+            queue_info.get("queue_status"),
+            queue_info.get("status"),
+        ])
+
+    statuses = [str(s).strip().lower() for s in raw_statuses if str(s or "").strip()]
+    if any(s in _JIMENG_TERMINAL_TASK_STATUSES for s in statuses):
+        return False
+    if any(_is_jimeng_active_queue_status(s) for s in statuses):
+        return True
+
+    # Some successful terminal payloads omit status but include a video URL.
+    if data.get("video_url") or data.get("url") or data.get("download_url"):
+        return False
+    videos = data.get("videos")
+    if isinstance(videos, list) and videos:
+        return False
+
+    return None
+
+
+def _jimeng_query_result_occupies_capacity(result: Dict[str, Any]) -> Optional[bool]:
+    """Return whether a Jimeng task should occupy the local capacity gate.
+
+    Customer machines can accumulate stale local CLI rows that list_task reports
+    as querying forever. Those rows, and normal Queueing rows, must not block the
+    global queue. Capacity only counts a task when query_result explicitly says
+    queue_info.queue_status is Generating. Terminal payloads return False; unclear
+    payloads return None and are not counted by the gate.
+    """
+    if not isinstance(result, dict) or not result.get("success"):
+        return None
+    data = result.get("data") or {}
+    if not isinstance(data, dict):
+        return None
+
+    raw_statuses = [
+        data.get("gen_status"),
+        data.get("status"),
+        data.get("task_status"),
+    ]
+    statuses = [str(s).strip().lower() for s in raw_statuses if str(s or "").strip()]
+    if any(s in _JIMENG_TERMINAL_TASK_STATUSES for s in statuses):
+        return False
+
+    if data.get("video_url") or data.get("url") or data.get("download_url"):
+        return False
+    videos = data.get("videos")
+    if isinstance(videos, list) and videos:
+        return False
+
+    queue_info = data.get("queue_info")
+    if isinstance(queue_info, dict):
+        queue_status = str(queue_info.get("queue_status") or "").strip().lower()
+        if queue_status == "generating":
+            return True
+        if queue_status:
+            return False
+
+    return None
+
+
+def _jimeng_task_response_contains_active(res: dict, submit_id: str) -> Optional[bool]:
+    if not res.get("success"):
+        return None
+    tasks = _extract_task_list(res.get("data"))
+    target = str(submit_id or "").strip()
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        if _jimeng_task_id(task) == target:
+            return _is_jimeng_active_task_entry(task)
+    return False
+
+
+async def _backfill_character_audio_from_voice(db, novel_id: int, elem: dict) -> dict:
+    """Backfill legacy preset voice bindings into audio_file for video flows."""
+    if not elem or elem.get("element_type") != "character":
+        return elem
+    if elem.get("audio_file") or not elem.get("voice_id"):
+        return elem
+    try:
+        from services import voice_service
+        from utils.timezone import now_beijing_str
+
+        cur = await db.execute("SELECT name FROM novels WHERE id = ?", (novel_id,))
+        novel = await cur.fetchone()
+        novel_name = None
+        if novel:
+            try:
+                novel_name = novel["name"]
+            except Exception:
+                novel_name = None
+        audio_file = await voice_service.materialize_voice_audio_file(
+            elem.get("voice_id"),
+            novel_name,
+            elem.get("name"),
+        )
+        if not audio_file:
+            return elem
+        await db.execute(
+            "UPDATE extracted_elements SET audio_file = ?, updated_at = ? WHERE id = ?",
+            (audio_file, now_beijing_str(), elem.get("id")),
+        )
+        await db.commit()
+        elem = dict(elem)
+        elem["audio_file"] = audio_file
+    except Exception as e:
+        logger.warning("[video] 音色音频自动补齐失败 element=%s: %s", elem.get("id"), e)
+    return elem
+
+
+async def _jimeng_task_list_contains_active(submit_id: str) -> Optional[bool]:
+    """检查即梦任务列表是否仍包含该 submit_id 且不是明确终态。
+
+    返回:
+      True  = list_task 确认包含活跃/未知状态任务
+      False = list_task 可查,但不包含或已明确终态
+      None  = 查询失败/结构异常,调用方不能据此判失败
+    """
+    if not submit_id:
+        return None
+    try:
+        # 先用 CLI 原生 submit_id 过滤,不带 gen_status。真实排队任务可能是 querying,
+        # 用 --gen_status=processing 会漏掉,导致强幽灵误杀。
+        direct = await video_service.list_tasks(submit_id=submit_id)
+        direct_present = _jimeng_task_response_contains_active(direct, submit_id)
+        if direct_present is True:
+            return True
+
+        # 兼容旧 CLI/异常输出:再查无状态列表兜底。这里也不能带 processing 过滤。
+        broad = await video_service.list_tasks(limit=50)
+        broad_present = _jimeng_task_response_contains_active(broad, submit_id)
+        if broad_present is True:
+            return True
+        if direct_present is False or broad_present is False:
+            return False
+        return None
+    except Exception as e:
+        logger.debug(f"[poll-status] 即梦 list_task 反查失败 submit_id={submit_id}: {e}")
+        return None
+
+
+_JIMENG_TRANSIENT_SUBMIT_FAIL_KEYWORDS = (
+    "context deadline exceeded",
+    "client.timeout",
+    "awaiting headers",
+    "deadline exceeded",
+    "timed out",
+    "timeout",
+    "i/o timeout",
+    "connection reset",
+    "wsarecv",
+    "broken pipe",
+    "eof",
+)
+
+
+_JIMENG_RECOVERABLE_SUBMIT_FAIL_KEYWORDS = (
+    "1310",
+    "exceedconcurrencylimit",
+    "concurrency",
+)
+
+
+def _is_jimeng_transient_submit_failure(reason: str) -> bool:
+    """提交阶段的网络/超时类失败。
+
+    这类响应即使带 submit_id,也可能只是 CLI 本地写了 task 记录,
+    即梦后台并没有真正进入 processing,不能直接按"已受理"轮询。
+    """
+    text = str(reason or "").lower()
+    return any(k in text for k in _JIMENG_TRANSIENT_SUBMIT_FAIL_KEYWORDS)
+
+
+def _is_jimeng_recoverable_submit_failure(reason: str) -> bool:
+    """提交返回 fail+submit_id,但即梦仍可能把任务排进队列的已知业务场景。"""
+    text = str(reason or "").lower()
+    return any(k in text for k in _JIMENG_RECOVERABLE_SUBMIT_FAIL_KEYWORDS)
+
+
+async def _confirm_jimeng_submit_visible(
+    submit_id: str,
+    *,
+    attempts: int = 3,
+    delay_seconds: float = 2.0,
+) -> Optional[bool]:
+    """提交超时但带 submit_id 时,短暂反查即梦后台是否真的有任务。
+
+    返回:
+      True  = list_task 确认看到活跃/未知状态任务,可按已受理进入轮询
+      False = list_task 可查,多次都看不到,应立即失败释放本地状态
+      None  = list_task 查询失败,不能据此判失败
+    """
+    if not submit_id:
+        return False
+    saw_unknown = False
+    for idx in range(max(1, attempts)):
+        present = await _jimeng_task_list_contains_active(submit_id)
+        if present is True:
+            return True
+        if present is None:
+            saw_unknown = True
+        if idx < attempts - 1:
+            await asyncio.sleep(delay_seconds)
+    if saw_unknown:
+        return None
+    return False
 
 
 def _strip_llm_metadata(prompt: str) -> str:
@@ -185,6 +539,23 @@ def _extract_start_state_from_prompt(prompt: str) -> str:
     return '\n'.join(lines).rstrip()
 
 
+def _strip_inline_start_state_duplicate(prompt: str) -> str:
+    """删除旧模板的单行起始状态副本。
+
+    仅由调用方在已经取得可信的标准多行 ``start_state_text`` 时调用。
+    这里故意不解析单行内容,也不无条件删除,避免存量首节只有
+    ``场景起始状态:角色=...`` 时丢失唯一状态。
+    """
+    if not prompt:
+        return prompt
+    cleaned = re.sub(
+        r'(?m)^[ \t]*场景起始状态[ \t]*[:：][ \t]*\S[^\r\n]*(?:\r?\n)?',
+        '',
+        prompt,
+    )
+    return re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+
+
 def _parse_start_state_names(start_state_text: str) -> set:
     """v3.61.176: 从"场景起始状态:"块里只抽角色名(`=` 左侧),返回 set。
 
@@ -220,8 +591,9 @@ def _parse_start_state_names(start_state_text: str) -> set:
     return names
 
 
-# 图片超过渠道 9 张上限时的保留优先级。数值越大越优先保留；
-# 同类素材保持原顺序，因此人物列表靠前的主角会优先保留。
+# 图片超过渠道 9 张上限时的“保留优先级”（数值越大越优先保留）。
+# 用户确认的顺序：人物 > 场景 > 道具 > 用户关键帧 > 尾帧 > 俯视 A/B。
+# 同类素材保持原顺序，因此人物列表靠前的主角、俯视 A 图会优先保留。
 _IMAGE_KEEP_PRIORITY = {
     "character": 6,
     "scene": 5,
@@ -251,7 +623,7 @@ def _image_asset_name(item: Any) -> str:
 
 
 def _select_image_keep_indices(items: List[Any], limit: int = 9) -> tuple[List[int], List[int]]:
-    """Select image indices by business priority while preserving upload order."""
+    """按统一保留优先级选出图片索引，同时保持最终上传的原始顺序。"""
     if len(items) <= limit:
         return list(range(len(items))), []
     ranked = sorted(
@@ -268,6 +640,7 @@ def _build_file_refs(
     image_items: List[tuple],
     audio_items: List[tuple],
     ref_at: bool = False,
+    separate_audio_order: bool = False,
 ) -> List[str]:
     """v3.61.181: 共用 file_refs 生成器(原 _process_video_generation L2143-2148 抽出)
 
@@ -276,7 +649,9 @@ def _build_file_refs(
         audio_items: [(path, name), ...]
 
     Returns:
-        ["图片1 凌婉兮人物形象参考图", "音频1 凌婉兮角色音色参考", ...]
+        默认保持历史行为：人物图后紧跟同名音频。
+        separate_audio_order=True 时，先列完全部图片，再严格按 audio_items
+        的实际上传顺序列音频，避免图片顺序把“音频2”排到“音频1”前面。
         调用方按需 ";".join 或 "\n".join,本函数不带分隔符
     """
     _kind_label_map = {
@@ -310,23 +685,229 @@ def _build_file_refs(
     for idx, item in enumerate(image_items, 1):
         name = _name(item)
         kind = _kind(item)
+        # 俯视调度图:name 已是完整短句("这张俯视调度图作为参考"),不追加"参考图"后缀
         if kind == "topview_dispatch":
             refs.append(f"{_ref_pfx}图片{idx} {name}")
             continue
         type_desc = _kind_label_map.get(kind, "")
         label = f"{_ref_pfx}图片{idx} {name}{type_desc}参考图"
-        if kind == "character":
+        if kind == "character" and not separate_audio_order:
             for ai, (anm, alabel) in enumerate(audio_labels):
                 if not used_audio[ai] and anm == name:
                     label = f"{label},{alabel}"   # 人物图 + 该人物音频,同组逗号分隔
                     used_audio[ai] = True
                     break
         refs.append(label)
-    # 没有同名图片可配的音频(理论少见)→ 末尾单列,不丢
-    for ai, (anm, alabel) in enumerate(audio_labels):
-        if not used_audio[ai]:
-            refs.append(alabel)
+    if separate_audio_order:
+        # 即梦独立排序模式：人物/场景/道具图片全部说完后，再按实际 audios[]
+        # 顺序列“音频1、音频2...”，让提示词文字顺序与上传顺序完全一致。
+        refs.extend(alabel for _, alabel in audio_labels)
+    else:
+        # 没有同名图片可配的音频(理论少见)→ 末尾单列,不丢
+        for ai, (anm, alabel) in enumerate(audio_labels):
+            if not used_audio[ai]:
+                refs.append(alabel)
     return refs
+
+
+def _topview_item_parts(item: Any) -> tuple:
+    if isinstance(item, dict):
+        return item.get("kind") or "", item.get("name") or "", item
+    kind = item[2] if isinstance(item, (list, tuple)) and len(item) > 2 else ""
+    name = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else ""
+    meta = item[3] if isinstance(item, (list, tuple)) and len(item) > 3 and isinstance(item[3], dict) else {}
+    return kind or "", name or "", meta
+
+
+def _topview_identity_from_dispatch(raw: Optional[str]) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    identity_pos = text.find("身份绑定:")
+    if identity_pos >= 0:
+        s = text[identity_pos + len("身份绑定:"):].strip()
+        s = s.splitlines()[0].strip()
+        s = s.split("。只参考", 1)[0].strip()
+        s = s.split("。画面其余", 1)[0].strip()
+        s = s.split("。颜色标注只用于", 1)[0].strip()
+        s = s.split("。颜色框只用于", 1)[0].strip()
+        return re.sub(r"\s+", " ", s)[:1000]
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("人物尾态:"):
+            return re.sub(r"\s+", " ", s[len("人物尾态:"):].strip())[:1000]
+    return ""
+
+
+def _topview_binding_name_key(value: Any) -> str:
+    text = str(value or "").strip()
+    return re.sub(r"[\s,，、;；:：·・\-\_()\[\]{}（）【】《》\"'“”‘’]+", "", text)
+
+
+def _topview_name_candidates(name: Any, meta: Optional[Dict[str, Any]] = None) -> List[str]:
+    meta = meta or {}
+    raw: List[Any] = [
+        name,
+        meta.get("name"),
+        meta.get("input_name"),
+        meta.get("element_name"),
+        meta.get("variant"),
+        meta.get("variant_name"),
+    ]
+    aliases = meta.get("aliases")
+    if isinstance(aliases, str):
+        try:
+            parsed = json.loads(aliases or "[]")
+            if isinstance(parsed, list):
+                raw.extend(parsed)
+            else:
+                raw.extend([x.strip() for x in re.split(r"[,，、]", aliases) if x.strip()])
+        except Exception:
+            raw.extend([x.strip() for x in re.split(r"[,，、]", aliases) if x.strip()])
+    elif isinstance(aliases, list):
+        raw.extend(aliases)
+    out: List[str] = []
+    seen: set = set()
+    for item in raw:
+        key = _topview_binding_name_key(item)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _topview_character_ref_map(image_items: Optional[List[Any]], ref_at: bool = False) -> Dict[str, str]:
+    """把当前最终上传素材里的角色图映射为 图片N 引用,供俯视颜色框绑定复用。"""
+    refs: Dict[str, str] = {}
+    if not image_items:
+        return refs
+    prefix = "@" if ref_at else ""
+    for idx, item in enumerate(image_items, 1):
+        kind, name, _meta = _topview_item_parts(item)
+        if kind != "character" or not name:
+            continue
+        for key in _topview_name_candidates(name, _meta):
+            if key and key not in refs:
+                refs[key] = f"{prefix}图片{idx} {name}人物形象参考图"
+    return refs
+
+
+def _topview_marker_pairs(identity_text: str) -> List[tuple]:
+    """从「红色框=凌瑶华(...)」/旧「红色标记=凌瑶华(...)」绑定里抽 (颜色框, 人名)。"""
+    pairs: List[tuple] = []
+    for seg in re.split(r"[；;]", str(identity_text or "")):
+        seg = seg.strip()
+        if not seg:
+            continue
+        m = re.search(r"((?:红|蓝|黄|绿|紫|橙|青|玫红|金|白|黑|浅蓝|深绿)色(?:框|标记))\s*[=:：]\s*([^（(,，;；。]+)", seg)
+        if not m:
+            continue
+        marker = m.group(1).strip()
+        name = m.group(2).strip()
+        if marker and name:
+            pairs.append((marker, name))
+    return pairs
+
+
+def _topview_marker_position_hints(identity_text: str) -> List[str]:
+    """从颜色框绑定括号里取地标站位,过滤参考图段后保留完整位置。"""
+    hints: List[str] = []
+    color_pat = r"(?:红|蓝|黄|绿|紫|橙|青|玫红|金|白|黑|浅蓝|深绿)色(?:框|标记)"
+    for seg in re.split(r"[；;]", str(identity_text or "")):
+        seg = seg.strip()
+        if not seg:
+            continue
+        m = re.search(rf"({color_pat})\s*[=:：]\s*([^（(,，;；。]+)[（(]([^）)]*)[）)]", seg)
+        if not m:
+            continue
+        marker = m.group(1).strip()
+        detail = m.group(3).strip()
+        parts = [p.strip() for p in re.split(r"[,，]", detail) if p.strip()]
+        if not parts:
+            continue
+        # topview_demo 写入顺序为:参考图、站位。站位本身可能含逗号,不能只取最后一段。
+        position_parts = [
+            p for p in parts
+            if not p.startswith("熔图参考图") and "参考图" not in p
+        ]
+        pos = "，".join(position_parts)
+        if pos:
+            hints.append(f"{marker}在{pos}")
+    return hints
+
+
+def _topview_dispatch_rule(image_items: Optional[List[tuple]], ref_at: bool = False) -> str:
+    """按素材中的 A/B 俯视人物调度图,给视频 prompt 补一段集中职责声明。"""
+    if not image_items:
+        return ""
+
+    has_start = False
+    has_end = False
+    start_identities: List[str] = []
+    end_identities: List[str] = []
+    for item in image_items:
+        kind, name, meta = _topview_item_parts(item)
+        if kind != "topview_dispatch":
+            continue
+        role = str(meta.get("role") or "").lower()
+        if role == "start" or "调度图A" in name or "位置图A" in name or "开始" in name:
+            has_start = True
+            ident = _topview_identity_from_dispatch(meta.get("identity_binding") or meta.get("dispatch_text"))
+            if ident:
+                start_identities.append(ident)
+        if role == "end" or "调度图B" in name or "位置图B" in name or "结束" in name:
+            has_end = True
+            ident = _topview_identity_from_dispatch(meta.get("identity_binding") or meta.get("dispatch_text"))
+            if ident:
+                end_identities.append(ident)
+
+    if has_start and has_end:
+        lead = "人物调度:开始时人物位于俯视人物调度图A所示站位,结束时自然移动到俯视人物调度图B所示站位,移动过程连贯。"
+    elif has_end:
+        lead = "人物调度:结束时人物自然移动到俯视人物调度图B所示站位,移动过程连贯。"
+    elif has_start:
+        lead = "人物调度:开始时人物位于俯视人物调度图A所示站位,后续按分镜正文自然运动。"
+    else:
+        return ""
+    identity_lines = list(dict.fromkeys(end_identities or start_identities))
+    character_refs = _topview_character_ref_map(image_items, ref_at=ref_at)
+    color_identity_lines: List[str] = []
+    marker_ref_lines: List[str] = []
+    position_hint_lines: List[str] = []
+    seen_identities: set = set()
+    seen_marker_refs: set = set()
+    seen_positions: set = set()
+    for ident in identity_lines:
+        for marker, role_name in _topview_marker_pairs(ident):
+            identity_line = f"{marker}={role_name}"
+            if identity_line not in seen_identities:
+                seen_identities.add(identity_line)
+                color_identity_lines.append(identity_line)
+            ref = character_refs.get(_topview_binding_name_key(role_name))
+            if ref:
+                line = f"{marker}对应当前视频素材{ref}"
+                if line not in seen_marker_refs:
+                    seen_marker_refs.add(line)
+                    marker_ref_lines.append(line)
+        for hint in _topview_marker_position_hints(ident):
+            if hint not in seen_positions:
+                seen_positions.add(hint)
+                position_hint_lines.append(hint)
+    binding_text = ""
+    if identity_lines:
+        binding_text = (
+            (("颜色身份:" + "；".join(color_identity_lines) + "。") if color_identity_lines else "")
+            + (("角色素材对应:" + "；".join(marker_ref_lines) + "。") if marker_ref_lines else "")
+            + (("站位提示:" + "；".join(position_hint_lines) + "。") if position_hint_lines else "")
+            + "俯视参考仅用于读取目标人物身份、起始站位、结束站位与移动关系,并与对应人物素材图匹配;"
+            "正片始终按分镜规定的景别、机位和运镜呈现真实人物与真实场景。"
+        )
+    return (
+        lead +
+        "俯视人物调度图只用于读取人物和道具的位置关系,不代表正片画面视角;"
+        "视频全程按分镜正文的景别、机位和运镜正常拍摄。"
+        + binding_text
+    )
 
 
 async def _build_final_video_prompt(
@@ -338,6 +919,8 @@ async def _build_final_video_prompt(
     with_file_refs: bool = True,
     log_prefix: str = "video-gen",
     ref_at: bool = False,
+    separate_audio_order: bool = False,
+    provider_type: Optional[str] = None,
 ) -> str:
     """v3.61.181: 即梦 CLI / ark / cool / xinglian 4 路径共用的 final prompt 拼装
 
@@ -348,13 +931,18 @@ async def _build_final_video_prompt(
                                     (传 None 或空 → 不拼 file_refs 段)
         with_file_refs: cool 等已经在 payload 里独立传 files,但仍要在 prompt 里
                         告知模型"哪张图是谁",所以默认 True
+        separate_audio_order: 按调用方需要先列图片，再按实际上传顺序列音频
+        provider_type: 兼容现有各渠道调用；模板正文不再按渠道投影或过滤
         log_prefix: 日志前缀(各 provider 区分)
 
     流程:
         1) `_extract_start_state_from_prompt` + 4 分支校验取 start_state_text
-        2) `_strip_llm_metadata` 剥 🔗本节结尾 + 📏总时长 + 状态链元数据
+        2) `_strip_llm_metadata` 仅执行历史基础清理，不改写模板正文
         3) 拼装顺序: style_prefix → storyboard_style_prompt → start_state → file_refs → stripped prompt → style_suffix
         4) 完整 final_prompt log 出来
+
+    模板正文由模板自身负责约束；工具不投影、压缩或过滤固定11字段。
+    账本、审计、Cmin、V/E 等内容是否出现，完全由模板输出决定。
 
     返回:final_prompt 字符串
     """
@@ -432,16 +1020,24 @@ async def _build_final_video_prompt(
                 f"{len(cur_section_start_state)} 个激活角色"
             )
 
-    # 2) 剥 🔗 本节结尾 / 📏 本小节总时长 / 状态链元数据
+    # 2) 沿用历史基础清理，不对模板正文做结构化投影或字段过滤
     stripped = _strip_llm_metadata(raw_prompt)
+    if start_state_text:
+        stripped = _strip_inline_start_state_duplicate(stripped)
     logger.info(f"[{log_prefix}] 分镜 {storyboard_id} 裁剪后 prompt 长度: {len(stripped)}")
 
     # 3) file_refs(图片1 ... ; 图片2 ... ; ...) v3.61.157 用分号
     file_refs_text = ""
     if with_file_refs and (image_items or audio_items):
-        refs = _build_file_refs(image_items or [], audio_items or [], ref_at=ref_at)
+        refs = _build_file_refs(
+            image_items or [],
+            audio_items or [],
+            ref_at=ref_at,
+            separate_audio_order=separate_audio_order,
+        )
         if refs:
             file_refs_text = ";".join(refs)
+    topview_rule_text = _topview_dispatch_rule(image_items if with_file_refs else None, ref_at=ref_at)
 
     # 4) 拼装(完全跟即梦 CLI L2223-2248 对齐)
     parts: List[str] = []
@@ -455,6 +1051,9 @@ async def _build_final_video_prompt(
     if file_refs_text:
         parts.append(file_refs_text)
         parts.append("")  # 空行分隔
+    if topview_rule_text:
+        parts.append(topview_rule_text)
+        parts.append("")
     parts.append(stripped)
     if style_suffix:
         parts.append(style_suffix)
@@ -721,14 +1320,30 @@ async def _get_storyboard_video_duration(storyboard_id: int) -> Optional[int]:
     db = await get_db()
     try:
         cur = await db.execute(
-            "SELECT prompt, description FROM storyboards WHERE id = ?",
+            """
+            SELECT s.prompt, s.description,
+                   COALESCE(pt.model_family, 'seedance_2_0') AS model_family
+            FROM storyboards s
+            LEFT JOIN prompt_templates pt ON pt.id = s.template_id
+            WHERE s.id = ?
+            """,
             (storyboard_id,),
         )
         row = await cur.fetchone()
         if not row:
             return None
+        from services.video_model_capabilities import get_video_model_capabilities
+
+        max_duration_sec = int(
+            get_video_model_capabilities(row["model_family"])[
+                "max_duration_seconds"
+            ]
+        )
         for key in ("prompt", "description"):
-            dur = _extract_section_duration(row[key] or "")
+            dur = _extract_section_duration(
+                row[key] or "",
+                max_duration_sec=max_duration_sec,
+            )
             if dur is not None:
                 return dur
         return None
@@ -979,228 +1594,259 @@ async def _build_friendly_video_name(storyboard_id: int, original_ext: str = ".m
 
 def find_best_match(search_name: str, elements: list, element_type: str = 'scene') -> dict | None:
     """
-    三级匹配策略：精确名称 → 别名匹配 → 关键词匹配
+    全候选匹配：精确名称/核心名 → 精确别名 → 最长包含 → 关键词。
+
+    旧实现会在别名子串命中时立即返回，结果依赖数据库返回顺序。例如旧元素
+    "瑶华阁" 先于新元素 "瑶华阁湖心亭" 返回时，短别名会抢走
+    "内/外 瑶华阁湖心亭 夜"。这里先为所有候选评分，再统一选最高分，
+    从根上消除短名称抢占和输入顺序依赖。
+
     elements: list of sqlite3.Row or dict, 每个元素需要有 name 和 aliases 字段
     返回匹配到的元素或 None
     """
     if not search_name or not elements:
         logger.debug(f"[find_best_match] 提前返回: search_name={search_name}, elements数量={len(elements) if elements else 0}")
         return None
-    
-    # 规范化名称：去除尾部标点符号
-    normalized_name = search_name.strip()
-    while normalized_name and normalized_name[-1] in '。，.,:：；;、！!？? ':
-        normalized_name = normalized_name[:-1]
-    normalized_name = normalized_name.strip()
-    if not normalized_name:
+
+    trailing_punctuation = '。，.,:：；;、！!？? '
+
+    def _normalize_text(value: object) -> str:
+        text = str(value or '').strip()
+        while text and text[-1] in trailing_punctuation:
+            text = text[:-1]
+        return re.sub(r'\s+', ' ', text).strip().casefold()
+
+    def _scene_core_name(value: object) -> str:
+        """去掉镜头场景名外围信息，只保留可用于素材匹配的地点核心名。"""
+        core = _normalize_text(value)
+        if not core:
+            return ''
+        if ((core.startswith('【') and core.endswith('】'))
+                or (core.startswith('[') and core.endswith(']'))):
+            core = core[1:-1].strip()
+        if '。人物：' in core:
+            core = core.split('。人物：', 1)[0].strip()
+        # 分镜标题可能带“·题材·时长·情绪”，地点始终在第一个分段。
+        if '·' in core:
+            core = core.split('·', 1)[0].strip()
+        # “内/外”是混合场景标识；裸“内/外”仅在后面有空格时视为前缀，
+        # 避免误伤“内蒙古”“外滩”等真实地名。
+        core = re.sub(
+            r'^(?:(?:内\s*[/／]\s*外|外\s*[/／]\s*内)\s*|(?:内外|外内|内|外)\s+)',
+            '',
+            core,
+        ).strip()
+        # 时间标签只在与地点有分隔时剥离，不删除名称本身以“夜”等字结尾的场景。
+        core = re.sub(
+            r'\s+(?:时间未明|时间不明|时间未知|日|夜|昼|白天|夜晚|深夜|清晨|黎明|黄昏|傍晚)\s*$',
+            '',
+            core,
+        ).strip()
+        return _normalize_text(core)
+
+    def _core_name(value: object) -> str:
+        normalized = _normalize_text(value)
+        return _scene_core_name(normalized) if element_type == 'scene' else normalized
+
+    def _scene_space_kind(value: object) -> str:
+        """提取明确的室内/室外属性；混合场景和无标记场景返回空。"""
+        if element_type != 'scene':
+            return ''
+        normalized = _normalize_text(value)
+        if not normalized:
+            return ''
+        if ((normalized.startswith('【') and normalized.endswith('】'))
+                or (normalized.startswith('[') and normalized.endswith(']'))):
+            normalized = normalized[1:-1].strip()
+        if re.match(r'^(?:内\s*[/／]\s*外|外\s*[/／]\s*内|内外\s+|外内\s+)', normalized):
+            return ''
+        if re.match(r'^内\s+', normalized):
+            return 'interior'
+        if re.match(r'^外\s+', normalized):
+            return 'exterior'
+
+        core = _scene_core_name(normalized)
+        interior_tokens = ('内室', '室内', '内部', '房间', '卧室', '书房', '暗室', '密室')
+        exterior_tokens = ('外景', '室外', '院落', '庭院', '门外')
+        has_interior = any(token in core for token in interior_tokens)
+        has_exterior = any(token in core for token in exterior_tokens)
+        if has_interior != has_exterior:
+            return 'interior' if has_interior else 'exterior'
+        return ''
+
+    normalized_name = _normalize_text(search_name)
+    search_core = _core_name(search_name)
+    search_space_kind = _scene_space_kind(search_name)
+    if not normalized_name or not search_core:
         return None
-    
+
     # 预处理：将 sqlite3.Row 转为 dict，解析 aliases
     processed_elements = []
     for elem in elements:
         if hasattr(elem, 'keys'):
             elem_dict = dict(elem)
         else:
-            elem_dict = elem
-        
-        # 解析 aliases
+            elem_dict = dict(elem) if isinstance(elem, dict) else {}
+        if not elem_dict:
+            continue
+
         aliases_raw = elem_dict.get('aliases') or '[]'
         if isinstance(aliases_raw, str):
             try:
                 aliases = json.loads(aliases_raw) if aliases_raw else []
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 aliases = []
         else:
             aliases = aliases_raw if isinstance(aliases_raw, list) else []
-        
-        elem_dict['_aliases_list'] = aliases
+        elem_dict['_aliases_list'] = [
+            str(alias).strip()
+            for alias in aliases
+            if alias is not None and str(alias).strip()
+        ]
         processed_elements.append(elem_dict)
-    
-    def _is_hollow(elem: dict) -> bool:
-        """空壳元素:无成品图/生图/宫格图/音频(即没做任何素材)。
-        匹配优先级应让非空壳元素胜出,避免同名但空壳的记录劫持匹配结果。
 
-        v3.61.158 codex round4: 人物若设置了 active_variant_id,
-        说明用户已切到马甲 — 视为非空壳(马甲字段级 fallback 兜底,最差也等同 element body)。
-        """
-        if elem.get('element_type') == 'character' and elem.get('active_variant_id'):
+    def _is_hollow(elem: dict) -> bool:
+        """素材完整度只用于同分候选，不能覆盖更精确的语义匹配。"""
+        if element_type == 'character' and elem.get('active_variant_id'):
             return False
         return not (
             elem.get('finished_image')
             or elem.get('image_url')
+            or elem.get('reference_image')
             or elem.get('grid_image')
+            or elem.get('panorama_url')
             or elem.get('audio_file')
+            or elem.get('volc_asset_uri')
         )
 
-    # 第一级：精确匹配名称（使用规范化后的名称）
-    hollow_exact_match = None  # 记录空壳的精确匹配,作为最后 fallback
-    for elem in processed_elements:
-        elem_name = elem.get('name', '').strip()
-        # 也对元素名称做规范化处理
-        while elem_name and elem_name[-1] in '。，.,:：；;、！!？? ':
-            elem_name = elem_name[:-1]
-        elem_name = elem_name.strip()
-        if elem_name == normalized_name:
-            if _is_hollow(elem):
-                # 空壳先存着,继续看有没有别的非空壳能匹配
-                if hollow_exact_match is None:
-                    hollow_exact_match = elem
-                continue
-            return elem
-    
-    # 第一级补充：核心名精确匹配（场景类型）
-    # 处理分镜场景名如 "内 别墅书房内部 日" 与元素名 "别墅书房内部" 的匹配
-    if element_type == 'scene':
-        def extract_core_name_for_match(name: str) -> str:
-            """提取核心名称：去除前后缀（用于场景匹配）"""
-            if not name:
-                return name
-            core = name.strip()
-            # 去除前缀 "外 " 或 "内 "
-            if core.startswith('外 ') or core.startswith('内 '):
-                core = core[2:]
-            # 去除时间后缀 " 日" 或 " 夜"
-            if core.endswith(' 日') or core.endswith(' 夜'):
-                core = core[:-2]
-            # 去除 "。人物：xxx" 这类后缀
-            if '。人物：' in core:
-                core = core.split('。人物：')[0]
-            return core.strip()
-        
-        search_core = extract_core_name_for_match(normalized_name)
-        for elem in processed_elements:
-            elem_core = extract_core_name_for_match(elem.get('name', ''))
-            if elem_core and elem_core == search_core:
-                logger.debug(f"[find_best_match] 核心名匹配成功: '{search_core}' -> '{elem.get('name')}'")
-                return elem
-    
-    # 第二级：别名精确匹配（使用规范化后的名称和提取的核心名）
-    # 先定义提取核心名的函数（用于场景）
-    def _extract_core_for_alias(name: str) -> str:
-        """提取核心名称：去除前后缀（仅场景需要）"""
-        if not name:
-            return name
-        core = name.strip()
-        # 去除前缀 "外 " 或 "内 "
-        if core.startswith('外 ') or core.startswith('内 '):
-            core = core[2:]
-        # 去除时间后缀 " 日" 或 " 夜"
-        if core.endswith(' 日') or core.endswith(' 夜'):
-            core = core[:-2]
-        # 去除 "。人物：xxx" 这类后缀
-        if '。人物：' in core:
-            core = core.split('。人物：')[0]
-        return core.strip()
-    
-    for elem in processed_elements:
-        aliases = elem.get('_aliases_list', [])
-        # 对别名也做规范化处理
-        normalized_aliases = []
-        for alias in aliases:
-            alias = alias.strip()
-            while alias and alias[-1] in '。，.,:：；;、！!？? ':
-                alias = alias[:-1]
-            alias = alias.strip()
-            if alias:
-                normalized_aliases.append(alias)
-        
-        # 别名匹配策略：
-        # a. 别名 == 原始分镜名（标准化后）
-        # b. 别名 == extract_core_name(分镜名)  ← 场景使用
-        # c. 分镜名包含别名（模糊包含匹配）
-        matched = False
-        
-        # a. 原始名称匹配
-        if normalized_name in normalized_aliases:
-            matched = True
-            logger.debug(f"[find_best_match] 别名匹配成功(原始名): '{normalized_name}' -> '{elem.get('name')}'")
-        
-        # b. 核心名匹配（场景类型）
-        if not matched and element_type == 'scene':
-            core_name_for_alias = _extract_core_for_alias(normalized_name)
-            if core_name_for_alias and core_name_for_alias in normalized_aliases:
-                matched = True
-                logger.debug(f"[find_best_match] 别名匹配成功(核心名): '{core_name_for_alias}' -> '{elem.get('name')}' (aliases={normalized_aliases})")
-        
-        # c. 模糊包含匹配（别名被包含在分镜名中）
-        if not matched:
-            for alias in normalized_aliases:
-                if alias and len(alias) >= 2 and alias in normalized_name:
-                    matched = True
-                    logger.debug(f"[find_best_match] 别名匹配成功(包含): '{alias}' in '{normalized_name}' -> '{elem.get('name')}'")
-                    break
-        
-        if matched:
-            # 别名匹配到空壳时,记录但继续找更好的
-            if _is_hollow(elem):
-                if hollow_exact_match is None:
-                    hollow_exact_match = elem
-                continue
-            return elem
+    def _compact_len(value: str) -> int:
+        return len(re.sub(r'\s+', '', value or ''))
 
-    # 如果第一/二级只匹配到了空壳,且下面关键词匹配也没别的选择,先返回空壳
-    # (这里不能直接返回,需要走完第三级关键词匹配看有没有非空壳命中)
-    # 第三级：关键词匹配
-    def extract_core_name(name: str) -> str:
-        """提取核心名称：去除前后缀（仅场景需要）"""
-        if not name:
-            return name
-        core = name.strip()
-        # 去除前缀 "外 " 或 "内 "
-        if core.startswith('外 ') or core.startswith('内 '):
-            core = core[2:]
-        # 去除时间后缀 " 日" 或 " 夜"
-        if core.endswith(' 日') or core.endswith(' 夜'):
-            core = core[:-2]
-        # 去除 "。人物：xxx" 这类后缀
-        if '。人物：' in core:
-            core = core.split('。人物：')[0]
-        return core.strip()
-    
-    def extract_keywords(text: str) -> set:
-        """提取关键词集合：滑动窗口取2-3字的词组"""
-        if not text:
-            return set()
-        text = text.strip()
-        keywords = set()
-        n = len(text)
-        for i in range(n):
-            # 取2字窗口
-            if i < n - 1:
-                keywords.add(text[i:i+2])
-            # 取3字窗口
-            if i < n - 2:
-                keywords.add(text[i:i+3])
-        return keywords
-    
-    core_name = extract_core_name(normalized_name) if element_type == 'scene' else normalized_name
-    search_keywords = extract_keywords(core_name)
-    
-    # 统计每个元素匹配的关键词数量，取最高分者
+    def _keywords(value: str) -> set[str]:
+        compact = re.sub(r'\s+', '', value or '')
+        result: set[str] = set()
+        for index in range(len(compact)):
+            if index + 2 <= len(compact):
+                result.add(compact[index:index + 2])
+            if index + 3 <= len(compact):
+                result.add(compact[index:index + 3])
+        return result
+
+    search_keywords = _keywords(search_core)
+
+    def _score_label(label: str, *, is_alias: bool) -> tuple[tuple[int, ...], str] | None:
+        label_normalized = _normalize_text(label)
+        label_core = _core_name(label)
+        if not label_normalized or not label_core:
+            return None
+
+        source_bonus = 0 if is_alias else 1
+        raw_len = _compact_len(label_normalized)
+        core_len = _compact_len(label_core)
+        search_len = _compact_len(search_core)
+
+        if label_normalized == normalized_name:
+            tier = 480 if is_alias else 500
+            return (tier, 1, raw_len, 1000, source_bonus, 0), '别名精确' if is_alias else '名称精确'
+        if label_core == search_core:
+            tier = 470 if is_alias else 490
+            return (tier, 1, core_len, 1000, source_bonus, 0), '别名核心精确' if is_alias else '名称核心精确'
+
+        label_space_kind = _scene_space_kind(label)
+        if search_space_kind and label_space_kind and search_space_kind != label_space_kind:
+            return None
+        space_compatibility = int(
+            bool(search_space_kind) and search_space_kind == label_space_kind
+        )
+
+        if min(search_len, core_len) >= 2 and (label_core in search_core or search_core in label_core):
+            matched_len = min(search_len, core_len)
+            coverage = int(1000 * matched_len / max(search_len, core_len))
+            length_delta = abs(search_len - core_len)
+            return (
+                300, space_compatibility, matched_len, coverage, source_bonus, -length_delta
+            ), '最长包含'
+
+        label_keywords = _keywords(label_core)
+        common_count = len(search_keywords & label_keywords)
+        if common_count >= 3:
+            coverage = int(
+                1000 * common_count / max(len(search_keywords), len(label_keywords), 1)
+            )
+            length_delta = abs(search_len - core_len)
+            return (
+                100, space_compatibility, common_count, coverage, source_bonus, -length_delta
+            ), '关键词'
+        return None
+
     best_match = None
-    best_score = 0
-    
+    best_score = None
+    best_reason = ''
+    best_label = ''
+
     for elem in processed_elements:
-        # 收集该元素的所有名称：元素名 + 别名
-        all_names = [elem.get('name', '')] + elem.get('_aliases_list', [])
-        for name in all_names:
-            elem_core = extract_core_name(name) if element_type == 'scene' else name
-            elem_keywords = extract_keywords(elem_core)
-            common_keywords = search_keywords & elem_keywords
-            if len(common_keywords) >= 3 and len(common_keywords) > best_score:
-                best_score = len(common_keywords)
-                best_match = elem
-    
+        labels = [(elem.get('name') or '', False)]
+        labels.extend((alias, True) for alias in elem.get('_aliases_list', []))
+        seen_labels = set()
+        elem_label_score = None
+        elem_reason = ''
+        elem_label = ''
+
+        for label, is_alias in labels:
+            label_key = (_normalize_text(label), is_alias)
+            if not label_key[0] or label_key in seen_labels:
+                continue
+            seen_labels.add(label_key)
+            scored = _score_label(label, is_alias=is_alias)
+            if not scored:
+                continue
+            label_score, reason = scored
+            if elem_label_score is None or label_score > elem_label_score:
+                elem_label_score = label_score
+                elem_reason = reason
+                elem_label = str(label)
+
+        if elem_label_score is None:
+            continue
+
+        try:
+            elem_id = int(elem.get('id') or 0)
+        except (TypeError, ValueError):
+            elem_id = 0
+        # 语义评分永远排在素材完整度之前；同分时才优先有素材、较新的记录。
+        score = elem_label_score + (
+            0 if _is_hollow(elem) else 1,
+            elem_id,
+            _normalize_text(elem.get('name')),
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_match = elem
+            best_reason = elem_reason
+            best_label = elem_label
+
+    if best_match:
+        logger.debug(
+            "[find_best_match] '%s' -> '%s' id=%s via=%s label='%s' score=%s",
+            search_name,
+            best_match.get('name'),
+            best_match.get('id'),
+            best_reason,
+            best_label,
+            best_score,
+        )
     return best_match
 
 
 class JimengParams(BaseModel):
     """即梦生成参数 - 前端直接发送, 不再依赖预存 video_config"""
-    model_version: str       # seedance2.0 / seedance2.0_vip / seedance2.0fast / seedance2.0fast_vip / seedance1.5pro
+    model_version: str       # seedance2.0 / seedance2.0_vip / seedance2.0fast / seedance2.0fast_vip / seedance2.0mini
     generation_mode: str     # text2video / image2video / multimodal2video
     ratio: str               # 16:9 / 9:16 / 1:1 / 4:3 / 3:4
     resolution: str          # 480P / 720P / 1080P
     duration: int            # 秒
+    # 活动辅助参数：开启后，每次即梦 CLI 提交额外附带一段本地缓存的2秒纯黑参考视频。
+    include_black_video: bool = False
 
     # v3.61.120: 兼容前端可能传 float / str ("15" / 15.0) 的情况
     # el-input-number 失焦偶尔变 float;localStorage 反序列化某些情况下变 string
@@ -1247,8 +1893,50 @@ class BatchVideoGenerateRequest(BaseModel):
     chain_frame_desc: Optional[str] = None
 
 
+class VideoPromptExportItem(BaseModel):
+    """A storyboard prompt exactly as the video page would submit it."""
+
+    storyboard_id: int
+    prompt: str = ""
+
+
+class VideoPromptExportRequest(BaseModel):
+    """Build channel-ready prompt text without exposing the provider JSON payload."""
+
+    items: List[VideoPromptExportItem]
+    provider: str = "jimeng"
+    use_chain_frame: bool = False
+    chain_frame_desc: Optional[str] = None
+    generation_mode: str = "multimodal2video"
+    model_version: Optional[str] = None
+
+    @field_validator("items")
+    @classmethod
+    def _validate_items(cls, value):
+        if not value:
+            raise ValueError("请至少选择一个分镜")
+        if len(value) > 500:
+            raise ValueError("一次最多导出 500 个分镜")
+        ids = [item.storyboard_id for item in value]
+        if len(ids) != len(set(ids)):
+            raise ValueError("导出分镜中存在重复项")
+        return value
+
+    @field_validator("provider")
+    @classmethod
+    def _validate_provider(cls, value):
+        provider = str(value or "").strip().lower()
+        if provider not in {"jimeng", "pippit", "minimax", "ark", "cool", "xinglian"}:
+            raise ValueError(f"不支持的导出渠道: {value}")
+        return provider
+
+
 # 串行尾帧默认描述(前端预填用,后端兜底)
 DEFAULT_CHAIN_FRAME_DESC = "此图为上一视频的尾帧参考图,本镜从此画面故事的延续,保持场景与角色一致,不重新诠释画风/材质"
+DEFAULT_TOPVIEW_START_PROMPT = "俯视人物调度图A:本镜开始时的人物站位与颜色框"
+DEFAULT_TOPVIEW_END_PROMPT = "俯视人物调度图B:本镜结束时的人物站位与颜色框"
+TOPVIEW_START_LABEL = DEFAULT_TOPVIEW_START_PROMPT
+TOPVIEW_END_LABEL = DEFAULT_TOPVIEW_END_PROMPT
 
 
 def _translate_jimeng_fail_reason(raw: str, guidance: str = "") -> str:
@@ -1279,10 +1967,29 @@ def _translate_jimeng_fail_reason(raw: str, guidance: str = "") -> str:
             "  2) 长期想多跑:把生成模式从「并发」切到「串行尾帧」(顶部开关) — 一个完成才发下一个,不会撞并发\n"
             "(这是即梦平台的限制,不是工具问题)"
         )
+    elif "post-tns" in low or "tns check" in low or "tns" in low:
+        msg = (
+            "即梦生成后的内容安全审核未通过(post-TNS),不是本地 CLI 调用失败。\n"
+            "通常是画面、台词、音频或参考素材触发平台后置审核。建议弱化敏感词/暴力色情/未成年/真人脸风险,或换参考图后重试；"
+            "也可以到即梦官网(jimeng.jianying.com)查看更细的审核反馈。"
+        )
     elif "generation failed" in low or "final generation failed" in low:
         msg = (
             "视频生成失败,通常是即梦内容审核未通过(画面/音频/台词可能含不适当内容)。\n"
             "建议:1) 修改提示词或台词后重试  2) 前往即梦官网(jimeng.jianying.com)查看具体审核反馈"
+        )
+    elif (
+        "upload resource" in low
+        or "upload image" in low
+        or "upload audio" in low
+        or "no file upload" in low
+        or "upload phase" in low
+    ):
+        msg = (
+            "即梦素材上传失败,任务没有真正进入生成队列。\n"
+            "这通常表示素材在上传阶段没有被即梦接收,不等同于账号积分或 4000 分限制。\n"
+            "建议先减少参考素材数量,去掉非必要的人物/道具/场景图；再检查参考图/音频文件是否存在、能否正常打开、路径是否含特殊权限限制,然后重新生成。\n"
+            f"原始错误:{raw[:200]}"
         )
     elif "aigccompliance" in low or "compliance" in low or "violat" in low:
         msg = "内容安全审核未通过(可能含敏感内容),请修改提示词或素材后重试"
@@ -1298,6 +2005,18 @@ def _translate_jimeng_fail_reason(raw: str, guidance: str = "") -> str:
         )
     elif "timeout" in low or "超时" in raw:
         msg = "即梦服务响应超时,请稍后重试"
+    elif (
+        "current account is not allowed to use dreamina_cli" in low
+        or "not allowed to use dreamina_cli" in low
+        or ("dreamina_cli" in low and "permission denied" in low)
+        or "未开通即梦 cli 生成权限" in low
+    ):
+        msg = (
+            "当前即梦账号已完成网页授权，但即梦平台未给该账号开放 CLI 视频生成权限。\n"
+            "网页显示高级会员或有会员积分，不等于 dreamina_cli 权限已经开通。\n"
+            "请点页面顶部「切换账号」，在独立登录窗口中换一个已开放 CLI 权限的账号；"
+            "若确认该账号本应可用，请联系即梦官方核查账号权限。"
+        )
     elif "credit" in low or "balance" in low or "余额" in raw or "积分" in raw:
         msg = "即梦余额不足,请到即梦充值后重试"
     elif "param" in low or "参数" in raw:
@@ -1311,6 +2030,12 @@ def _translate_jimeng_fail_reason(raw: str, guidance: str = "") -> str:
     if guidance:
         msg += f"\n👉 即梦建议:{guidance}"
     return msg
+
+
+def _normalize_chain_scene_name(value: Any) -> str:
+    """接尾帧用的物理场景名归一化,忽略拆分产生的「(续2)」后缀。"""
+    text = str(value or "").strip()
+    return re.sub(r"\s*[\(（]\s*续\s*\d*\s*[\)）]\s*$", "", text).strip()
 
 
 async def find_chainable_prev_frame(storyboard_id: int) -> Optional[dict]:
@@ -1419,8 +2144,14 @@ async def find_chainable_prev_frame(storyboard_id: int) -> Optional[dict]:
                 prev_scenes = json.loads(prev["scenes"] or "[]")
             except Exception:
                 prev_scenes = []
-            # 跨节但同物理场景(剧本拆分)— scenes[0] 是完整场景描述
-            if prev_scenes and cur_scenes and prev_scenes[0] == cur_scenes[0]:
+            # 跨节但同物理场景(剧本拆分)— scenes[0] 是完整场景描述。
+            # 分镜拆分会把同一物理场景标成「外 陈州祭台 日 (续2)」这类续场景,
+            # 接尾帧时应按去掉续集后缀后的场景名比较。
+            if (
+                prev_scenes
+                and cur_scenes
+                and _normalize_chain_scene_name(prev_scenes[0]) == _normalize_chain_scene_name(cur_scenes[0])
+            ):
                 connectable = True
         if not connectable:
             return None
@@ -1465,6 +2196,94 @@ async def find_chainable_prev_frame(storyboard_id: int) -> Optional[dict]:
         await db.close()
 
 
+async def find_chainable_prev_topview(storyboard_id: int) -> Optional[dict]:
+    """寻找当前镜可接的上一小节结尾俯视调度图。
+
+    和尾帧不同,俯视链不要求上一镜视频已完成,只要求紧邻上一小节已生成
+    topview_image,且仍在同一物理场景内。跨场景直接断链。
+    """
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT id, novel_id, script_id, sort_order, section_number, scene_index, scene_type, scenes "
+            "FROM storyboards WHERE id = ?",
+            (storyboard_id,),
+        )
+        cur = await cursor.fetchone()
+        if not cur:
+            return None
+        try:
+            cur_scenes = json.loads(cur["scenes"] or "[]")
+        except Exception:
+            cur_scenes = []
+        cur_scene_type = (cur["scene_type"] if "scene_type" in cur.keys() else None) or "normal"
+        cur_scene_idx = cur["scene_index"] if "scene_index" in cur.keys() else None
+
+        if cur_scene_idx is None:
+            cursor = await db.execute(
+                "SELECT id, sort_order, section_number, scene_index, scene_type, scenes, topview_image, topview_prompt, topview_dispatch_text "
+                "FROM storyboards "
+                "WHERE novel_id = ? AND script_id IS ? AND sort_order < ? "
+                "  AND COALESCE(scene_type, 'normal') = ? "
+                "ORDER BY sort_order DESC LIMIT 1",
+                (cur["novel_id"], cur["script_id"], cur["sort_order"], cur_scene_type),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT id, sort_order, section_number, scene_index, scene_type, scenes, topview_image, topview_prompt, topview_dispatch_text "
+                "FROM storyboards "
+                "WHERE novel_id = ? AND script_id IS ? AND scene_index IS NOT NULL "
+                "  AND ("
+                "    scene_index < ?"
+                "    OR (scene_index = ? AND section_number < ?)"
+                "    OR (scene_index = ? AND section_number = ? AND sort_order < ?)"
+                "  ) "
+                "  AND COALESCE(scene_type, 'normal') = ? "
+                "ORDER BY scene_index DESC, section_number DESC, sort_order DESC LIMIT 1",
+                (
+                    cur["novel_id"], cur["script_id"],
+                    cur_scene_idx,
+                    cur_scene_idx, cur["section_number"],
+                    cur_scene_idx, cur["section_number"], cur["sort_order"],
+                    cur_scene_type,
+                ),
+            )
+        prev = await cursor.fetchone()
+        if not prev or not prev["topview_image"]:
+            return None
+
+        prev_scene_idx = prev["scene_index"] if "scene_index" in prev.keys() else None
+        connectable = prev_scene_idx is not None and cur_scene_idx is not None and prev_scene_idx == cur_scene_idx
+        if not connectable:
+            try:
+                prev_scenes = json.loads(prev["scenes"] or "[]")
+            except Exception:
+                prev_scenes = []
+            connectable = bool(
+                prev_scenes
+                and cur_scenes
+                and _normalize_chain_scene_name(prev_scenes[0]) == _normalize_chain_scene_name(cur_scenes[0])
+            )
+        if not connectable:
+            return None
+
+        abs_path = resolve_db_path(prev["topview_image"])
+        if not abs_path or not os.path.exists(abs_path):
+            logger.info("[topview-chain] 当前镜 %s 上一镜 %s 有 topview 但文件不存在:%s", storyboard_id, prev["id"], abs_path)
+            return None
+        return {
+            "storyboard_id": prev["id"],
+            "scene_index": prev_scene_idx,
+            "section_number": prev["section_number"],
+            "image_path": prev["topview_image"],
+            "abs_path": abs_path,
+            "topview_prompt": prev["topview_prompt"],
+            "dispatch_text": prev["topview_dispatch_text"] if "topview_dispatch_text" in prev.keys() else None,
+        }
+    finally:
+        await db.close()
+
+
 @router.get("/active-tasks")
 async def list_active_video_tasks():
     """v3.61.23: 跨章节、跨小说扫一遍 storyboards,返回所有"真正还在跑"的分镜
@@ -1473,7 +2292,8 @@ async def list_active_video_tasks():
     过滤规则(跟 /generate 的 30 分钟去重窗口对齐):
       - generating + submit_time 在 30 分钟内 → 算活动(用户可能正在跑)
       - generating + submit_time 超过 30 分钟 → 视为僵尸,不挡(避免老 session 残留永久封锁按钮)
-      - queued → 全算活动(串行批次中等待轮到自己的镜)
+      - queued → 30 分钟内的等待任务算活动;或同一剧本内有近期 generating 时算活动
+                  老崩溃残留 queued 超过 30 分钟后不挡按钮
     """
     from utils.timezone import now_beijing_str
     now_str = now_beijing_str()
@@ -1481,6 +2301,14 @@ async def list_active_video_tasks():
     try:
         cursor = await db.execute(
             """
+            WITH recent_generating AS (
+              SELECT id, script_id
+              FROM storyboards
+              WHERE video_status = 'generating'
+                AND video_submit_time IS NOT NULL
+                AND datetime(replace(video_submit_time, ' ', 'T'))
+                    > datetime(replace(?, ' ', 'T'), '-30 minutes')
+            )
             SELECT s.id, s.video_status, s.scene_index, s.section_number, s.sort_order,
                    s.video_submit_time, s.script_id, scr.chapter_id,
                    ch.title AS chapter_title, ch.novel_id, n.name AS novel_name
@@ -1489,17 +2317,27 @@ async def list_active_video_tasks():
             LEFT JOIN chapters ch ON scr.chapter_id = ch.id
             LEFT JOIN novels n ON ch.novel_id = n.id
             WHERE
-              s.video_status = 'queued'
+              s.id IN (SELECT id FROM recent_generating)
               OR (
-                s.video_status = 'generating'
-                AND s.video_submit_time IS NOT NULL
-                AND datetime(replace(s.video_submit_time, ' ', 'T'))
-                    > datetime(replace(?, ' ', 'T'), '-30 minutes')
+                s.video_status = 'queued'
+                AND (
+                  (
+                    s.video_submit_time IS NOT NULL
+                    AND datetime(replace(s.video_submit_time, ' ', 'T'))
+                        > datetime(replace(?, ' ', 'T'), '-30 minutes')
+                  )
+                  OR EXISTS (
+                    SELECT 1
+                    FROM recent_generating rg
+                    WHERE rg.script_id = s.script_id
+                       OR (rg.script_id IS NULL AND s.script_id IS NULL)
+                  )
+                )
               )
             ORDER BY s.video_submit_time DESC, s.id ASC
             LIMIT 50
             """,
-            (now_str,),
+            (now_str, now_str),
         )
         rows = await cursor.fetchall()
         items = []
@@ -1527,20 +2365,42 @@ async def list_active_video_tasks():
 
 
 @router.post("/check-login")
-async def check_login():
+async def check_login(force: bool = False):
     """检查即梦CLI登录状态和余额"""
-    result = await video_service.check_login()
+    result = await video_service.check_login(force=force)
     
     # 解析结果，转换为前端期望的格式
     if result.get("success"):
         data = result.get("data", {})
-        # dreamina user_credit 返回的格式: {"vip_credit": 6194, "gift_credit": 0, "purchase_credit": 0, "total_credit": 6194}
-        if isinstance(data, dict) and "total_credit" in data:
+        if isinstance(data, dict) and data.get("_identity_unverified"):
             return {
                 "success": True,
                 "logged_in": True,
-                "balance": data.get("total_credit", 0),
-                "message": f"已登录，余额: {data.get('total_credit', 0)}"
+                "balance": 0,
+                "cli_permission": "unknown",
+                "can_generate": True,
+                "identity_unverified": True,
+                "message": data.get("_identity_unverified_message")
+                or "网页授权完成，但 CLI 未取得账号身份，真实余额未知；可尝试提交生成",
+            }
+        # dreamina user_credit 返回的格式: {"vip_credit": 6194, "gift_credit": 0, "purchase_credit": 0, "total_credit": 6194}
+        if isinstance(data, dict) and "total_credit" in data:
+            cli_permission = str(data.get("_cli_permission") or "available")
+            permission_message = str(data.get("_cli_permission_message") or "")
+            balance = data.get("total_credit", 0)
+            if cli_permission == "denied":
+                message = permission_message or "已授权，但当前账号没有即梦 CLI 生成权限"
+            elif cli_permission == "unknown":
+                message = permission_message or "已授权，CLI 余额为 0，生成权限待验证"
+            else:
+                message = f"已登录，余额: {balance}"
+            return {
+                "success": True,
+                "logged_in": True,
+                "balance": balance,
+                "cli_permission": cli_permission,
+                "can_generate": cli_permission != "denied",
+                "message": message,
             }
         else:
             # 如果返回格式不符合预期，可能是未登录
@@ -1551,16 +2411,30 @@ async def check_login():
                 "message": "未登录或登录已过期"
             }
     else:
-        # 命令执行失败，可能未登录或CLI未安装
+        # 命令执行失败不等同于退出登录。只有 CLI 明确返回登录失效时才确认
+        # logged_in=False；超时、锁等待、进程异常等瞬态错误交给前端保留
+        # 最近一次已确认状态，避免路由切换时闪成“未登录”。
         error_msg = result.get("error", "检查登录状态失败")
-        # 将 CLI 原始报错转为友好提示
-        if "dreamina login" in error_msg or "未检测到有效登录" in error_msg:
-            error_msg = "未登录，请点击上方“登录即梦”按钮进行授权"
+        error_text = str(error_msg or "")
+        error_lower = error_text.lower()
+        confirmed_logged_out = (
+            "dreamina login" in error_lower
+            or "未检测到有效登录" in error_text
+            or "请先登录" in error_text
+        )
+        if confirmed_logged_out:
+            error_text = "未登录，请点击上方“登录即梦”按钮进行授权"
+            return {
+                "success": True,
+                "logged_in": False,
+                "balance": 0,
+                "message": error_text,
+            }
         return {
-            "success": True,
+            "success": False,
             "logged_in": False,
-            "balance": 0,
-            "message": error_msg
+            "transient": True,
+            "message": error_text,
         }
 
 
@@ -1578,6 +2452,88 @@ async def relogin_jimeng():
     return result
 
 
+# v3.61.6 火山方舟单条提交(非队列路径)— 跟 /generate 对等,但走 VolcengineArkProvider
+class ArkSubmitRequest(BaseModel):
+    storyboard_id: int
+    prompt: str
+    config_id: int  # 火山方舟视频配置 id (云端 llm_configs)
+    params: Optional[dict] = None
+    use_chain_frame: bool = False  # v3.61.12: 串行尾帧
+    # v3.61.107: 企业自持 APIKey(可选,明文,用完即丢)
+    # 前端从 safeStorage 解密后塞过来,后端用它覆盖云端 cloud_cfg["apiKey"]
+    # 留空 → 降级用云端 APIKey
+    local_api_key: Optional[str] = None
+    # New API 仅接受公网 URL。桌面端通过受控 OSS 临时上传完成后把 URL
+    # 透传到这里；未传时 provider 会明确说明哪些本地素材尚未发布。
+    uploaded_images: Optional[List[str]] = None
+    uploaded_audios: Optional[List[str]] = None
+    uploaded_videos: Optional[List[str]] = None
+    first_frame_url: Optional[str] = None
+    last_frame_url: Optional[str] = None
+
+
+class NewApiPrepareAssetsRequest(BaseModel):
+    storyboard_id: int
+    config_id: int
+    use_chain_frame: bool = False
+
+
+def _newapi_upload_asset(value: str, kind: str) -> Dict[str, str]:
+    source = str(value or "").strip()
+    if source.startswith(("http://", "https://")):
+        return {"url": source, "kind": kind}
+    path = resolve_db_path(source) if source.startswith("/data/") else os.path.abspath(source)
+    if not os.path.isfile(path):
+        return {"error": f"找不到{kind}素材文件: {source}", "kind": kind}
+    mime_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    return {"path": path, "kind": kind, "mime_type": mime_type}
+
+
+@router.post("/newapi/prepare-assets")
+async def prepare_newapi_assets(request: NewApiPrepareAssetsRequest):
+    """Return local storyboard asset metadata only when this is a New API config.
+
+    The Electron main process consumes the returned local paths and uploads the
+    bytes directly to OSS through its authenticated IPC bridge.  This FastAPI
+    process never receives account cookies or OSS credentials.
+    """
+    try:
+        from services.llm_service import LLMService
+        # Negative ids are desktop-only official capability markers.  They
+        # contain no endpoint/key but use the same signed OSS upload bridge as
+        # NewAPI, so raw local paths never leave the desktop process.
+        official_video = int(request.config_id) in {-900004, -900005}
+        config = await LLMService.get_by_id(request.config_id, local_only=True) if not official_video else None
+        if not official_video and (not config or config.get("config_type") != "video"):
+            return {"active": False}
+        normalized = {
+            "baseUrl": config.get("base_url"), "modelName": config.get("model_name"),
+            "providerCode": config.get("provider_code"), "name": config.get("name"),
+        } if config else {"providerCode": "newapi"}
+        if not official_video and _infer_cloud_provider(normalized) != "newapi":
+            return {"active": False}
+        images, audios, _, _ = await _collect_storyboard_assets_for_ark(
+            request.storyboard_id,
+            use_chain_frame=request.use_chain_frame,
+            provider_type="newapi",
+        )
+        prepared_images = [_newapi_upload_asset(item, "image") for item in images]
+        prepared_audios = [_newapi_upload_asset(item, "audio") for item in audios]
+        failures = [item["error"] for item in prepared_images + prepared_audios if item.get("error")]
+        if failures:
+            return {"active": True, "success": False, "message": "；".join(failures[:3])}
+        return {
+            "active": True,
+            "success": True,
+            "images": prepared_images,
+            "audios": prepared_audios,
+            "videos": [],
+        }
+    except Exception as exc:
+        logger.exception(f"[newapi/prepare-assets] sb={request.storyboard_id} 失败: {exc}")
+        return {"active": True, "success": False, "message": f"准备 New API 素材失败: {type(exc).__name__}: {exc}"}
+
+
 class PippitSubmitRequest(BaseModel):
     storyboard_id: int
     prompt: str
@@ -1587,6 +2543,18 @@ class PippitSubmitRequest(BaseModel):
 
 class PippitConfigSaveRequest(BaseModel):
     access_key: str = ""
+
+
+class MiniMaxSubmitRequest(BaseModel):
+    storyboard_id: int
+    prompt: str
+    params: Optional[dict] = None
+    # H3 的 r2va 不能混 first_frame/last_frame；开启后上一镜尾帧仅作为 reference_image。
+    use_chain_frame: bool = False
+
+
+class MiniMaxConfigSaveRequest(BaseModel):
+    api_key: str = ""
 
 
 @router.get("/pippit/config")
@@ -1607,6 +2575,10 @@ async def get_pippit_config():
 async def save_pippit_config(req: PippitConfigSaveRequest):
     access_key = (req.access_key or "").strip()
     await _set_app_setting(PIPPIT_ACCESS_KEY_SETTING, access_key)
+    logger.info(
+        "[pippit/config] access_key=%s",
+        "configured" if access_key else "cleared",
+    )
     return {
         "success": True,
         "message": "小云雀 Access Key 已保存" if access_key else "小云雀 Access Key 已清空",
@@ -1623,103 +2595,68 @@ async def check_pippit_cli():
 
     provider = get_provider("pippit_cli", await _pippit_provider_config())
     result = await provider.check_login()
-    access_key = await _get_pippit_access_key()
+    has_key = bool(await _get_pippit_access_key())
     return {
         "success": bool(result.get("success")),
         "message": result.get("message") or result.get("error") or "",
         "cli_found": bool(result.get("cli_found")),
         "logged_in": bool(result.get("logged_in")),
-        "has_access_key": bool(access_key),
-        "access_key_masked": _mask_secret(access_key),
+        "has_access_key": has_key,
+        "access_key_masked": _mask_secret(await _get_pippit_access_key()),
     }
 
 
-@router.post("/pippit/submit")
-async def pippit_submit(request: PippitSubmitRequest):
-    """小云雀 CLI 单条提交，按统一 provider 轮询。"""
+@router.get("/minimax/config")
+async def get_minimax_config():
+    env_key = _env_minimax_api_key()
+    local_key = (await _get_app_setting(MINIMAX_API_KEY_SETTING)).strip()
+    active_key = env_key or local_key
+    return {
+        "success": True,
+        "has_api_key": bool(active_key),
+        "has_env_api_key": bool(env_key),
+        "has_local_api_key": bool(local_key),
+        "api_key_masked": _mask_secret(active_key),
+        "model": "MiniMax-H3",
+        "resolution": "2K",
+    }
+
+
+@router.post("/minimax/config")
+async def save_minimax_config(req: MiniMaxConfigSaveRequest):
+    api_key = (req.api_key or "").strip()
+    await _set_app_setting(MINIMAX_API_KEY_SETTING, api_key)
+    logger.info("[minimax/config] api_key=%s", "configured" if api_key else "cleared")
+    active_key = _env_minimax_api_key() or api_key
+    return {
+        "success": True,
+        "message": "MiniMax API Key 已保存" if api_key else "MiniMax API Key 已清空",
+        "has_api_key": bool(active_key),
+        "has_env_api_key": bool(_env_minimax_api_key()),
+        "has_local_api_key": bool(api_key),
+        "api_key_masked": _mask_secret(active_key),
+        "model": "MiniMax-H3",
+        "resolution": "2K",
+    }
+
+
+@router.post("/minimax/check")
+async def check_minimax_config():
+    """只检查本机是否已配置凭证，不创建付费视频任务。"""
     from services.video_providers import get_provider
 
-    sb_id = request.storyboard_id
-    claim = await _try_claim_storyboard_for_submit(sb_id, provider="pippit_cli")
-    if not claim["claimed"]:
-        if claim.get("not_found"):
-            return {"success": False, "message": "分镜不存在"}
-        return {
-            "success": False,
-            "duplicate": True,
-            "message": f"该分镜已有任务在生成({claim.get('blocked_minutes', -1)} 分钟前),拒绝重复提交",
-        }
-
-    video_log_id = None
-    try:
-        await _apply_speaker_filter_to_storyboard(sb_id, request.prompt or "")
-        images, audios, image_labels, audio_labels = await _collect_storyboard_assets_for_ark(
-            sb_id, use_chain_frame=request.use_chain_frame, provider_type="pippit_cli"
-        )
-        final_prompt = await _build_final_video_prompt(
-            storyboard_id=sb_id,
-            raw_prompt=request.prompt or "",
-            image_items=image_labels[:9],
-            audio_items=audio_labels[:3],
-            with_file_refs=True,
-            log_prefix="pippit/submit",
-        )
-        final_params = dict(request.params or {})
-        duration = _extract_section_duration(request.prompt or "")
-        if duration is not None:
-            final_params["duration"] = duration
-        video_log_id = await _log_video_submit_start(
-            storyboard_id=sb_id, provider="pippit_cli", provider_code="pippit_cli",
-            model=final_params.get("model") or final_params.get("model_version") or "",
-            config_name="小云雀 CLI", base_url="", final_prompt=final_prompt,
-            images=images, audios=audios, params=final_params,
-        )
-        provider = get_provider("pippit_cli", await _pippit_provider_config())
-        sub_res = await provider.submit(prompt=final_prompt, images=images, audios=audios, params=final_params)
-        if not sub_res.success:
-            await _log_video_submit_end(video_log_id, success=False, fail_reason=sub_res.fail_reason,
-                                        sanitized_payload=sub_res.sanitized_payload)
-            await storyboard_service.update_video_status(sb_id, "failed", fail_reason=sub_res.fail_reason or "小云雀 CLI 提交失败")
-            return {"success": False, "message": sub_res.fail_reason or "小云雀 CLI 提交失败", "error_code": sub_res.error_code}
-
-        await _log_video_submitted(video_log_id, provider="pippit_cli", submit_id=sub_res.submit_id)
-        db = await get_db()
-        try:
-            await db.execute(
-                "UPDATE storyboards SET submit_id = ?, video_status = 'generating', video_submit_time = ?, "
-                "video_provider = ?, video_config_id = NULL, video_url = NULL, last_frame_path = NULL, "
-                "last_frame_orig_path = NULL, video_fail_reason = NULL WHERE id = ?",
-                (sub_res.submit_id, _now_str_simple(), "pippit_cli", sb_id),
-            )
-            await db.commit()
-        finally:
-            await db.close()
-        return {"success": True, "submit_id": sub_res.submit_id, "message": "已提交小云雀 CLI"}
-    except Exception as e:
-        logger.exception("[pippit/submit] sb=%s 异常: %s", sb_id, e)
-        try:
-            await storyboard_service.update_video_status(sb_id, "failed", fail_reason=f"小云雀提交异常: {type(e).__name__}: {e}")
-        except Exception:
-            pass
-        if video_log_id:
-            try:
-                await _log_video_submit_end(video_log_id, success=False, fail_reason=f"{type(e).__name__}: {e}")
-            except Exception:
-                pass
-        return {"success": False, "message": f"小云雀提交异常: {type(e).__name__}: {e}"}
-
-
-# v3.61.6 火山方舟单条提交(非队列路径)— 跟 /generate 对等,但走 VolcengineArkProvider
-class ArkSubmitRequest(BaseModel):
-    storyboard_id: int
-    prompt: str
-    config_id: int  # 火山方舟视频配置 id (云端 llm_configs)
-    params: Optional[dict] = None
-    use_chain_frame: bool = False  # v3.61.12: 串行尾帧
-    # v3.61.107: 企业自持 APIKey(可选,明文,用完即丢)
-    # 前端从 safeStorage 解密后塞过来,后端用它覆盖云端 cloud_cfg["apiKey"]
-    # 留空 → 降级用云端 APIKey
-    local_api_key: Optional[str] = None
+    provider = get_provider("minimax_h3", await _minimax_provider_config())
+    result = await provider.check_login()
+    active_key = await _get_minimax_api_key()
+    return {
+        "success": bool(result.get("success")),
+        "logged_in": bool(result.get("logged_in")),
+        "has_api_key": bool(active_key),
+        "api_key_masked": _mask_secret(active_key),
+        "message": result.get("message") or "",
+        "model": "MiniMax-H3",
+        "resolution": "2K",
+    }
 
 
 @router.post("/ark/submit")
@@ -1756,20 +2693,47 @@ async def ark_submit(request: ArkSubmitRequest):
         # 2. 取火山方舟配置
         try:
             cloud_cfg = await get_active_config(config_id=request.config_id, config_type="video")
-        except Exception as e:
-            await storyboard_service.update_video_status(sb_id, "failed", fail_reason=f"获取火山方舟配置失败: {e}")
-            return {"success": False, "message": f"获取配置失败: {e}"}
+        except Exception:
+            # Self-configured New API entries live only in the encrypted local
+            # config database.  Falling back here keeps them independent of the
+            # account server and avoids the historical account_required error.
+            cloud_cfg = None
+            try:
+                from services.llm_service import LLMService
+                local_cfg = await LLMService.get_by_id(request.config_id, local_only=True)
+                if local_cfg and local_cfg.get("config_type") == "video":
+                    cloud_cfg = {
+                        "id": local_cfg.get("id"),
+                        "name": local_cfg.get("name"),
+                        "baseUrl": local_cfg.get("base_url"),
+                        "apiKey": local_cfg.get("api_key"),
+                        "modelName": local_cfg.get("model_name"),
+                        "providerCode": local_cfg.get("provider_code"),
+                        "extraParams": local_cfg.get("extra_params") or {},
+                        "_local_only": True,
+                    }
+            except Exception as local_error:
+                logger.warning(f"[cloud/submit] sb={sb_id} 本地视频配置读取失败: {local_error}")
 
         if not cloud_cfg:
-            await storyboard_service.update_video_status(sb_id, "failed", fail_reason="未找到视频模型配置")
-            # v3.61.226: 文案改中性 —— 此路径星链/Cool/火山方舟都走,写死"火山方舟"会误导星链等用户
-            return {"success": False, "message": "请先在千山AI个人中心配置视频模型(并在工具里选中对应配置)"}
+            await storyboard_service.update_video_status(
+                sb_id,
+                "failed",
+                fail_reason="当前选择的视频模型配置已失效",
+            )
+            return {
+                "success": False,
+                "message": (
+                    "当前选择的视频模型配置已失效或不属于当前账号，请返回视频页重新选择对应渠道配置；"
+                    "若无可选项，请先在千山AI个人中心配置视频模型"
+                ),
+            }
 
         # v3.61.170: 提前算 _resolved_provider_type — 传给 collect 让 asset:// 按 provider 分流
         #   cool 不认 asset://,collect 必须降级用原本地图(否则角色加白图会丢)
         # v3.61.173: 加 xinglian(星链云 SD2)friendly 文案
         _resolved_provider_type = _infer_cloud_provider(cloud_cfg)
-        _provider_friendly = {"cool": "Cool 中转", "volcengine_ark": "火山方舟", "xinglian": "星链云"}.get(_resolved_provider_type, _resolved_provider_type)
+        _provider_friendly = PROVIDER_FRIENDLY.get(_resolved_provider_type, _resolved_provider_type)
 
         # 3. 收集图片/音频(从 storyboard 关联元素 + 尾帧 + 自定义参考图)
         # v3.61.110: 同时拿 image_labels — 用于拼 @image1 / @image2 角色绑定
@@ -1779,8 +2743,20 @@ async def ark_submit(request: ArkSubmitRequest):
         await _apply_speaker_filter_to_storyboard(sb_id, request.prompt or "")
         images, audios, image_labels, audio_labels = await _collect_storyboard_assets_for_ark(
             sb_id, use_chain_frame=request.use_chain_frame,
+            prompt_for_speakers=request.prompt or "",
             provider_type=_resolved_provider_type,
         )
+        if _resolved_provider_type == "newapi":
+            # The New API relay cannot read local desktop paths.  The renderer
+            # uploads selected assets directly to OSS first and sends their
+            # short-lived read URLs here.  Keep source labels for prompt
+            # binding, but swap only the provider payload values.
+            uploaded_images = [str(item).strip() for item in (request.uploaded_images or []) if str(item or "").strip()]
+            uploaded_audios = [str(item).strip() for item in (request.uploaded_audios or []) if str(item or "").strip()]
+            if uploaded_images:
+                images = uploaded_images
+            if uploaded_audios:
+                audios = uploaded_audios
 
         # v3.61.181: 统一调 helper,跟即梦 CLI / cool / xinglian 完全对齐
         #   流程:_strip_llm_metadata 剥 🔗 + 📏 → style_prefix → storyboard_style → start_state → file_refs(分号拼) → stripped prompt → style_suffix
@@ -1794,6 +2770,7 @@ async def ark_submit(request: ArkSubmitRequest):
             with_file_refs=True,
             log_prefix="ark/submit",
             ref_at=(_resolved_provider_type == "cool"),  # v3.61.214: 仅 cool 用 @图片N / @音频N
+            provider_type=_resolved_provider_type,
         )
 
         # v3.61.41: 提交前预校验音频总时长 — 火山方舟 r2v 要求音频总时长 ≤ 视频时长
@@ -1855,6 +2832,12 @@ async def ark_submit(request: ArkSubmitRequest):
 
         # v3.61.11: 按 prompt 里的 "📏 本小节总时长" 覆盖 duration(跟队列 worker / 即梦路径一致)
         final_params = dict(request.params or {})
+        if _resolved_provider_type == "newapi":
+            final_params["reference_videos"] = [str(item).strip() for item in (request.uploaded_videos or []) if str(item or "").strip()]
+            if request.first_frame_url:
+                final_params["first_frame_url"] = request.first_frame_url.strip()
+            if request.last_frame_url:
+                final_params["last_frame_url"] = request.last_frame_url.strip()
         try:
             sec_dur = _extract_section_duration(request.prompt or "")
             if sec_dur is not None:
@@ -1953,11 +2936,312 @@ async def ark_submit(request: ArkSubmitRequest):
     }
 
 
+@router.post("/pippit/submit")
+async def pippit_submit(request: PippitSubmitRequest):
+    """小云雀 CLI 单条提交,按即梦 CLI 的产品流程接入统一 provider 轮询。
+
+    Access Key is read from local app_settings/env and injected into the CLI subprocess env.
+    """
+    from services.video_providers import get_provider
+
+    sb_id = request.storyboard_id
+    claim = await _try_claim_storyboard_for_submit(sb_id, provider="pippit_cli")
+    if not claim["claimed"]:
+        if claim.get("not_found"):
+            return {"success": False, "message": "分镜不存在"}
+        elapsed = claim.get("blocked_minutes", -1)
+        return {
+            "success": False,
+            "duplicate": True,
+            "message": f"该分镜已有任务在生成({elapsed} 分钟前),拒绝重复提交",
+        }
+
+    try:
+        await _apply_speaker_filter_to_storyboard(sb_id, request.prompt or "")
+        from services.video_model_capabilities import get_video_model_capabilities
+        _pippit_caps = get_video_model_capabilities(
+            (request.params or {}).get("model")
+            or (request.params or {}).get("model_version"),
+            "pippit_cli",
+        )
+        images, audios, image_labels, audio_labels = await _collect_storyboard_assets_for_ark(
+            sb_id,
+            use_chain_frame=request.use_chain_frame,
+            prompt_for_speakers=request.prompt or "",
+            provider_type="pippit_cli",
+            max_images=int(_pippit_caps["max_images"]),
+        )
+
+        final_prompt = await _build_final_video_prompt(
+            storyboard_id=sb_id,
+            raw_prompt=request.prompt or "",
+            image_items=image_labels[: int(_pippit_caps["max_images"])],
+            audio_items=audio_labels[: int(_pippit_caps["max_audios"])],
+            with_file_refs=True,
+            log_prefix="pippit/submit",
+            provider_type="pippit_cli",
+        )
+
+        final_params = dict(request.params or {})
+        try:
+            sec_dur = _extract_section_duration(
+                request.prompt or "",
+                max_duration_sec=int(_pippit_caps["max_duration_seconds"]),
+            )
+            if sec_dur is not None:
+                final_params["duration"] = sec_dur
+        except Exception as _e:
+            logger.debug(f"[pippit/submit] 提取小节时长失败(忽略): {_e}")
+
+        _video_log_id = await _log_video_submit_start(
+            storyboard_id=sb_id,
+            provider="pippit_cli",
+            provider_code="pippit_cli",
+            model=final_params.get("model") or final_params.get("model_version") or "",
+            config_name="小云雀 CLI",
+            base_url="",
+            final_prompt=final_prompt,
+            images=images,
+            audios=audios,
+            params=final_params,
+        )
+
+        provider = get_provider("pippit_cli", await _pippit_provider_config())
+        sub_res = await provider.submit(
+            prompt=final_prompt,
+            images=images,
+            audios=audios,
+            params=final_params,
+        )
+
+        if not sub_res.success:
+            await _log_video_submit_end(
+                _video_log_id,
+                success=False,
+                fail_reason=sub_res.fail_reason,
+                sanitized_payload=sub_res.sanitized_payload,
+            )
+            await storyboard_service.update_video_status(
+                sb_id,
+                "failed",
+                fail_reason=sub_res.fail_reason or "小云雀 CLI 提交失败",
+            )
+            return {
+                "success": False,
+                "message": sub_res.fail_reason or "小云雀 CLI 提交失败",
+                "error_code": sub_res.error_code,
+            }
+
+        await _log_video_submitted(
+            _video_log_id,
+            provider="pippit_cli",
+            submit_id=sub_res.submit_id,
+        )
+
+        db = await get_db()
+        try:
+            await db.execute(
+                "UPDATE storyboards SET submit_id = ?, video_status = 'generating', "
+                "video_submit_time = ?, video_provider = ?, video_config_id = NULL, "
+                "video_url = NULL, last_frame_path = NULL, last_frame_orig_path = NULL, "
+                "video_fail_reason = NULL "
+                "WHERE id = ?",
+                (sub_res.submit_id, _now_str_simple(), "pippit_cli", sb_id),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+        logger.info(f"[pippit/submit] sb={sb_id} task_id={sub_res.submit_id}")
+        return {
+            "success": True,
+            "submit_id": sub_res.submit_id,
+            "message": "已提交小云雀 CLI",
+        }
+    except Exception as e:
+        logger.exception(f"[pippit/submit] sb={sb_id} 异常: {e}")
+        try:
+            await storyboard_service.update_video_status(
+                sb_id,
+                "failed",
+                fail_reason=f"小云雀提交异常: {type(e).__name__}: {e}",
+            )
+        except Exception:
+            pass
+        _vlid = locals().get("_video_log_id")
+        if _vlid:
+            try:
+                await _log_video_submit_end(_vlid, success=False, fail_reason=f"{type(e).__name__}: {e}")
+            except Exception:
+                pass
+        return {"success": False, "message": f"小云雀提交异常: {e}"}
+
+
+@router.post("/minimax/submit")
+async def minimax_submit(request: MiniMaxSubmitRequest):
+    """MiniMax H3 单条提交；素材、提示词、日志、轮询和下载均走统一链路。"""
+    from services.video_providers import get_provider
+
+    sb_id = request.storyboard_id
+    claim = await _try_claim_storyboard_for_submit(sb_id, provider="minimax_h3")
+    if not claim["claimed"]:
+        if claim.get("not_found"):
+            return {"success": False, "message": "分镜不存在"}
+        elapsed = claim.get("blocked_minutes", -1)
+        return {
+            "success": False,
+            "duplicate": True,
+            "message": f"该分镜已有任务在生成({elapsed} 分钟前),拒绝重复提交",
+        }
+
+    try:
+        if not await _get_minimax_api_key():
+            await storyboard_service.update_video_status(
+                sb_id, "failed", fail_reason="未配置 MiniMax API Key"
+            )
+            return {
+                "success": False,
+                "message": "请先在 MiniMax H3 渠道顶部保存 API Key",
+                "error_code": "AUTH",
+            }
+
+        declared_duration = _extract_declared_section_duration(request.prompt or "")
+        if declared_duration is not None and not 4 <= declared_duration <= 15:
+            message = (
+                f"当前分镜声明时长 {declared_duration:g} 秒，MiniMax H3 仅支持 4-15 秒。"
+                "请先调整或拆分该分镜；系统不会静默增补或截断时长。"
+            )
+            await storyboard_service.update_video_status(sb_id, "failed", fail_reason=message)
+            return {"success": False, "message": message, "error_code": "INVALID_PARAM"}
+
+        await _apply_speaker_filter_to_storyboard(sb_id, request.prompt or "")
+        images, audios, image_labels, audio_labels = await _collect_storyboard_assets_for_ark(
+            sb_id,
+            use_chain_frame=request.use_chain_frame,
+            prompt_for_speakers=request.prompt or "",
+            provider_type="minimax_h3",
+            max_images=9,
+            # H3 超限必须明确报错，不能沿用旧渠道的“自动裁掉低优先级图片”。
+            apply_image_limit=False,
+        )
+
+        final_prompt = await _build_final_video_prompt(
+            storyboard_id=sb_id,
+            raw_prompt=request.prompt or "",
+            image_items=image_labels[:9],
+            audio_items=audio_labels[:3],
+            with_file_refs=True,
+            log_prefix="minimax/submit",
+            provider_type="minimax_h3",
+            separate_audio_order=True,
+        )
+
+        final_params = dict(request.params or {})
+        final_params["model"] = "MiniMax-H3"
+        final_params["resolution"] = "2K"
+        if declared_duration is not None:
+            import math
+            final_params["duration"] = int(math.ceil(declared_duration))
+        else:
+            try:
+                final_params["duration"] = int(final_params.get("duration") or 5)
+            except (TypeError, ValueError):
+                final_params["duration"] = 5
+        final_params["use_chain_frame"] = bool(request.use_chain_frame)
+
+        _video_log_id = await _log_video_submit_start(
+            storyboard_id=sb_id,
+            provider="minimax_h3",
+            provider_code="minimax_h3",
+            model="MiniMax-H3",
+            config_name="MiniMax H3",
+            base_url="https://api.minimaxi.com",
+            final_prompt=final_prompt,
+            images=images,
+            audios=audios,
+            params=final_params,
+        )
+
+        provider = get_provider("minimax_h3", await _minimax_provider_config())
+        sub_res = await provider.submit(
+            prompt=final_prompt,
+            images=images,
+            audios=audios,
+            params=final_params,
+        )
+        if not sub_res.success:
+            await _log_video_submit_end(
+                _video_log_id,
+                success=False,
+                fail_reason=sub_res.fail_reason,
+                sanitized_payload=sub_res.sanitized_payload,
+            )
+            await storyboard_service.update_video_status(
+                sb_id,
+                "failed",
+                fail_reason=sub_res.fail_reason or "MiniMax H3 提交失败",
+            )
+            return {
+                "success": False,
+                "message": sub_res.fail_reason or "MiniMax H3 提交失败",
+                "error_code": sub_res.error_code,
+            }
+
+        await _log_video_submitted(
+            _video_log_id,
+            provider="minimax_h3",
+            submit_id=sub_res.submit_id,
+        )
+        db = await get_db()
+        try:
+            await db.execute(
+                "UPDATE storyboards SET submit_id = ?, video_status = 'generating', "
+                "video_submit_time = ?, video_provider = 'minimax_h3', video_config_id = NULL, "
+                "video_url = NULL, last_frame_path = NULL, last_frame_orig_path = NULL, "
+                "video_fail_reason = NULL WHERE id = ?",
+                (sub_res.submit_id, _now_str_simple(), sb_id),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+        logger.info("[minimax/submit] sb=%s task_id=%s", sb_id, sub_res.submit_id)
+        return {
+            "success": True,
+            "submit_id": sub_res.submit_id,
+            "message": "已提交 MiniMax H3",
+        }
+    except Exception as e:
+        logger.exception("[minimax/submit] sb=%s 异常: %s", sb_id, e)
+        try:
+            await storyboard_service.update_video_status(
+                sb_id,
+                "failed",
+                fail_reason=f"MiniMax H3 提交异常: {type(e).__name__}: {e}",
+            )
+        except Exception:
+            pass
+        _vlid = locals().get("_video_log_id")
+        if _vlid:
+            try:
+                await _log_video_submit_end(
+                    _vlid,
+                    success=False,
+                    fail_reason=f"{type(e).__name__}: {e}",
+                )
+            except Exception:
+                pass
+        return {"success": False, "message": f"MiniMax H3 提交异常: {e}"}
+
+
 async def _collect_storyboard_assets_for_ark(
     sb_id: int,
     use_chain_frame: bool = False,
-    prompt_for_speakers: str = "",  # v3.61.132/135: 兼容老调用,新调用应在外面先调 _apply_speaker_filter_to_storyboard
+    # prompt is also used to derive independent visual-appearance and first-speech order.
+    prompt_for_speakers: str = "",
     provider_type: str = "volcengine_ark",  # v3.61.170+173: cool / volcengine_ark / xinglian
+    apply_image_limit: bool = True,
+    max_images: int = 9,
 ) -> tuple:
     """从 storyboard 关联元素收集图片+音频路径(给云端 HTTP provider 用)
 
@@ -1980,6 +3264,7 @@ async def _collect_storyboard_assets_for_ark(
 
     images: List[str] = []
     audios: List[str] = []
+    audio_candidates: List[tuple] = []  # (path, 分镜人物原名, audio_label)
     matched_log: List[str] = []
     image_labels: List[Dict[str, str]] = []  # v3.61.110: 每张图的 {name, kind}
     audio_labels: List[Dict[str, str]] = []  # v3.61.111: 每段音频的 {name, kind} — Seedance 2.0 @Audio1 绑定
@@ -1999,7 +3284,11 @@ async def _collect_storyboard_assets_for_ark(
         cur = await db.execute(
             """SELECT novel_id, characters, scenes, props,
                    extra_reference_image, extra_reference_desc,
-                   last_frame_path, excluded_audios, auto_excluded_audios
+                   last_frame_path, excluded_audios, auto_excluded_audios,
+                   prompt, description, manual_audio_order,
+                   jimeng_image_characters, jimeng_audio_characters,
+                   topview_image, topview_prompt, topview_start_prompt, topview_end_prompt,
+                   topview_dispatch_text, start_frame_image, end_frame_image
             FROM storyboards WHERE id = ?""",
             (sb_id,),
         )
@@ -2028,10 +3317,28 @@ async def _collect_storyboard_assets_for_ark(
         excluded_audio_names = _manual | _auto
         if excluded_audio_names:
             logger.info(f"[ark/collect] sb={sb_id} 屏蔽音频(手动 {sorted(_manual)} + 自动 {sorted(_auto)},开关={_filter_on})")
+        topview_start_prompt = (row["topview_start_prompt"] or "").strip() or DEFAULT_TOPVIEW_START_PROMPT
+        topview_end_prompt = (
+            (row["topview_end_prompt"] or "").strip()
+            or (row["topview_prompt"] or "").strip()
+            or DEFAULT_TOPVIEW_END_PROMPT
+        )
         try:
-            char_names = _json.loads(row["characters"] or "[]")
+            raw_char_names = _json.loads(row["characters"] or "[]")
         except Exception:
-            char_names = []
+            raw_char_names = []
+        _ordering_prompt = (
+            (prompt_for_speakers or "").strip()
+            or (row["prompt"] or "").strip()
+            or (row["description"] or "").strip()
+        )
+        try:
+            _manual_audio_order = _json.loads(row["manual_audio_order"] or "[]")
+        except Exception:
+            _manual_audio_order = []
+        # All providers share the same independent image/audio selection metadata.
+        # Provider adapters only decide transport details and physical limits.
+        char_names = list(raw_char_names)
         try:
             scene_names = _json.loads(row["scenes"] or "[]")
         except Exception:
@@ -2085,6 +3392,41 @@ async def _collect_storyboard_assets_for_ark(
             else:
                 matched_log.append(f"extra_reference_image 文件不存在: {extra_abs_check}")
 
+        # 优先级 2.5: 首尾俯视调度链。
+        # 当前起始俯视图 = 上一小节同场景的结尾俯视图;当前结尾俯视图 = 本节 topview_image。
+        try:
+            _prev_topview = await find_chainable_prev_topview(sb_id)
+        except Exception as _e:
+            logger.warning(f"[ark/collect] 取上一节俯视调度图失败 sb={sb_id}: {_e}")
+            _prev_topview = None
+        if _prev_topview and _prev_topview.get("image_path"):
+            _pimg = _prev_topview["image_path"]
+            if _pimg not in images:
+                images.append(_pimg)
+                image_labels.append({
+                    "name": topview_start_prompt,
+                    "kind": "topview_dispatch",
+                    "role": "start",
+                    "dispatch_text": _prev_topview.get("dispatch_text") or "",
+                })
+            matched_log.append(f"dispatch_start_topview: prev_sb={_prev_topview.get('storyboard_id')}")
+
+        if row["topview_image"]:
+            _dimg = row["topview_image"]
+            _dabs = resolve_db_path(_dimg)
+            if _dabs and os.path.exists(_dabs):
+                if _dimg not in images:
+                    images.append(_dimg)
+                    image_labels.append({
+                        "name": topview_end_prompt,
+                        "kind": "topview_dispatch",
+                        "role": "end",
+                        "dispatch_text": row["topview_dispatch_text"] or "",
+                    })
+                matched_log.append("dispatch_end_topview")
+            else:
+                matched_log.append(f"dispatch_end_topview 文件不存在: {_dabs}")
+
         # v3.61.12 优先级 3: 元素图/音频 — 用 find_best_match 三级匹配
         # v3.61.104: 加白(Active) → asset:// URI 最优先,绕过火山 Deepfake 拦截
         # v3.61.158 codex P1 修:加 active_variant_id + image_prompt/image_status + volc_asset_id/group_id
@@ -2092,7 +3434,7 @@ async def _collect_storyboard_assets_for_ark(
         #   ARK 路径才会真用马甲图/音频/加白 asset
         cur = await db.execute(
             """SELECT id, name, element_type, finished_image, image_url,
-                   grid_image, reference_image, audio_file, aliases, description,
+                   grid_image, reference_image, audio_file, voice_id, aliases, description,
                    image_prompt, image_status,
                    volc_asset_id, volc_asset_uri, volc_asset_status, volc_asset_group_id,
                    active_variant_id
@@ -2104,6 +3446,66 @@ async def _collect_storyboard_assets_for_ark(
         by_type: Dict[str, List[Dict[str, Any]]] = {}
         for el in all_els:
             by_type.setdefault(el["element_type"], []).append(el)
+
+        _jimeng_image_set: set = set()
+        _jimeng_audio_set: set = set()
+        _audio_character_order: List[str] = []
+        _character_elements = by_type.get("character", [])
+        _manual_image_characters = _optional_json_name_list(
+            row["jimeng_image_characters"]
+        )
+        _manual_audio_characters = _optional_json_name_list(
+            row["jimeng_audio_characters"]
+        )
+        _shared_refs = _resolve_jimeng_character_references(
+            raw_char_names,
+            _ordering_prompt,
+            _character_elements,
+            _manual_image_characters,
+            _manual_audio_characters,
+            _manual_audio_order,
+        )
+        _image_names = list(_shared_refs["image_names"])
+        _audio_names = list(_shared_refs["audio_names"])
+
+        _manual_excluded_canonical = {
+            name.lower()
+            for name in _canonicalize_character_names(
+                list(_manual),
+                _character_elements,
+            )
+        }
+        if _shared_refs["audio_selection_mode"] == "manual":
+            _effective_excluded_canonical = _manual_excluded_canonical
+        else:
+            _effective_excluded_canonical = {
+                name.lower()
+                for name in _canonicalize_character_names(
+                    list(excluded_audio_names),
+                    _character_elements,
+                )
+            }
+        _audio_names = [
+            name
+            for name in _audio_names
+            if name.lower() not in _effective_excluded_canonical
+        ]
+        _jimeng_image_set = {name.lower() for name in _image_names}
+        _jimeng_audio_set = {name.lower() for name in _audio_names}
+        _audio_character_order = [
+            name
+            for name in _shared_refs["audio_order"]
+            if name.lower() in _jimeng_audio_set
+        ]
+        char_names = _dedup_order_names(_image_names + _audio_character_order)
+        matched_log.append(
+            f"人物图:{_image_names}({_shared_refs['image_selection_mode']})"
+        )
+        matched_log.append(
+            f"人物音频:{_audio_character_order}"
+            f"({_shared_refs['audio_selection_mode']}/"
+            f"{_shared_refs['audio_order_mode']})"
+        )
 
         from services.extraction_service import ExtractionService as _ES_ark
         for name_list, etype in [
@@ -2122,6 +3524,7 @@ async def _collect_storyboard_assets_for_ark(
                 # v3.61.158 codex P1: 人物走 active variant fallback(字段级 merge)
                 # ARK 路径才能用马甲图/音频/加白 asset,跟即梦路径口径一致
                 if etype == "character":
+                    el = await _backfill_character_audio_from_voice(db, novel_id, dict(el))
                     el = await _ES_ark.resolve_active_character_asset(el)
                 _v_tag = el.get("__active_variant_name")
                 matched_log.append(f"{etype}:{name} → {el.get('name')}" + (f" [马甲={_v_tag}]" if _v_tag else ""))
@@ -2130,10 +3533,21 @@ async def _collect_storyboard_assets_for_ark(
                 volc_uri = el.get("volc_asset_uri")
                 volc_status = el.get("volc_asset_status")
                 _matched_name = el.get("name") or name  # 实际匹配到的元素名
-                if _allow_asset_uri and volc_uri and volc_status == "Active":
+                _label_meta = {"name": _matched_name, "kind": etype}
+                if etype == "character":
+                    _label_meta.update({
+                        "input_name": name,
+                        "element_name": el.get("name"),
+                        "aliases": el.get("aliases"),
+                        "variant": _v_tag,
+                    })
+                _submit_image = etype != "character" or name.lower() in _jimeng_image_set
+                if not _submit_image:
+                    matched_log.append(f"  ↳ 本镜不提交人物图:{name}")
+                elif _allow_asset_uri and volc_uri and volc_status == "Active":
                     if volc_uri not in images:
                         images.append(volc_uri)
-                        image_labels.append({"name": _matched_name, "kind": etype})
+                        image_labels.append(dict(_label_meta))
                     matched_log.append(f"  ↳ 使用火山私域素材 {volc_uri}")
                 else:
                     img = (
@@ -2142,7 +3556,7 @@ async def _collect_storyboard_assets_for_ark(
                     )
                     if img and img not in images:
                         images.append(img)
-                        image_labels.append({"name": _matched_name, "kind": etype})
+                        image_labels.append(dict(_label_meta))
                     if volc_uri and volc_status == "Active" and not _allow_asset_uri:
                         matched_log.append(f"  ↳ provider={provider_type} 不支持 asset://,用原本地图")
                     elif volc_uri and volc_status != "Active":
@@ -2150,24 +3564,227 @@ async def _collect_storyboard_assets_for_ark(
                 if etype == "character" and el.get("audio_file"):
                     # v3.61.135: 纯 excluded_audios 判定 — key 统一用"分镜字段里那个 name"
                     # (前端 char.name / 种菜模式 helper / 手动屏蔽 全部写这个),不再混 _matched_name
-                    _in_excluded = name in excluded_audio_names
+                    _in_excluded = name.lower() not in _jimeng_audio_set
                     if _in_excluded:
                         matched_log.append(f"  ↳ 屏蔽音频:{name}")
-                    elif el["audio_file"] not in audios:
-                        audios.append(el["audio_file"])
-                        # v3.61.111: 跟 character image_labels 同名,Seedance 才能把 @AudioN 跟 @ImageN 绑同一个角色
-                        audio_labels.append({"name": _matched_name, "kind": "character"})
+                    elif not any(
+                        item[0] == el["audio_file"] for item in audio_candidates
+                    ):
+                        # Keep audio labels aligned with the independently ordered character list.
+                        audio_candidates.append((
+                            el["audio_file"],
+                            name,
+                            {
+                                "name": _matched_name,
+                                "kind": "character",
+                                "input_name": name,
+                            },
+                        ))
     finally:
         await db.close()
+
+    # Every provider receives the same first-speech/manual audio order.
+    for _audio_path, _input_name, _audio_label in _sort_named_assets(
+        audio_candidates,
+        locals().get("_audio_character_order", []),
+    ):
+        audios.append(_audio_path)
+        audio_labels.append(_audio_label)
+
+    # Cloud/全局队列/Pippit 都会在 provider 层截到 9 张。必须在这里先按
+    # 统一优先级同步裁 images + labels，不能让 provider 简单取前 9 张造成
+    # 提示词素材编号与实际上传错位。
+    max_images = max(1, int(max_images or 9))
+    if apply_image_limit and len(images) > max_images:
+        aligned_labels = list(image_labels)
+        while len(aligned_labels) < len(images):
+            aligned_labels.append({"name": f"图片{len(aligned_labels) + 1}", "kind": ""})
+        kept_indices, removed_indices = _select_image_keep_indices(
+            aligned_labels, max_images
+        )
+        removed_names = [_image_asset_name(aligned_labels[idx]) for idx in removed_indices]
+        images = [images[idx] for idx in kept_indices]
+        image_labels = [aligned_labels[idx] for idx in kept_indices]
+        logger.warning(
+            f"[ark/collect] sb={sb_id} 图片超出 {max_images} 张上限，按人物>场景>道具>关键帧>尾帧>俯视图 "
+            f"裁掉 {len(removed_indices)} 张: {removed_names}"
+        )
 
     logger.info(
         f"[ark/collect] sb={sb_id} use_chain_frame={use_chain_frame} "
         f"匹配: {matched_log} → images={len(images)} audios={len(audios)}"
     )
-    # image_labels / audio_labels 附加在 tuple 后两位
-    # v3.61.164 codex 复审:历史有一行 `return images[:9], audios[:3]` 是死代码(在前一条 return 之后)— 删
-    #   真实截切由调用方(ARK provider 内 images[:9] / audios[:3])兜底
+    # image_labels / audio_labels 附加在 tuple 后两位；图片已按当前模型上限收敛。
     return images, audios, image_labels, audio_labels
+
+
+_PROMPT_EXPORT_PROVIDER_TYPES = {
+    "jimeng": "jimeng",
+    "pippit": "pippit_cli",
+    "minimax": "minimax_h3",
+    "ark": "volcengine_ark",
+    "cool": "cool",
+    "xinglian": "xinglian",
+}
+
+
+def _prompt_export_section_label(row: Dict[str, Any]) -> str:
+    scene_index = row.get("scene_index")
+    section_number = row.get("section_number")
+    if scene_index is not None:
+        return f"{int(scene_index) + 1}-{section_number or ''}".rstrip("-")
+    return str(section_number or row.get("id") or "")
+
+
+def _prompt_export_scene_name(row: Dict[str, Any]) -> str:
+    try:
+        section_info = json.loads(row.get("section_info") or "{}")
+    except Exception:
+        section_info = {}
+    if not isinstance(section_info, dict):
+        return ""
+    return str(section_info.get("scene") or "").strip()
+
+
+def _format_video_prompt_export_block(row: Dict[str, Any], final_prompt: str) -> str:
+    """Format one human-copyable prompt block; never serialize a request payload."""
+    label = _prompt_export_section_label(row)
+    scene = _prompt_export_scene_name(row)
+    heading = f"分镜 #{label}"
+    if scene:
+        heading += f"｜{scene}"
+    return f"==================== {heading} ====================\n{(final_prompt or '').strip()}"
+
+
+@router.post("/export-prompts", response_class=PlainTextResponse)
+async def export_video_prompts(request: VideoPromptExportRequest):
+    """Export only the final prompt/content text sent to the active video channel.
+
+    The response is plain UTF-8 text grouped by storyboard. It intentionally omits
+    the provider request JSON, model parameters, credentials, local asset paths and
+    all other transport metadata.
+    """
+    provider_type = _PROMPT_EXPORT_PROVIDER_TYPES[request.provider]
+    from services.video_model_capabilities import (
+        get_video_model_capabilities,
+        reference_audio_duration_error,
+    )
+    export_capabilities = get_video_model_capabilities(
+        request.model_version or "seedance_2_0",
+        provider_type,
+    )
+    max_export_images = int(export_capabilities["max_images"])
+    max_export_audios = int(export_capabilities["max_audios"])
+    requested_ids = [item.storyboard_id for item in request.items]
+    prompt_by_id = {item.storyboard_id: item.prompt or "" for item in request.items}
+
+    placeholders = ",".join("?" for _ in requested_ids)
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            f"""
+            SELECT id, scene_index, section_number, section_info
+            FROM storyboards
+            WHERE id IN ({placeholders})
+            """,
+            tuple(requested_ids),
+        )
+        row_by_id = {int(row["id"]): dict(row) for row in await cur.fetchall()}
+    finally:
+        await db.close()
+
+    missing_ids = [storyboard_id for storyboard_id in requested_ids if storyboard_id not in row_by_id]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail=f"以下分镜不存在或已删除: {missing_ids}")
+
+    blocks: List[str] = []
+    with_file_refs = not (
+        request.provider == "jimeng"
+        and request.generation_mode != "multimodal2video"
+    )
+    for storyboard_id in requested_ids:
+        raw_prompt = prompt_by_id[storyboard_id]
+        # Keep audio/image numbering aligned with a real submit. This helper may
+        # refresh the automatic speaker-audio exclusion just like submit does.
+        await _apply_speaker_filter_to_storyboard(storyboard_id, raw_prompt)
+        images, audios, image_labels, audio_labels = await _collect_storyboard_assets_for_ark(
+            storyboard_id,
+            use_chain_frame=request.use_chain_frame,
+            prompt_for_speakers=raw_prompt,
+            provider_type=provider_type,
+            # Jimeng filters missing local files before applying its model-aware
+            # priority cap, so defer that cap until after the same filter below.
+            apply_image_limit=(request.provider != "jimeng"),
+            max_images=max_export_images,
+        )
+        if request.provider == "jimeng":
+            # The Jimeng CLI path only uploads existing local files and drops
+            # voice samples outside its model-specific duration range. Mirror
+            # those two filters so exported 图片N/音频N numbering stays exact.
+            existing_images: List[Dict[str, str]] = []
+            for path, label in zip(images, image_labels):
+                abs_path = resolve_db_path(path)
+                if abs_path and os.path.exists(abs_path):
+                    existing_images.append(dict(label))
+            if len(existing_images) > max_export_images:
+                kept_indices, _removed_indices = _select_image_keep_indices(
+                    existing_images,
+                    max_export_images,
+                )
+                existing_images = [existing_images[idx] for idx in kept_indices]
+            image_labels = existing_images
+
+            valid_audio_labels: List[Dict[str, str]] = []
+            try:
+                from api.extraction import _probe_audio_duration_seconds
+            except Exception:
+                _probe_audio_duration_seconds = None
+            valid_audio_durations: List[float] = []
+            for path, label in zip(audios, audio_labels):
+                abs_path = resolve_db_path(path)
+                if not abs_path or not os.path.exists(abs_path):
+                    continue
+                try:
+                    duration = _probe_audio_duration_seconds(abs_path) if _probe_audio_duration_seconds else None
+                except Exception:
+                    duration = None
+                if duration is not None and reference_audio_duration_error(
+                    request.model_version or "seedance_2_0",
+                    [duration],
+                ):
+                    continue
+                if duration is not None:
+                    valid_audio_durations.append(float(duration))
+                valid_audio_labels.append(dict(label))
+            audio_labels = valid_audio_labels
+            total_audio_error = reference_audio_duration_error(
+                request.model_version or "seedance_2_0",
+                valid_audio_durations,
+            )
+            if total_audio_error:
+                raise HTTPException(status_code=400, detail=total_audio_error)
+
+            if request.use_chain_frame:
+                chain_desc = (request.chain_frame_desc or DEFAULT_CHAIN_FRAME_DESC).strip()
+                for label in image_labels:
+                    if label.get("kind") == "chain_frame":
+                        label["name"] = chain_desc
+                        label["kind"] = "chain_prev_frame"
+                        break
+        final_prompt = await _build_final_video_prompt(
+            storyboard_id=storyboard_id,
+            raw_prompt=raw_prompt,
+            image_items=image_labels[:max_export_images] if with_file_refs else [],
+            audio_items=audio_labels[:max_export_audios] if with_file_refs else [],
+            with_file_refs=with_file_refs,
+            log_prefix=f"prompt-export/{request.provider}",
+            ref_at=(request.provider == "cool"),
+            separate_audio_order=(request.provider in {"jimeng", "minimax"}),
+            provider_type=provider_type,
+        )
+        blocks.append(_format_video_prompt_export_block(row_by_id[storyboard_id], final_prompt))
+
+    return PlainTextResponse("\n\n\n".join(blocks), media_type="text/plain")
 
 
 def _now_str_simple() -> str:
@@ -2184,6 +3801,7 @@ def _cloud_timeout_minutes(provider: Optional[str]) -> int:
 
     阈值依据:
       - volcengine_ark = 5  火山真 API,正常 1-3 分钟,5 分钟足够
+      - pippit_cli     = 5  小云雀 CLI,5 分钟后开始主动查上游;硬上限另见 _cloud_hard_limit_minutes()
       - xinglian       = 180 逆向即梦号,排队几小时常态(实测 38 分钟才出包),3 小时折中
       - cool / 其他    = 30  Cool 正常 1-3 分钟,30 分钟留 10 倍余量,死任务不挂太久
       - None / jimeng  = 30  不该走云端路径,兜底
@@ -2193,7 +3811,17 @@ def _cloud_timeout_minutes(provider: Optional[str]) -> int:
         return 5
     if p == "xinglian":
         return 180
+    if p == "newapi":
+        return 30
     return 30
+
+
+def _cloud_hard_limit_minutes(provider: Optional[str]) -> Optional[int]:
+    """Provider-specific hard stop for jobs that keep returning running."""
+    p = (provider or "").lower()
+    if p == "pippit_cli":
+        return 8 * 60
+    return None
 
 
 def _infer_cloud_provider(cloud_cfg: dict) -> str:
@@ -2206,6 +3834,13 @@ def _infer_cloud_provider(cloud_cfg: dict) -> str:
     pc = (cloud_cfg.get("providerCode") or cloud_cfg.get("provider_code") or "").lower()
     name = (cloud_cfg.get("name") or "").lower()
 
+    # OpenAI/New API compatible H3 relay. This needs to be resolved before
+    # model-name heuristics because its model also contains "minimax".
+    if pc in ("newapi", "new_api", "taihang") or "newapi" in pc or "taihang" in pc:
+        return "newapi"
+    if "120.209.70.196" in bu or "newapi" in bu or "太航" in name:
+        return "newapi"
+
     # Cool 优先(防 cool 配置的 model="seedance_2" 被 ARK "seedance" 子串误归)
     if pc in ("cool", "mjapi") or "cool" in pc or "mjapi" in pc:
         return "cool"
@@ -2217,6 +3852,9 @@ def _infer_cloud_provider(cloud_cfg: dict) -> str:
         return "xinglian"
     if "vjimeng.vip" in bu or "vjimeng" in bu or "vjimeng" in name or mn.startswith("sd2-"):
         return "xinglian"
+
+    if pc in ("pippit", "pippit_cli") or "pippit" in pc or "pippit" in bu or "pippit" in name or "小云雀" in name:
+        return "pippit_cli"
 
     # 默认 ARK
     return "volcengine_ark"
@@ -2247,7 +3885,7 @@ def _sum_audio_duration_seconds(audio_paths) -> float:
 
 
 # v3.61.23: 原子级"判重 + 占位"。用 UPDATE WHERE 一条 SQL 同时做:
-#   1) 检查是否还有 30 分钟内的 generating 任务
+#   1) 检查是否还有 30 分钟内的 generating 任务,或全局队列活跃项
 #   2) 没有 → 把状态置 generating + 刷 video_submit_time + 清旧 submit_id/url/fail_reason
 # 因为是单条 SQL,SQLite 行锁保证并发请求只会有一个赢,根治 TOCTOU race。
 async def _try_claim_storyboard_for_submit(sb_id: int, provider: str = "jimeng") -> dict:
@@ -2262,7 +3900,7 @@ async def _try_claim_storyboard_for_submit(sb_id: int, provider: str = "jimeng")
     now_str = now_beijing_str()
     db = await get_db()
     try:
-        # 一条原子 UPDATE:WHERE 子句既是判重(NOT 30 分钟内 generating)又是 id 匹配
+        # 一条原子 UPDATE:WHERE 子句既是判重(NOT 30 分钟内 generating/queued)又是 id 匹配
         cursor = await db.execute(
             """
             UPDATE storyboards
@@ -2278,6 +3916,11 @@ async def _try_claim_storyboard_for_submit(sb_id: int, provider: str = "jimeng")
                 AND video_submit_time IS NOT NULL
                 AND datetime(replace(video_submit_time, ' ', 'T'))
                     > datetime(replace(?, ' ', 'T'), '-30 minutes')
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM video_task_queue q
+                WHERE q.storyboard_id = storyboards.id
+                  AND q.status IN ('queued', 'generating')
               )
             """,
             (now_str, provider, sb_id, now_str),
@@ -2327,6 +3970,12 @@ async def generate_video(request: VideoGenerateRequest, background_tasks: Backgr
     if request.use_chain_frame:
         abort_reason = await _check_chain_aborted_precondition(request.storyboard_id)
         if abort_reason:
+            if abort_reason.startswith("链路暂停:"):
+                return {
+                    "success": False,
+                    "message": abort_reason,
+                    "chain_blocked": True,
+                }
             await storyboard_service.update_video_status(
                 request.storyboard_id, "chain_aborted",
                 fail_reason=abort_reason
@@ -2339,11 +3988,19 @@ async def generate_video(request: VideoGenerateRequest, background_tasks: Backgr
         if claim.get("not_found"):
             return {"success": False, "message": "分镜不存在"}
         elapsed = claim.get("blocked_minutes", -1)
-        msg = (
-            f"该分镜已有任务在生成(提交于 {elapsed} 分钟前),为避免重复扣费已拒绝本次提交。"
-            f"如需强制重新生成,请先在视频列表里点「刷新状态」或等当前任务完成"
-        )
+        if (claim.get("current_status") or "").lower() == "queued":
+            msg = "该分镜已在全局队列等待生成,为避免重复扣费已拒绝本次提交。"
+        else:
+            msg = (
+                f"该分镜已有任务在生成(提交于 {elapsed} 分钟前),为避免重复扣费已拒绝本次提交。"
+                f"如需强制重新生成,请先在视频列表里点「刷新状态」或等当前任务完成"
+            )
         return {"success": False, "message": msg, "duplicate": True}
+
+    try:
+        await storyboard_service.clear_stale_chain_aborted_after(request.storyboard_id)
+    except Exception as e:
+        logger.warning(f"[chain-aborted-clear] 分镜 {request.storyboard_id} 占位后清理旧中断失败(忽略): {e}")
 
     # 把 params 转 dict 传给 background(BaseModel 跨协程可能有序列化问题)
     params_dict = request.params.model_dump() if request.params else None
@@ -2410,20 +4067,23 @@ async def _check_chain_aborted_precondition(storyboard_id: int) -> Optional[str]
                 prev_scenes = json.loads(prev["scenes"] or "[]")
             except Exception:
                 prev_scenes = []
-            if prev_scenes and cur_scenes and prev_scenes[0] == cur_scenes[0]:
+            if (
+                prev_scenes
+                and cur_scenes
+                and _normalize_chain_scene_name(prev_scenes[0]) == _normalize_chain_scene_name(cur_scenes[0])
+            ):
                 connectable = True
         if not connectable:
             return None  # 跨场景,前镜失败跟我无关
-        # 同链路且前镜终态 → 中断
-        # v3.61.153 codex P1:download_failed 同样视为链路断点
-        # 因为本地没视频文件没尾帧,下镜接帧本就接不上
-        if prev["video_status"] in ("failed", "chain_aborted", "download_failed"):
+        # 同链路且前镜失败 → 中断;本地下载失败只暂停,不能把当前镜写成 chain_aborted。
+        if prev["video_status"] == "download_failed":
+            return f"链路暂停:上一镜(分镜 #{prev['id']})本地下载失败,请先重试下载上一镜再继续串行尾帧生成"
+        if prev["video_status"] in ("failed", "chain_aborted"):
             _zh = {
                 "failed": "生成失败",
                 "chain_aborted": "已被链路中断",
-                "download_failed": "本地下载失败,需先重试下载",
             }.get(prev["video_status"], prev["video_status"])
-            return f"链路中断:上一镜(分镜 #{prev['id']}){_zh},串行尾帧模式下不再生成"
+            return f"前置分镜(id #{prev['id']}){_zh},本镜未生成;请先重试该前置分镜"
         return None
     finally:
         await db.close()
@@ -2436,6 +4096,7 @@ async def _process_video_generation(
     params: Optional[dict] = None,
     use_chain_frame: bool = False,
     chain_frame_desc: Optional[str] = None,
+    start_background_reconcile: bool = True,
 ):
     """后台处理视频生成 - 仅提交任务，不等待完成
 
@@ -2468,7 +4129,9 @@ async def _process_video_generation(
             
             # 获取分镜所属的小说ID和风格提示词
             cursor = await db.execute(
-                "SELECT novel_id, style_prompt, extra_reference_image, extra_reference_desc FROM storyboards WHERE id = ?",
+                "SELECT novel_id, style_prompt, extra_reference_image, extra_reference_desc, "
+                "topview_image, topview_prompt, topview_start_prompt, topview_end_prompt, "
+                "topview_dispatch_text, start_frame_image, end_frame_image FROM storyboards WHERE id = ?",
                 (storyboard_id,)
             )
             sb_novel_row = await cursor.fetchone()
@@ -2476,6 +4139,14 @@ async def _process_video_generation(
             storyboard_style_prompt = (sb_novel_row['style_prompt'] or "") if sb_novel_row else ""
             extra_ref_image = (sb_novel_row['extra_reference_image'] or "") if sb_novel_row else ""
             extra_ref_desc = (sb_novel_row['extra_reference_desc'] or "") if sb_novel_row else ""
+            # 本节结尾俯视调度图(熔图功能产物,用户可在详情面板 X 掉 = 字段清空)
+            topview_image = (sb_novel_row['topview_image'] or "") if sb_novel_row else ""
+            topview_start_prompt = (sb_novel_row['topview_start_prompt'] or "").strip() if sb_novel_row else ""
+            topview_end_prompt = (sb_novel_row['topview_end_prompt'] or "").strip() if sb_novel_row else ""
+            legacy_topview_prompt = (sb_novel_row['topview_prompt'] or "").strip() if sb_novel_row else ""
+            topview_dispatch_text = (sb_novel_row['topview_dispatch_text'] or "") if sb_novel_row else ""
+            topview_start_prompt = topview_start_prompt or DEFAULT_TOPVIEW_START_PROMPT
+            topview_end_prompt = topview_end_prompt or legacy_topview_prompt or DEFAULT_TOPVIEW_END_PROMPT
             
             # 获取视频风格设置（使用 'video' 作为 element_type）
             style_prefix = ""
@@ -2515,6 +4186,16 @@ async def _process_video_generation(
             "智能多帧": "text2video",
         }
         generation_mode = mode_mapping.get(generation_mode, generation_mode)
+        from services.jimeng_black_video import jimeng_black_video_enabled
+        include_black_video = jimeng_black_video_enabled(
+            (params or {}).get("include_black_video", False)
+        )
+        if include_black_video and generation_mode != "multimodal2video":
+            logger.info(
+                "[video-gen] 分镜 %s 已开启2秒黑屏视频，生成模式切换为 multimodal2video",
+                storyboard_id,
+            )
+            generation_mode = "multimodal2video"
         logger.info(f"[video-gen] 分镜 {storyboard_id} 使用配置: id={video_config_id}, name='{config_name}', model_name='{model_name}', duration={duration}, ratio='{ratio}', mode='{generation_mode}'")
 
         # 映射 model_name 到 CLI 的 model_version 格式
@@ -2522,6 +4203,7 @@ async def _process_video_generation(
         #   - seedance2.0_vip      (VIP标准版)
         #   - seedance2.0fast_vip  (VIP快速版)
         #   - seedance2.0fast      (快速版)
+        #   - seedance2.0mini      (Mini版)
         #   - seedance2.0          (标准版)
         # VIP 参数会触发即梦平台的优先队列处理
 
@@ -2534,8 +4216,9 @@ async def _process_video_generation(
             model_name_lower = model_name.lower()
             is_vip = "-vip" in model_name_lower or "_vip" in model_name_lower or model_name_lower.endswith("vip")
             is_fast = "fast" in model_name_lower
+            is_mini = "mini" in model_name_lower
 
-            logger.info(f"[video-gen] 分镜 {storyboard_id} model_name 解析: raw='{model_name}', lower='{model_name_lower}', is_vip={is_vip}, is_fast={is_fast}")
+            logger.info(f"[video-gen] 分镜 {storyboard_id} model_name 解析: raw='{model_name}', lower='{model_name_lower}', is_vip={is_vip}, is_fast={is_fast}, is_mini={is_mini}")
 
             # 提取版本号
             if "2.0" in model_name_lower or "20" in model_name_lower:
@@ -2549,14 +4232,17 @@ async def _process_video_generation(
 
             # 构建 CLI 的 model_version（注意 VIP 使用下划线）
             if version == "2.0":
-                if is_fast:
+                if is_mini:
+                    model_version = "seedance2.0mini"
+                elif is_fast:
                     model_version = "seedance2.0fast"
                 else:
                     model_version = "seedance2.0"
-                if is_vip:
+                if is_vip and not is_mini:
                     model_version += "_vip"  # VIP 使用下划线
             elif version == "1.5":
-                model_version = "seedance1.5pro"
+                # 1.5 系列已从可选模板下线;历史配置命中 1.5 时回落到 2.0。
+                model_version = "seedance2.0"
             elif version == "1.0":
                 if is_fast:
                     model_version = "seedance1.0fast"
@@ -2567,9 +4253,43 @@ async def _process_video_generation(
 
             logger.info(f"[video-gen] 分镜 {storyboard_id} model_name: {model_name} -> model_version: {model_version}")
 
+        if model_version == "seedance2.0mini" and str(direct_resolution or "").lower() != "720p":
+            logger.info(
+                f"[video-gen] 分镜 {storyboard_id} Seedance 2.0 Mini 仅按 720P 提交,"
+                f"忽略前端/历史配置 resolution={direct_resolution}"
+            )
+            direct_resolution = "720P"
+
+        from services.video_model_capabilities import (
+            canonical_video_model_name,
+            get_video_model_capabilities,
+            reference_audio_duration_error,
+        )
+        model_version = canonical_video_model_name(model_version, "jimeng")
+        _model_caps = get_video_model_capabilities(model_version, "jimeng")
+        if not _model_caps["video_generation_available"]:
+            raise ValueError(f"即梦 CLI 暂未开放 {_model_caps['label']} 视频生成")
+        _min_output_duration = int(_model_caps.get("min_duration_seconds") or 4)
+        _max_output_duration = int(_model_caps["max_duration_seconds"])
+        try:
+            duration = int(round(float(duration)))
+        except (TypeError, ValueError):
+            duration = _min_output_duration
+        if duration < _min_output_duration or duration > _max_output_duration:
+            logger.warning(
+                "[video-gen] 分镜 %s %s 时长 %s 超范围,收敛到 %s-%ss",
+                storyboard_id,
+                _model_caps["label"],
+                duration,
+                _min_output_duration,
+                _max_output_duration,
+            )
+            duration = min(_max_output_duration, max(_min_output_duration, duration))
+
         # 根据生成模式准备素材
         images = []
         audios = []
+        videos = []
 
         logger.info(f"[video-gen] 分镜 {storyboard_id} 生成模式: {generation_mode}")
 
@@ -2608,11 +4328,38 @@ async def _process_video_generation(
                 else:
                     logger.warning(f"[video-gen] 分镜 {storyboard_id} 额外参考图文件不存在: {ref_img_path}")
 
+            # 首尾俯视调度链:上一节同场景结尾俯视图作为本镜起始图,本节 topview_image 作为本镜结尾图。
+            try:
+                prev_topview = await find_chainable_prev_topview(storyboard_id)
+            except Exception as _e:
+                logger.warning(f"[video-gen] 分镜 {storyboard_id} 取上一节俯视调度图失败: {_e}")
+                prev_topview = None
+            if prev_topview and prev_topview.get("abs_path"):
+                image_items.append((prev_topview["abs_path"], topview_start_prompt, "topview_dispatch", {
+                    "role": "start",
+                    "dispatch_text": prev_topview.get("dispatch_text") or "",
+                }))
+                logger.info(f"[video-gen] 分镜 {storyboard_id} 已注入起始俯视调度图: prev={prev_topview.get('storyboard_id')}, path={prev_topview['abs_path']}")
+
+            if topview_image:
+                topview_abs = resolve_db_path(topview_image)
+                if os.path.exists(topview_abs):
+                    image_items.append((topview_abs, topview_end_prompt, "topview_dispatch", {
+                        "role": "end",
+                        "dispatch_text": topview_dispatch_text,
+                    }))
+                    logger.info(f"[video-gen] 分镜 {storyboard_id} 已注入结尾俯视调度图: {topview_abs}")
+                else:
+                    logger.warning(f"[video-gen] 分镜 {storyboard_id} 结尾俯视调度图文件不存在: {topview_abs}")
+
             # 查询分镜关联的元素图片和音频
             db2 = await get_db()
             try:
                 cursor = await db2.execute(
-                    "SELECT novel_id, script_id, section_number, sort_order, characters, scenes, props, description, excluded_audios, auto_excluded_audios, section_start_state FROM storyboards WHERE id = ?",
+                    "SELECT novel_id, script_id, section_number, sort_order, characters, scenes, props, "
+                    "description, prompt, excluded_audios, auto_excluded_audios, manual_audio_order, "
+                    "jimeng_image_characters, jimeng_audio_characters, "
+                    "section_start_state FROM storyboards WHERE id = ?",
                     (storyboard_id,)
                 )
                 sb_row = await cursor.fetchone()
@@ -2656,22 +4403,106 @@ async def _process_video_generation(
                         excluded_audio_names = _m | _a
                     if excluded_audio_names:
                         logger.info(f"[video-gen] 分镜 {storyboard_id} 屏蔽的音频角色: {excluded_audio_names}")
-                    all_names = []
+                    names_by_field: Dict[str, List[str]] = {}
                     for field in ['characters', 'scenes', 'props']:
                         raw_names = json.loads(sb_row[field] or '[]')
-                        elem_type = field.rstrip('s')  # characters -> character, etc.
+                        expanded_names: List[str] = []
                         for raw_name in raw_names:
                             # 拆分中文逗号和英文逗号
                             split_names = [n.strip() for n in raw_name.replace('，', ',').split(',') if n.strip()]
-                            all_names.extend([(name, elem_type) for name in split_names])
+                            expanded_names.extend(split_names)
+                        names_by_field[field] = _dedup_order_names(expanded_names)
+
+                    _ordering_prompt = (
+                        (prompt or "").strip()
+                        or (sb_row['prompt'] or "").strip()
+                        or (sb_row['description'] or "").strip()
+                    )
+                    _raw_character_names = names_by_field.get('characters', [])
+                    try:
+                        _manual_audio_order = json.loads(sb_row['manual_audio_order'] or '[]')
+                    except Exception:
+                        _manual_audio_order = []
+                    _manual_image_characters = _optional_json_name_list(
+                        sb_row['jimeng_image_characters']
+                    )
+                    _manual_audio_characters = _optional_json_name_list(
+                        sb_row['jimeng_audio_characters']
+                    )
 
                     # 预加载该小说的所有元素（人物、场景、道具）用于三级匹配
                     # v3.61.158: 加 id + element_type + active_variant_id + 火山相关全字段,给 resolve_active_character_asset 用
                     cursor = await db2.execute(
-                        "SELECT id, element_type, name, description, finished_image, audio_file, grid_image, aliases, image_url, reference_image, image_prompt, image_status, volc_asset_id, volc_asset_uri, volc_asset_status, volc_asset_group_id, active_variant_id FROM extracted_elements WHERE novel_id = ? AND element_type = 'character'",
+                        "SELECT id, element_type, name, description, finished_image, audio_file, voice_id, grid_image, aliases, image_url, reference_image, image_prompt, image_status, volc_asset_id, volc_asset_uri, volc_asset_status, volc_asset_group_id, active_variant_id FROM extracted_elements WHERE novel_id = ? AND element_type = 'character'",
                         (novel_id,)
                     )
                     character_elements = await cursor.fetchall()
+
+                    _jimeng_refs = _resolve_jimeng_character_references(
+                        _raw_character_names,
+                        _ordering_prompt,
+                        list(character_elements),
+                        _manual_image_characters,
+                        _manual_audio_characters,
+                        _manual_audio_order,
+                    )
+                    _image_character_names = _jimeng_refs["image_names"]
+                    _image_character_set = {name.lower() for name in _image_character_names}
+                    _audio_character_names = list(_jimeng_refs["audio_names"])
+
+                    # 手动音频名单是用户明确选择，忽略“仅说话人”自动屏蔽残留；
+                    # 手动屏蔽 excluded_audios 仍始终生效。
+                    try:
+                        _manual_excluded_names = set(json.loads(sb_row['excluded_audios'] or '[]'))
+                    except Exception:
+                        _manual_excluded_names = set()
+                    _manual_excluded_canonical = set(
+                        name.lower()
+                        for name in _canonicalize_character_names(
+                            list(_manual_excluded_names),
+                            list(character_elements),
+                        )
+                    )
+                    if _jimeng_refs["audio_selection_mode"] == "manual":
+                        _effective_excluded_canonical = _manual_excluded_canonical
+                    else:
+                        _effective_excluded_canonical = set(
+                            name.lower()
+                            for name in _canonicalize_character_names(
+                                list(excluded_audio_names),
+                                list(character_elements),
+                            )
+                        )
+                    _audio_character_names = [
+                        name
+                        for name in _audio_character_names
+                        if name.lower() not in _effective_excluded_canonical
+                    ]
+                    _audio_character_set = {name.lower() for name in _audio_character_names}
+                    _audio_character_order = [
+                        name
+                        for name in _jimeng_refs["audio_order"]
+                        if name.lower() in _audio_character_set
+                    ]
+                    logger.info(
+                        f"[video-gen] 分镜 {storyboard_id} 即梦人物图="
+                        f"{_image_character_names}({_jimeng_refs['image_selection_mode']})；"
+                        f"音频={_audio_character_order}"
+                        f"({_jimeng_refs['audio_selection_mode']}/"
+                        f"{_jimeng_refs['audio_order_mode']})"
+                    )
+
+                    all_names = []
+                    _all_character_names = _dedup_order_names(
+                        _image_character_names + _audio_character_order
+                    )
+                    all_names.extend((name, "character") for name in _all_character_names)
+                    for field in ['scenes', 'props']:
+                        elem_type = field.rstrip('s')
+                        all_names.extend(
+                            (name, elem_type)
+                            for name in names_by_field.get(field, [])
+                        )
 
                     cursor = await db2.execute(
                         "SELECT name, finished_image, audio_file, grid_image, aliases, image_url, volc_asset_uri, volc_asset_status FROM extracted_elements WHERE novel_id = ? AND element_type = 'scene'",
@@ -2695,7 +4526,8 @@ async def _process_video_generation(
                             if matched:
                                 # v3.61.158: 人物走 active variant fallback(字段级 merge)
                                 from services.extraction_service import ExtractionService as _ES
-                                elem = await _ES.resolve_active_character_asset(dict(matched))
+                                elem_dict = await _backfill_character_audio_from_voice(db2, novel_id, dict(matched))
+                                elem = await _ES.resolve_active_character_asset(elem_dict)
                                 _v_tag = elem.get("__active_variant_name")
                                 if _v_tag:
                                     logger.info(f"[video-gen] 人物三级匹配 '{name}' -> '{matched['name']}' [马甲={_v_tag}]")
@@ -2726,40 +4558,46 @@ async def _process_video_generation(
                             # 此函数 `_process_video_generation` 是**即梦 CLI 专用**(走 dreamina.exe),
                             # 即梦完全不认识 asset://xxx URI(那是火山方舟视频专属),
                             # 直接传 → dreamina 当本地文件 open → Windows 报"filename syntax incorrect"
-                            img_added = False
-                            # 优先使用宫格图 → 成品图 → AI生成图(即梦只能用本地文件)
+                            _submit_character_image = (
+                                elem_type != "character"
+                                or name.lower() in _image_character_set
+                            )
+                            img_added = not _submit_character_image
+                            # 优先级:
+                            # - 人物:成品图 → AI生成图 → 宫格图 → 参考图。人物卡片和云端 provider 都按这个口径展示/提交;
+                            #   这里若先用宫格图,会绕过已打 AI 合规标识的成品图,导致视频端仍拿到无标图。
+                            # - 场景/道具:保留老口径,仍优先宫格图 → 成品图 → AI生成图。
                             # v3.61.154 Q4 道具不上传修复:
                             #   原代码三个图都没就**默默 skip**,用户报"关联了道具结果即梦那边没了"
                             #   现在加详细 log 标明每条路径的命中情况,让用户能定位"为啥道具丢了"
                             _tried_paths = []
-                            if not img_added and elem['grid_image']:
-                                img_path = resolve_db_path(elem['grid_image'])
+                            _image_priority = (
+                                ["finished_image", "image_url", "grid_image", "reference_image"]
+                                if elem_type == "character"
+                                else ["grid_image", "finished_image", "image_url"]
+                            )
+                            for _field in _image_priority:
+                                if img_added:
+                                    break
+                                _value = elem[_field] if _field in elem.keys() else None
+                                if not _value:
+                                    _tried_paths.append(f"{_field}=空")
+                                    continue
+                                img_path = resolve_db_path(_value)
                                 if os.path.exists(img_path):
-                                    image_items.append((img_path, name, elem_type))
+                                    if elem_type == "character":
+                                        image_items.append((img_path, name, elem_type, {
+                                            "input_name": name,
+                                            "element_name": elem.get("name"),
+                                            "aliases": elem.get("aliases"),
+                                            "variant": elem.get("__active_variant_name"),
+                                        }))
+                                    else:
+                                        image_items.append((img_path, name, elem_type))
                                     img_added = True
                                 else:
-                                    _tried_paths.append(f"grid_image={elem['grid_image']}(文件不存在)")
-                            elif not img_added:
-                                _tried_paths.append("grid_image=空")
-                            if not img_added and elem['finished_image']:
-                                img_path = resolve_db_path(elem['finished_image'])
-                                if os.path.exists(img_path):
-                                    image_items.append((img_path, name, elem_type))
-                                    img_added = True
-                                else:
-                                    _tried_paths.append(f"finished_image={elem['finished_image']}(文件不存在)")
-                            elif not img_added:
-                                _tried_paths.append("finished_image=空")
-                            if not img_added and elem['image_url']:
-                                img_path = resolve_db_path(elem['image_url'])
-                                if os.path.exists(img_path):
-                                    image_items.append((img_path, name, elem_type))
-                                    img_added = True
-                                else:
-                                    _tried_paths.append(f"image_url={elem['image_url']}(文件不存在)")
-                            elif not img_added:
-                                _tried_paths.append("image_url=空")
-                            if not img_added:
+                                    _tried_paths.append(f"{_field}={_value}(文件不存在)")
+                            if _submit_character_image and not img_added:
                                 logger.warning(
                                     f"[video-gen] 分镜 {storyboard_id} 跳过 {elem_type} '{name}':无可用图片。"
                                     f"尝试路径: {' | '.join(_tried_paths)}。"
@@ -2767,11 +4605,15 @@ async def _process_video_generation(
                                 )
                             # 角色音频:屏蔽判定只看分镜字段里的 name(跟前端写入/读取 key 一致)
                             # v3.61.135: 不再用 elem.name(素材库正式名)二次判定 — 避免别名场景下前后端不一致
-                            if elem['audio_file'] and name not in excluded_audio_names:
+                            _submit_character_audio = (
+                                elem_type != "character"
+                                or name.lower() in _audio_character_set
+                            )
+                            if elem['audio_file'] and _submit_character_audio:
                                 audio_path = resolve_db_path(elem['audio_file'])
                                 if os.path.exists(audio_path):
                                     audio_items.append((audio_path, name))
-                            elif elem['audio_file']:
+                            elif elem['audio_file'] and elem_type == "character":
                                 logger.info(f"[video-gen] 分镜 {storyboard_id} 跳过被屏蔽的音频: {name}")
 
                     # ★ v3.59.53 移除「道具文本扫描补充」逻辑
@@ -2783,39 +4625,56 @@ async def _process_video_generation(
             finally:
                 await db2.close()
 
-        # ★ v3.59.59:发即梦前再过滤一遍音频时长(老用户库里可能存了不合规音频)
-        # 即梦硬限 [2, 15] 秒,超出会让整个视频任务失败,而上传 audio 阶段才报
+        if audio_items:
+            audio_items = _sort_named_assets(
+                audio_items,
+                locals().get("_audio_character_order", []),
+            )
+
+        # 发即梦前按当前模型过滤单条音频时长，并校验所有音频总时长。
+        # 2.0:单条/合计 2-15s；2.5:用户口径 2-30s，实际容差
+        # 单条 [1.8, 30.2]s、合计 <=30.2s。
         # 这里过滤后跳过该音频,保留其他素材让任务继续
         if audio_items:
-            from api.extraction import _probe_audio_duration_seconds, JIMENG_AUDIO_MIN_DURATION, JIMENG_AUDIO_MAX_DURATION
+            from api.extraction import _probe_audio_duration_seconds
+            audio_durations = []
             valid_audios = []
             for ap, an in audio_items:
                 try:
                     dur = _probe_audio_duration_seconds(ap)
-                    if dur is not None and (dur < JIMENG_AUDIO_MIN_DURATION or dur > JIMENG_AUDIO_MAX_DURATION):
+                    if dur is not None:
+                        one_audio_error = reference_audio_duration_error(model_version, [dur])
+                    else:
+                        one_audio_error = ""
+                    if one_audio_error:
                         logger.warning(
                             f"[video-gen] 分镜 {storyboard_id} 跳过音频 '{an}' "
-                            f"(时长 {dur:.2f}s 不在 [{JIMENG_AUDIO_MIN_DURATION:.0f}, {JIMENG_AUDIO_MAX_DURATION:.0f}] 范围)"
+                            f"({one_audio_error})"
                         )
                         continue
+                    if dur is not None:
+                        audio_durations.append(float(dur))
                 except Exception:
                     pass
                 valid_audios.append((ap, an))
             audio_items = valid_audios
+            total_audio_error = reference_audio_duration_error(
+                model_version,
+                audio_durations,
+            )
+            if total_audio_error:
+                raise ValueError(total_audio_error)
 
-        # ─────── 即梦素材硬上限 ───────
-        # 规则(v3.59.54 起):
-        #   - 音频 ≤ 3 个(即梦 API 硬限制,不可放宽)
-        #   - 图片+音频总数 ≤ 10 个(v3.59.54 从 9 放宽到 10)
-        # 超出时按用户指定的优先级裁剪(数字越大越先裁):
-        #   prop(道具) → audio(音频) → reference(关键帧) → chain_prev_frame(尾帧) → character(人物) → scene(场景,最后裁)
-        # v3.61.154 Q4 修复:MAX_TOTAL 10→9 对齐即梦实际上限,避免发上去被即梦拒
-        # v3.61.164:曾试过改回 10,codex 复审指出"10 被即梦拒"的历史风险还在 → 不混进
-        #            当前需求一并发版,改回 9 守住。需要 10 时单独 bump 165 隔离验证
-        MAX_AUDIO = 3
-        MAX_TOTAL = 9
+        # ─────── 即梦 CLI 素材上限（按模型族路由） ───────
+        # 当前主流程没有用户参考视频入口；活动开关可额外注入1段缓存黑屏视频。
+        # 超出时按统一保留优先级裁剪:
+        #   人物 > 场景 > 道具 > 用户关键帧 > 尾帧 > 俯视 A/B。
+        MAX_IMAGES = int(_model_caps["max_images"])
+        MAX_AUDIO = int(_model_caps["max_audios"])
+        MAX_VIDEOS = int(_model_caps["max_videos"])
+        MAX_TOTAL_MATERIALS = int(_model_caps["max_total_materials"])
 
-        # 1) 硬限:音频 ≤ 3(即梦 API 限制)
+        # 1) 音频按当前模型族上限裁剪
         if len(audio_items) > MAX_AUDIO:
             removed = audio_items[MAX_AUDIO:]
             audio_items = audio_items[:MAX_AUDIO]
@@ -2824,17 +4683,27 @@ async def _process_video_generation(
                 f"裁掉 {len(removed)} 个: {[n for _, n in removed]}"
             )
 
-        # 2) 总数 ≤ 9。图片按保留优先级裁剪，同时保持最终上传原始顺序。
-        total = len(image_items) + len(audio_items)
-        if total > MAX_TOTAL:
-            image_limit = max(0, MAX_TOTAL - len(audio_items))
-            kept_indices, removed_indices = _select_image_keep_indices(image_items, image_limit)
+        # 2) 图片按当前模型族上限裁剪
+        if len(image_items) > MAX_IMAGES:
+            kept_indices, removed_indices = _select_image_keep_indices(image_items, MAX_IMAGES)
             removed_names = [_image_asset_name(image_items[idx]) for idx in removed_indices]
             image_items = [image_items[idx] for idx in kept_indices]
             logger.warning(
-                f"[video-gen] 分镜 {storyboard_id} 素材超出 {MAX_TOTAL} 个上限,"
-                f"裁掉 {len(removed_indices)} 张图片: {removed_names}"
+                f"[video-gen] 分镜 {storyboard_id} 图片超出 {MAX_IMAGES} 张上限,"
+                f"按人物>场景>道具>关键帧>尾帧>俯视图裁掉 {len(removed_indices)} 个: {removed_names}"
             )
+
+        # 活动开关只改变即梦 CLI 的传输参数，不写入提示词，也不作为首/尾帧。
+        # 同一比例全局复用一个本地缓存 MP4，避免每个分镜重复生成文件。
+        if include_black_video:
+            from services.jimeng_black_video import prepare_jimeng_reference_videos
+            videos = await prepare_jimeng_reference_videos([], True, ratio)
+            total_materials = len(image_items) + len(audio_items) + len(videos)
+            if len(videos) > MAX_VIDEOS or total_materials > MAX_TOTAL_MATERIALS:
+                raise ValueError(
+                    f"{_model_caps['label']} 开启2秒黑屏视频后素材合计 {total_materials} 个，"
+                    f"超过上限 {MAX_TOTAL_MATERIALS} 个；请减少1个图片或音频素材后重试"
+                )
 
         # 构建文件路径列表和引用描述
         images = [item[0] for item in image_items]
@@ -2842,9 +4711,10 @@ async def _process_video_generation(
 
         logger.info(
             f"[video-gen] 分镜 {storyboard_id} 最终上传: 图片 {len(images)} 张, "
-            f"音频 {len(audios)} 个, 合计 {len(images)+len(audios)} (即梦上限 {MAX_TOTAL})"
+            f"视频 {len(videos)} 个, 音频 {len(audios)} 个 ({_model_caps['label']} 上限: "
+            f"图片≤{MAX_IMAGES}, 视频≤{MAX_VIDEOS}, 音频≤{MAX_AUDIO})"
         )
-        logger.info(f"[video-gen] 分镜 {storyboard_id} 图片: {images}, 音频: {audios}")
+        logger.info(f"[video-gen] 分镜 {storyboard_id} 图片: {images}, 视频: {videos}, 音频: {audios}")
 
         # v3.61.181: 拼装统一走 _build_final_video_prompt helper(同步 ark / cool / xinglian)
         #   行为零变化:即梦 CLI 原 L2143-2260 全套逻辑现在在 helper 内,
@@ -2865,6 +4735,8 @@ async def _process_video_generation(
             audio_items=_aud_items,
             with_file_refs=(generation_mode == "multimodal2video"),
             log_prefix="video-gen",
+            separate_audio_order=True,
+            provider_type="jimeng",
         )
 
         # v3.61.183: 视频提交日志(create_log)— 进 dreamina CLI 前记一条 running
@@ -2884,28 +4756,33 @@ async def _process_video_generation(
                 "resolution": direct_resolution if generation_mode not in ("image2video", "multimodal2video") else None,
                 "model_version": model_version,
                 "generation_mode": generation_mode,
+                "include_black_video": include_black_video,
             },
         )
 
-        # 根据 generation_mode 调用不同的生成方法
-        if generation_mode == "image2video" and images:
-            logger.info(f"[video-gen] 分镜 {storyboard_id} 使用 image2video 生成视频")
-            result = await video_service.image2video(
-                image=images[0], prompt=final_prompt, duration=duration,
-                model_version=model_version, poll=0
-            )
-        elif generation_mode == "multimodal2video" and images:
-            logger.info(f"[video-gen] 分镜 {storyboard_id} 使用 multimodal2video 生成视频")
-            # multimodal2video 最多9张图，3个音频
-            result = await video_service.multimodal2video(
-                prompt=final_prompt, images=images[:9], audios=audios[:3],
-                duration=duration, ratio=ratio,
-                model_version=model_version, poll=0
-            )
-        else:
+        async def _submit_jimeng_once() -> dict:
+            # 根据 generation_mode 调用不同的生成方法
+            if generation_mode == "image2video" and images:
+                logger.info(f"[video-gen] 分镜 {storyboard_id} 使用 image2video 生成视频")
+                return await video_service.image2video(
+                    image=images[0], prompt=final_prompt, duration=duration,
+                    resolution=direct_resolution,
+                    model_version=model_version, poll=0
+                )
+            if generation_mode == "multimodal2video" and (images or videos or audios):
+                logger.info(f"[video-gen] 分镜 {storyboard_id} 使用 multimodal2video 生成视频")
+                return await video_service.multimodal2video(
+                    prompt=final_prompt,
+                    images=images[:MAX_IMAGES],
+                    videos=videos[:MAX_VIDEOS],
+                    audios=audios[:MAX_AUDIO],
+                    duration=duration, ratio=ratio,
+                    resolution=direct_resolution,
+                    model_version=model_version, poll=0
+                )
             logger.info(f"[video-gen] 分镜 {storyboard_id} 使用 text2video 生成视频 (generation_mode={generation_mode}, images={images})")
             # 默认 text2video，或者没有图片时回退到 text2video
-            result = await video_service.generate_video(
+            return await video_service.generate_video(
                 prompt=final_prompt,
                 duration=duration,
                 ratio=ratio,
@@ -2914,19 +4791,64 @@ async def _process_video_generation(
                 poll=0,
             )
 
+        result = {}
+        _submit_visibility_checked = False
+        _submit_visibility: Optional[bool] = None
+        _max_submit_attempts = 2
+        for _submit_attempt in range(1, _max_submit_attempts + 1):
+            result = await _submit_jimeng_once()
+            _submit_visibility_checked = False
+            _submit_visibility = None
+            if result.get("success"):
+                _data = result.get("data", {}) or {}
+                _gen_status = _data.get("gen_status", "")
+                _submit_id = _data.get("submit_id")
+                _fail_reason = _data.get("fail_reason", "")
+                if (
+                    _gen_status == "fail"
+                    and _submit_id
+                    and _is_jimeng_transient_submit_failure(_fail_reason)
+                ):
+                    _submit_visibility = await _confirm_jimeng_submit_visible(
+                        _submit_id,
+                        attempts=5,
+                        delay_seconds=3.0,
+                    )
+                    _submit_visibility_checked = True
+                    if _submit_visibility is False and _submit_attempt < _max_submit_attempts:
+                        logger.warning(
+                            f"[video-gen] 分镜 {storyboard_id} 第 {_submit_attempt} 次提交超时且即梦后台未确认 "
+                            f"submit_id={_submit_id},不自动重试以避免即梦侧重复生成;进入轮询后由幽灵任务检测兜底"
+                        )
+            elif (
+                _submit_attempt < _max_submit_attempts
+                and _is_jimeng_transient_submit_failure(str(result.get("error") or result.get("message") or ""))
+            ):
+                logger.warning(
+                    f"[video-gen] 分镜 {storyboard_id} 第 {_submit_attempt} 次提交网络/超时失败(无可认领 submit_id),"
+                    f"自动重试一次: {str(result.get('error') or result.get('message') or '')[:200]}"
+                )
+                await asyncio.sleep(3)
+                continue
+            break
+
         if result.get("success"):
             data = result.get("data", {})
             gen_status = data.get("gen_status", "")
             submit_id = data.get("submit_id")
+            fail_reason = data.get("fail_reason", "")
+            guidance = data.get("guidance", "")
 
             # v3.61.254 修复②:提交即失败(gen_status=fail)前先看有没有 submit_id。
             #   即梦撞 1310 等场景会返回"fail + submit_id"混合响应 —— 任务其实已建在生成。
             #   旧逻辑在取 submit_id 之前就 return,把这种已受理任务误判失败 → 上层 60s 后重复提交撞自己并发。
-            #   故:只要拿到 submit_id,一律按"已提交"保存进轮询,由后续 poll 判最终 done/failed;
-            #       只有真没 submit_id 的 fail 才立即标失败。
+            # v3.61.295: 但"提交网络超时 + submit_id"不能直接认领。
+            #   冷启动首条视频实测会返回 context deadline exceeded + submit_id,query_result 一直 querying,
+            #   但即梦任务列表没有对应活跃任务。此时 submit_id 可能只是 CLI 本地幽灵记录。
+            #   故:业务类 fail(如 1310)仍可认领;网络/超时类 fail 必须先按 submit_id 反查即梦任务列表。
+            #   v3.61.xxx:只要 CLI 给了 submit_id 就不自动二次提交,避免实际已落地但短时不可见时重复扣费。
             if gen_status == "fail" and not submit_id:
-                fail_reason = data.get("fail_reason", "未知原因")
-                guidance = data.get("guidance", "")
+                fail_reason = fail_reason or "未知原因"
                 logger.error(f"[video-gen] 分镜 {storyboard_id} 提交即失败(无 submit_id): {fail_reason}")
                 if guidance:
                     logger.error(f"[video-gen] 分镜 {storyboard_id} 解决建议: {guidance}")
@@ -2938,16 +4860,75 @@ async def _process_video_generation(
                 return
 
             if gen_status == "fail" and submit_id:
-                logger.warning(
-                    f"[video-gen] 分镜 {storyboard_id} 即梦返回 gen_status=fail 但带 submit_id={submit_id} "
-                    f"(fail_reason={data.get('fail_reason')!r}) → 任务已受理,按已提交进轮询,不立即标失败"
-                )
+                if _is_jimeng_transient_submit_failure(fail_reason):
+                    if _submit_visibility_checked:
+                        visible = _submit_visibility
+                    else:
+                        visible = await _confirm_jimeng_submit_visible(
+                            submit_id,
+                            attempts=5,
+                            delay_seconds=3.0,
+                        )
+                    if visible is False:
+                        logger.warning(
+                            f"[video-gen] 分镜 {storyboard_id} 提交超时且 submit_id={submit_id} "
+                            f"暂未出现在即梦任务列表;仍按已受理进入轮询,避免自动重提交造成重复扣费: {fail_reason!r}"
+                        )
+                    elif visible is True:
+                        logger.warning(
+                            f"[video-gen] 分镜 {storyboard_id} 提交超时但即梦后台确认 submit_id={submit_id} "
+                            f"已在即梦任务列表,按已受理进入轮询"
+                        )
+                    else:
+                        logger.warning(
+                            f"[video-gen] 分镜 {storyboard_id} 提交超时且无法反查即梦任务列表 "
+                            f"submit_id={submit_id},保守按已提交进入轮询: {fail_reason!r}"
+                        )
+                elif _is_jimeng_recoverable_submit_failure(fail_reason):
+                    logger.warning(
+                        f"[video-gen] 分镜 {storyboard_id} 即梦返回可恢复 gen_status=fail 且带 submit_id={submit_id} "
+                        f"(fail_reason={data.get('fail_reason')!r}) → 按已排队进入轮询"
+                    )
+                else:
+                    visible = await _confirm_jimeng_submit_visible(
+                        submit_id,
+                        attempts=2,
+                        delay_seconds=1.0,
+                    )
+                    if visible is True:
+                        logger.warning(
+                            f"[video-gen] 分镜 {storyboard_id} 即梦提交阶段失败但 submit_id={submit_id} 已在即梦任务列表可见,"
+                            f"继续按已受理任务轮询: {fail_reason!r}"
+                        )
+                    else:
+                        full_reason = _translate_jimeng_fail_reason(fail_reason, guidance)
+                        logger.warning(
+                            f"[video-gen] 分镜 {storyboard_id} 即梦提交阶段硬失败但带 submit_id={submit_id},"
+                            f"任务列表反查未确认任务存在,不再认领为生成中: {fail_reason!r}"
+                        )
+                        await _log_video_submit_end(_video_log_id, success=False, fail_reason=full_reason)
+                        await storyboard_service.update_video_status(
+                            storyboard_id,
+                            "failed",
+                            fail_reason=full_reason,
+                        )
+                        return
 
             if submit_id:
                 # 保存 submit_id 到数据库，状态保持 generating
-                await storyboard_service.update_submit_id(storyboard_id, submit_id, "generating")
+                submit_saved = await storyboard_service.update_submit_id(
+                    storyboard_id,
+                    submit_id,
+                    "generating",
+                )
                 logger.info(f"分镜 {storyboard_id} 视频任务已提交，submit_id: {submit_id}，模型: {model_name}，模式: {generation_mode}")
                 await _log_video_submitted(_video_log_id, provider="jimeng", submit_id=submit_id)
+                # 单镜/旧批量接口以前完全依赖 VideoView 的前端定时器推进
+                # query_result -> 下载 -> 尾帧回写。用户切换菜单后组件卸载，
+                # 定时器停止，本地就会长期停在 generating。提交成功后由后端
+                # 持续收敛；全局队列已有自己的 worker，调用时显式关闭本任务。
+                if submit_saved and start_background_reconcile:
+                    _ensure_standalone_video_reconcile(storyboard_id)
             else:
                 # 提交成功但没有 submit_id，视为失败
                 # 把 dreamina 返回的完整 data 当作失败原因,便于排查
@@ -2969,6 +4950,11 @@ async def _process_video_generation(
                     "若用即梦模式,请点页面顶部「登录即梦」按钮重新授权;"
                     "若用 Cool / 星链云 / 火山方舟等渠道,请直接点「重新生成」重试。"
                 )
+            elif (
+                "dreamina_cli" in _err_str.lower()
+                and ("not allowed" in _err_str.lower() or "permission denied" in _err_str.lower())
+            ):
+                _fail_msg = _translate_jimeng_fail_reason(_err_str)
             else:
                 _fail_msg = f"视频任务提交失败: {_err_str[:500]}"
             await _log_video_submit_end(_video_log_id, success=False, fail_reason=_fail_msg)
@@ -3032,6 +5018,26 @@ async def batch_generate_videos(request: BatchVideoGenerateRequest, background_t
     if skipped:
         logger.warning(f"[batch-generate] 跳过 {len(skipped)} 个已在生成中的分镜(防重复扣费): {skipped}")
     if not filtered_ids:
+        queued_count = 0
+        for sid in skipped:
+            # skipped 不多,这里仅用于更准确的用户提示。
+            try:
+                _db = await get_db()
+                try:
+                    _cur = await _db.execute("SELECT video_status FROM storyboards WHERE id = ?", (sid,))
+                    _r = await _cur.fetchone()
+                    if _r and ((_r["video_status"] or "").lower() == "queued"):
+                        queued_count += 1
+                finally:
+                    await _db.close()
+            except Exception:
+                pass
+        if queued_count == len(raw_ids):
+            return {
+                "success": False,
+                "message": f"所选 {len(raw_ids)} 个分镜都已在全局队列等待生成,为避免重复扣费已拒绝。",
+                "skipped": skipped,
+            }
         return {
             "success": False,
             "message": f"所选 {len(raw_ids)} 个分镜全部已在生成中(submit 不到 30 分钟),为避免重复扣费已拒绝。请等当前任务完成后再试",
@@ -3058,7 +5064,7 @@ class AbortChainRequest(BaseModel):
     """
     by_id_list: List[int]
     failed_storyboard_id: int
-    fail_reason: Optional[str] = None  # 可选:用于 fail_reason 文案,默认"批次中断:#X 失败"
+    fail_reason: Optional[str] = None  # 可选:用于 fail_reason 文案,默认"前置分镜 #X 失败,本镜未生成"
 
 
 @router.post("/abort-chain-after")
@@ -3072,10 +5078,42 @@ async def abort_chain_after(request: AbortChainRequest):
     if not after_ids:
         return {"success": True, "aborted": 0, "message": "失败镜已是最后一项,无后续可中断"}
 
-    reason = request.fail_reason or f"批次中断:分镜 #{request.failed_storyboard_id} 失败,串行尾帧模式停止后续"
     db = await get_db()
     aborted = 0
     try:
+        cursor = await db.execute(
+            "SELECT video_status, submit_id, video_fail_reason FROM storyboards WHERE id = ?",
+            (request.failed_storyboard_id,)
+        )
+        failed_row = await cursor.fetchone()
+        failed_status = failed_row["video_status"] if failed_row else None
+        if failed_status == "download_failed":
+            logger.info(
+                f"[abort-chain] 跳过中断:#{request.failed_storyboard_id} 是 download_failed,"
+                "仅本地下载失败,后续镜保持原状态"
+            )
+            return {
+                "success": True,
+                "aborted": 0,
+                "aborted_ids": [],
+                "message": "上一镜已生成但本地下载失败,后续镜保持待生成;请先重试下载上一镜",
+            }
+
+        if failed_status not in ("failed", "chain_aborted"):
+            logger.info(
+                f"[abort-chain] 跳过中断:#{request.failed_storyboard_id} 当前状态不是失败态"
+                f"(status={failed_status}, submit_id={(failed_row['submit_id'] if failed_row else None)}, "
+                f"reason={(failed_row['video_fail_reason'] if failed_row else None)})"
+            )
+            return {
+                "success": True,
+                "aborted": 0,
+                "aborted_ids": [],
+                "skipped": True,
+                "message": "前置分镜仍在生成或未确认失败,后续镜保持原状态",
+            }
+
+        reason = request.fail_reason or f"前置分镜(id #{request.failed_storyboard_id})失败,本镜未生成;请先重试该前置分镜"
         # 仅对未定型镜执行(不动 done/failed/download_failed/chain_aborted 已经定型的)
         # v3.61.153 codex P1:加 'queued' — 串行批次后续镜常在 queued 状态,
         # 原条件漏了,导致前镜失败后后续镜不会被 chain_aborted
@@ -3095,6 +5133,63 @@ async def abort_chain_after(request: AbortChainRequest):
         await db.commit()
         logger.info(f"[abort-chain] 因 #{request.failed_storyboard_id} 失败,中断后续 {aborted} 镜")
         return {"success": True, "aborted": aborted, "aborted_ids": targets}
+    finally:
+        await db.close()
+
+
+class AbortStuckVideoRequest(BaseModel):
+    storyboard_ids: List[int]
+    reason: Optional[str] = None
+
+
+@router.post("/abort-stuck-video")
+async def abort_stuck_video(request: AbortStuckVideoRequest):
+    """用户手动中止卡住的视频生成:把指定分镜里仍 generating/queued 的镜标为 failed,
+    让用户能立刻重新勾选生成(不再干等 6 小时兜底)。
+    注:不取消上游任务(部分 provider 无 cancel),仅解除本地"生成中"占用。"""
+    if not request.storyboard_ids:
+        return {"success": True, "aborted": 0, "aborted_ids": []}
+    reason = request.reason or "已手动中止生成,可重新勾选生成"
+    db = await get_db()
+    aborted_ids: list = []
+    try:
+        placeholder = ",".join(["?"] * len(request.storyboard_ids))
+        cursor = await db.execute(
+            f"SELECT id FROM storyboards WHERE id IN ({placeholder}) "
+            f"  AND video_status IN ('generating','queued')",
+            request.storyboard_ids,
+        )
+        targets = [r["id"] for r in await cursor.fetchall()]
+        for tid in targets:
+            await db.execute(
+                """
+                UPDATE storyboards
+                SET video_status = ?,
+                    video_fail_reason = ?,
+                    submit_id = CASE
+                        WHEN COALESCE(video_provider, 'jimeng') = 'jimeng' THEN NULL
+                        ELSE submit_id
+                    END
+                WHERE id = ?
+                """,
+                ("failed", reason, tid),
+            )
+            await db.execute(
+                """
+                UPDATE video_task_queue
+                SET status = 'aborted',
+                    finished_at = ?,
+                    error_code = 'USER_ABORTED',
+                    error_message = ?
+                WHERE storyboard_id = ?
+                  AND status IN ('queued', 'generating')
+                """,
+                (now_beijing_str(), reason, tid),
+            )
+            aborted_ids.append(tid)
+        await db.commit()
+        logger.info(f"[abort-stuck-video] 用户手动中止 {len(aborted_ids)} 个卡住的视频任务: {aborted_ids}")
+        return {"success": True, "aborted": len(aborted_ids), "aborted_ids": aborted_ids}
     finally:
         await db.close()
 
@@ -3206,8 +5301,8 @@ async def _apply_speaker_filter_to_storyboard(sb_id: int, prompt: str) -> set:
         await db.close()
 
 
-def _extract_speakers_from_prompt(text: str) -> set:
-    """v3.61.131/134: 从分镜 prompt 抽出所有说话人(台词/内心OS/画外音/VO/OS 多种字段)
+def _extract_speaker_order_from_prompt(text: str) -> List[str]:
+    """按 prompt 中首次开口的文本位置抽取说话人顺序。
 
     宽容匹配(避免漏识别导致误屏蔽真实说话人):
         # 完整规范格式
@@ -3221,56 +5316,659 @@ def _extract_speakers_from_prompt(text: str) -> set:
         VO: 角色名: ...
         角色名(VO): ...               (括号内 VO)
         角色名(内心OS): ...
+        # 组合模板同一行格式
+        台词/OS/口型:现场台词:角色名:「...」 / 内心OS:角色名:「...」
+        台词/OS/口型:角色画外台词:角色名:「...」
+        # 组合模板键值格式
+        台词/OS/口型:类型=现场台词/角色=角色名:「...」
+        台词/OS/口型:类型=角色画外台词/角色=角色名:「...」
 
-    返回去重后的角色名集合。"旁白"过滤掉。
-    若无任何匹配,返回空集合 — 调用方回退"全部带音频"老逻辑。
+    返回按首次发声位置去重后的角色名列表。"旁白"过滤掉。
+    不按正则分支的执行先后排序，避免括号 VO 写在前面、规范台词写在后面时
+    被错误地反排。若无任何匹配，返回空列表。
     """
     if not text:
-        return set()
+        return []
     import re
-    speakers = set()
+    matches: List[tuple[int, int, str]] = []
+    match_seq = 0
+    rejected = {
+        '旁白', '无', 'none', 'None', '-', '台词', '内心OS', '画外音', 'OS', 'VO',
+        '类型', '角色', '现场台词', '角色画外台词', '画外台词',
+    }
+    rejected_lower = {name.lower() for name in rejected}
 
-    # ① 完整 / 半完整字段格式:字段:角色名:引号
-    # 接受多种引号:「」 ""  ''  「  "  '  以及无引号(到行尾)
-    # 接受空格变体
+    def _add_name(raw_name: str, position: int):
+        nonlocal match_seq
+        name = (raw_name or "").strip()
+        if name and name.lower() not in rejected_lower:
+            matches.append((max(0, position), match_seq, name))
+            match_seq += 1
+
+    def _collect(pattern, source=text, base_offset: int = 0):
+        for match in pattern.finditer(source):
+            _add_name(match.group(1), base_offset + match.start(1))
+
+    # ① 行首完整 / 半完整字段格式:字段:角色名:引号
+    # 必须从行首识别,且空白仅允许空格/Tab,不能用 \s 跨行。
+    # 否则“台词/OS:\n台词:云瓷:”会从标题里的 OS: 起步,错误抓成说话人“台词”,
+    # 同时吞掉真正的“台词:云瓷:”匹配。
     pattern1 = re.compile(
-        r'(?:台词|内心\s*OS|画外音|OS|VO)\s*[:：]\s*([^:：「"\'\n（(]{1,15}?)\s*[:：]'
+        r'^[ \t]*(?:[-*•][ \t]*)?'
+        r'(?:现场台词|角色画外台词|画外台词|台词|内心[ \t]*OS|画外音|OS|VO)'
+        r'[ \t]*[:：][ \t]*'
+        r'([^:：「"\'\r\n（(〔\[｜/]{1,15}?)[ \t]*[:：]',
+        re.MULTILINE,
     )
-    for m in pattern1.finditer(text):
-        name = m.group(1).strip()
-        # 过滤明显不是人名的占位
-        if name and name not in ('旁白', '无', 'none', 'None', '-'):
-            speakers.add(name)
+    _collect(pattern1)
 
-    # ② 角色名(VO/OS/内心OS): ... 这种括号变体
+    # ② 新组合模板把多段人声放在同一行。既匹配总字段后的第一段，
+    # 也匹配 “/ 现场台词:另一角色:” 这类后续段。
+    pattern_inline = re.compile(
+        r'(?:台词[ \t]*/[ \t]*OS[ \t]*/[ \t]*口型[ \t]*[:：]|'
+        r'[/｜;；][ \t]*)'
+        r'(?:现场台词|角色画外台词|画外台词|台词|内心[ \t]*OS|画外音|OS|VO)'
+        r'[ \t]*[:：][ \t]*'
+        r'([^:：「"\'\r\n（(〔\[｜/]{1,15}?)[ \t]*[:：]',
+        re.MULTILINE,
+    )
+    _collect(pattern_inline)
+
+    # ③ 组合模板键值格式。只在“台词/OS/口型”字段行内读取角色键，
+    # 避免动作、人物状态等其他行里的“角色=某人”污染说话人。
+    combined_heading = re.compile(
+        r'^[ \t]*(?:[-*•][ \t]*)?'
+        r'台词[ \t]*/[ \t]*OS[ \t]*/[ \t]*口型[ \t]*[:：]',
+    )
+    keyed_role = re.compile(
+        r'(?:^|[/｜;；:：])[ \t]*角色[ \t]*(?:[=＝]|[:：])[ \t]*'
+        r'([^:：「"\'\r\n（(〔\[｜/;；=＝]{1,15}?)[ \t]*[:：]',
+    )
+    # 极少数模型会把“类型=现场台词/角色=裴砚之”退化成“类型:裴砚之”。
+    # 仅在组合字段行首兜底，并通过 rejected 排除“现场台词”等类型值。
+    degraded_type_role = re.compile(
+        r'^[ \t]*(?:[-*•][ \t]*)?'
+        r'台词[ \t]*/[ \t]*OS[ \t]*/[ \t]*口型[ \t]*[:：][ \t]*'
+        r'类型[ \t]*[:：][ \t]*'
+        r'([^:：「"\'\r\n（(〔\[｜/;；=＝]{1,15}?)[ \t]*[:：]',
+    )
+    line_offset = 0
+    for line_with_ending in text.splitlines(keepends=True):
+        line = line_with_ending.rstrip("\r\n")
+        if not combined_heading.match(line):
+            line_offset += len(line_with_ending)
+            continue
+        _collect(keyed_role, line, line_offset)
+        degraded_match = degraded_type_role.match(line)
+        if degraded_match:
+            _add_name(degraded_match.group(1), line_offset + degraded_match.start(1))
+        line_offset += len(line_with_ending)
+
+    # ④ 角色名(VO/OS/内心OS): ... 这种括号变体
     pattern2 = re.compile(
-        r'([^\s:：「\n（(]{1,15}?)\s*[\((]\s*(?:VO|OS|内心\s*OS|画外音|旁白)\s*[\))]\s*[:：]'
+        r'^[ \t]*(?:[-*•][ \t]*)?'
+        r'([^\s:：「\r\n（(]{1,15}?)[ \t]*[\((][ \t]*'
+        r'(?:VO|OS|内心[ \t]*OS|画外音|旁白)[ \t]*[\))][ \t]*[:：]',
+        re.MULTILINE,
     )
-    for m in pattern2.finditer(text):
-        name = m.group(1).strip()
-        if name and name not in ('旁白', '无', 'none', 'None', '-'):
-            speakers.add(name)
+    _collect(pattern2)
 
-    return speakers
+    ordered: List[str] = []
+    seen = set()
+    for _, _, name in sorted(matches, key=lambda item: (item[0], item[1])):
+        key = name.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(name)
+    return ordered
 
 
-def _extract_section_duration(text: str) -> Optional[int]:
+def _extract_speakers_from_prompt(text: str) -> set:
+    """兼容旧调用：返回说话人集合；顺序需求请用 _extract_speaker_order_from_prompt。"""
+    return set(_extract_speaker_order_from_prompt(text))
+
+
+def _dedup_order_names(names: List[str]) -> List[str]:
+    """人物顺序字段统一去空、大小写不敏感去重，并保留首次出现。"""
+    result: List[str] = []
+    seen = set()
+    source = [names] if isinstance(names, str) else (names or [])
+    for raw_name in source:
+        for part in re.split(r'[,，、]', str(raw_name or "")):
+            name = part.strip()
+            key = name.lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            result.append(name)
+    return result
+
+
+_ENABLED_PROP_FIELD_RE = re.compile(
+    r"(?<![A-Za-z0-9_\u4e00-\u9fff])启用道具\s*(?:=|＝|[:：])"
+)
+
+
+def _merge_structured_enabled_props(
+    stored_props: List[str],
+    prompt: str,
+    prop_elements: Optional[List[Any]] = None,
+    excluded_props: Optional[List[str]] = None,
+) -> tuple[List[str], bool]:
+    """合并节级 ``启用道具``，并告知调用方是否必须关闭全文补扫。
+
+    - 存在 ``启用道具``：它是当前小节道具外显白名单，只补充该名单中能映射
+      到素材库的道具，禁止再从结尾状态、隐藏物、钩子等全文区域扫入道具。
+    - 不存在：保留旧模板的全文补扫兜底。
+    - 已保存/手动加入的 props 不删除，避免程序擅自覆盖用户选择。
+    - 用户显式移除的 excluded_props 优先于模板里的 ``启用道具``，否则删除后
+      会在刷新关联元素时被结构化白名单立即补回；手动重新加入 stored_props
+      仍拥有最高优先级，兼容“删掉后又主动加回”的操作。
+    """
+    merged = _dedup_order_names(stored_props)
+    text = str(prompt or "")
+    has_enabled_field = bool(_ENABLED_PROP_FIELD_RE.search(text))
+    if not has_enabled_field:
+        return merged, False
+
+    normalized_elements = [
+        dict(element) if hasattr(element, "keys") else (element or {})
+        for element in (prop_elements or [])
+    ]
+
+    def _canonical_prop_keys(names: Optional[List[str]]) -> set[str]:
+        """把正式名/别名统一映射到素材库正式名，供排除名单可靠比较。"""
+        keys: set[str] = set()
+        for raw_name in names or []:
+            name = str(raw_name or "").strip()
+            if not name:
+                continue
+            keys.add(name.casefold())
+            matched = find_best_match(name, normalized_elements, 'prop')
+            if matched:
+                canonical = str(matched.get("name") or "").strip()
+                if canonical:
+                    keys.add(canonical.casefold())
+        return keys
+
+    # 当前已落库 props 代表用户当前选择，优先级高于历史 excluded；这与
+    # StoryboardService.update_storyboard 中“手动重新加入即清除排除”保持一致。
+    stored_prop_keys = _canonical_prop_keys(merged)
+    blocked_prop_keys = _canonical_prop_keys(excluded_props) - stored_prop_keys
+    declared_enabled = _match_section_prop_names(
+        text,
+        normalized_elements,
+        enforce_visual_evidence=False,
+    )
+    matched_enabled = _match_section_prop_names(
+        text,
+        normalized_elements,
+    )
+    # 历史分镜可能已经把“启用清单里声明、但逐镜从未显露”的道具写入 props。
+    # 只过滤这种有明确结构化冲突的自动关联项；未出现在启用清单里的手动道具
+    # 仍保留，避免程序擅自覆盖用户选择。
+    no_visual_evidence = {
+        name.casefold()
+        for name in declared_enabled
+        if name not in matched_enabled
+    }
+    if no_visual_evidence:
+        invalid_variants = set(no_visual_evidence)
+        for element in normalized_elements:
+            canonical = str(element.get("name") or "").strip()
+            if canonical.casefold() not in no_visual_evidence:
+                continue
+            aliases_raw = element.get("aliases") or []
+            if isinstance(aliases_raw, str):
+                try:
+                    aliases_raw = json.loads(aliases_raw)
+                except Exception:
+                    aliases_raw = re.split(r"[,，、]", aliases_raw)
+            invalid_variants.update(
+                str(alias).strip().casefold()
+                for alias in (aliases_raw if isinstance(aliases_raw, list) else [])
+                if str(alias).strip()
+            )
+        merged = [
+            name
+            for name in merged
+            if str(name).strip().casefold() not in invalid_variants
+        ]
+
+    seen = {name.lower() for name in merged}
+    for name in matched_enabled:
+        key = str(name or "").strip().lower()
+        if key in blocked_prop_keys:
+            logger.info(
+                "[storyboard-elements] 启用道具跳过(用户已显式移除): '%s'",
+                str(name).strip(),
+            )
+            continue
+        if key and key not in seen:
+            seen.add(key)
+            merged.append(str(name).strip())
+    return merged, True
+
+
+_SHOT_LINE_RE = re.compile(
+    r'(?mi)^[ \t]*(?:[-*#>]+[ \t]*)*(?:镜号|镜头|镜|Shot)[ \t]*\d+'
+)
+_VOICE_FIELD_RE = re.compile(
+    r'(?:^|[|｜/;；])[ \t]*(?:'
+    r'台词[ \t]*/[ \t]*OS[ \t]*/[ \t]*口型|'
+    r'现场台词|角色画外台词|画外台词|台词|内心[ \t]*OS|画外音|OS|VO|'
+    r'对白|人声|口型'
+    r')[ \t]*[:：]',
+    re.IGNORECASE,
+)
+_VISUAL_TRAILER_RE = re.compile(
+    r'(?mi)^[ \t]*(?:[📎🔗📏📋]\s*)?(?:'
+    r'本节结尾状态|本节回收目标|本节人声审计|'
+    r'本节总时长|本小节总时长|自查|检查清单'
+    r')[^\r\n]*'
+)
+_STRUCTURED_VISIBLE_FIELD_RE = re.compile(
+    # 同时兼容：
+    #   本镜人物白名单:本镜可见人物=...
+    #   本镜人物白名单:可见人物=...
+    # 负向后顾避免把“局部可见人物”里的“可见人物”再次截取。
+    r'(?<![A-Za-z0-9_\u4e00-\u9fff])'
+    r'(?:本镜)?(?:局部可见人物|可见人物|新入场人物)'
+    r'[ \t]*(?:=|＝|[:：])[ \t]*'
+    r'(.*?)'
+    r'(?=[ \t]*[/／｜|;；][ \t]*(?:本镜)?(?:'
+    r'局部可见人物|可见人物|新入场人物|退场人物|画外声源|启用角色参考'
+    r')[ \t]*(?:=|＝|[:：])|[\r\n]|$)',
+)
+
+
+def _visual_story_text(prompt: str) -> str:
+    """只保留可用于判断人物画面首次出镜的镜头叙述。
+
+    模板节头中的人物白名单、起始状态会先列全员，不能拿来决定图片顺序；
+    台词/OS/画外音只代表发声，也不能冒充画面出镜。因此优先从第一条真实
+    镜头行开始，逐行剥掉人声字段，并在整节镜头结束后截断节尾状态/审计块。
+    “本镜人声审计”是每镜内部字段，不能拿它截断整节，否则第二镜及后续
+    才出场的人物会被误判为不出镜。
+    """
+    text = prompt or ""
+    shot_match = _SHOT_LINE_RE.search(text)
+    if shot_match:
+        text = text[shot_match.start():]
+
+    trailer_match = _VISUAL_TRAILER_RE.search(text)
+    if trailer_match:
+        text = text[:trailer_match.start()]
+
+    # 新模板每镜都有明确的视觉白名单。优先只读“可见/局部可见/新入场”，
+    # 故意不读同一行后面的“本镜画外声源”，避免尚未入画的先说话角色
+    # 抢到人物图片前排。
+    structured_visible = [
+        match.group(1).strip()
+        for match in _STRUCTURED_VISIBLE_FIELD_RE.finditer(text)
+        if match.group(1).strip()
+    ]
+    if structured_visible:
+        return "\n".join(structured_visible)
+
+    visual_lines: List[str] = []
+    for line in text.splitlines():
+        voice_match = _VOICE_FIELD_RE.search(line)
+        if voice_match:
+            # 一行可能是“镜头1...｜画面...｜台词:...”，只删人声字段之后；
+            # 若本行本来就是台词字段，则整行自然变为空。
+            line = line[:voice_match.start()]
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(
+            r'^(?:【)?(?:本节人物与道具白名单|场景起始状态|本节起始状态|'
+            r'本节人物状态|人物白名单|角色白名单)',
+            stripped,
+        ):
+            continue
+        visual_lines.append(line)
+    return "\n".join(visual_lines)
+
+
+def _order_characters_by_visual_appearance(
+    character_names: List[str],
+    prompt: str,
+) -> List[str]:
+    """人物图片顺序：按镜头画面叙述中的首次出镜；未命中者稳定追加。"""
+    candidates = _dedup_order_names(character_names)
+    visual_text = _visual_story_text(prompt)
+    found: List[tuple[int, int, str]] = []
+    missing: List[str] = []
+    for original_index, name in enumerate(candidates):
+        position = visual_text.find(name)
+        if position < 0:
+            missing.append(name)
+        else:
+            found.append((position, original_index, name))
+    found.sort(key=lambda item: (item[0], item[1]))
+    return [name for _, _, name in found] + missing
+
+
+def _optional_json_name_list(raw_value: Any) -> Optional[List[str]]:
+    """读取可空 JSON 人名列表：NULL 表示自动，[] 表示用户明确不提交。"""
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, list):
+        return _dedup_order_names(raw_value)
+    try:
+        parsed = json.loads(raw_value or "[]")
+    except Exception:
+        return None
+    return _dedup_order_names(parsed if isinstance(parsed, list) else [])
+
+
+def _character_element_aliases(element: Any) -> List[str]:
+    data = dict(element) if hasattr(element, "keys") else (element or {})
+    aliases_raw = data.get("aliases") or []
+    if isinstance(aliases_raw, str):
+        try:
+            aliases_raw = json.loads(aliases_raw)
+        except Exception:
+            aliases_raw = re.split(r"[,，、]", aliases_raw)
+    return _dedup_order_names(aliases_raw if isinstance(aliases_raw, list) else [])
+
+
+def _canonicalize_character_names(
+    names: List[str],
+    character_elements: Optional[List[Any]] = None,
+) -> List[str]:
+    """把提示词/旧分镜里的简称映射到素材库正式名，无法匹配时保留原名。"""
+    result: List[str] = []
+    seen = set()
+    elements = character_elements or []
+    for raw_name in _dedup_order_names(names):
+        matched = find_best_match(raw_name, elements, "character") if elements else None
+        name = str((matched or {}).get("name") or raw_name).strip()
+        key = name.lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(name)
+    return result
+
+
+def _order_names_by_reference(names: List[str], reference_order: List[str]) -> List[str]:
+    """按参考顺序稳定排列一个人名集合，参考中未出现的人保持原相对顺序置后。"""
+    candidates = _dedup_order_names(names)
+    rank = {
+        str(name or "").strip().lower(): index
+        for index, name in enumerate(_dedup_order_names(reference_order))
+        if str(name or "").strip()
+    }
+    return [
+        name
+        for _, name in sorted(
+            enumerate(candidates),
+            key=lambda pair: (
+                rank.get(pair[1].lower(), len(rank) + pair[0]),
+                pair[0],
+            ),
+        )
+    ]
+
+
+def _extract_visual_character_order(
+    character_names: List[str],
+    prompt: str,
+    character_elements: Optional[List[Any]] = None,
+) -> tuple[List[str], bool]:
+    """返回真正出镜的人物顺序，以及本次视觉识别是否足够可信。
+
+    有“本镜可见人物/局部可见/新入场”字段时，即便三个字段都写“无”，
+    也视为可信的显式结果；旧模板没有结构字段时，仅在视觉叙述确实命中
+    至少一个人物名时才可信，否则由调用方回退旧 characters，避免老项目
+    因模板格式不同突然丢光人物图。
+    """
+    candidates = _canonicalize_character_names(character_names, character_elements)
+    visual_text = _visual_story_text(prompt)
+    has_structured_visible_fields = bool(_STRUCTURED_VISIBLE_FIELD_RE.search(prompt or ""))
+    elements = character_elements or []
+
+    found: List[tuple[int, int, str]] = []
+    for original_index, name in enumerate(candidates):
+        tokens = [name]
+        if elements:
+            matched = find_best_match(name, elements, "character")
+            if matched:
+                tokens.append(str(matched.get("name") or ""))
+                tokens.extend(_character_element_aliases(matched))
+        positions = [
+            visual_text.find(token)
+            for token in _dedup_order_names(tokens)
+            if token and visual_text.find(token) >= 0
+        ]
+        if positions:
+            found.append((min(positions), original_index, name))
+
+    found.sort(key=lambda item: (item[0], item[1]))
+    ordered = [name for _, _, name in found]
+    return ordered, bool(has_structured_visible_fields or ordered)
+
+
+def _resolve_jimeng_character_references(
+    base_character_names: List[str],
+    prompt: str,
+    character_elements: Optional[List[Any]] = None,
+    manual_image_characters: Optional[List[str]] = None,
+    manual_audio_characters: Optional[List[str]] = None,
+    manual_audio_order: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """计算即梦本镜人物图片与音频的独立名单。
+
+    - 图片自动名单只读视觉叙述/可见白名单，纯画外音不会带人物图。
+    - 音频自动名单只读首次开口（包含 VO/OS/画外音）。
+    - 两个 manual_* 参数以 None 表示自动；空列表是用户明确全部关闭。
+    - 界面可以仍用一张人物卡，提交层则完全独立。
+    """
+    elements = character_elements or []
+    catalog_names = _dedup_order_names([
+        str((dict(element) if hasattr(element, "keys") else (element or {})).get("name") or "")
+        for element in elements
+    ])
+    base_names = _canonicalize_character_names(base_character_names, elements)
+    candidates = _dedup_order_names(base_names + catalog_names)
+
+    auto_image_names, visual_confident = _extract_visual_character_order(
+        candidates,
+        prompt,
+        elements,
+    )
+    if not visual_confident:
+        auto_image_names = list(base_names)
+
+    raw_speaker_order = _extract_speaker_order_from_prompt(prompt)
+    resolved_speaker_order = _canonicalize_character_names(raw_speaker_order, elements)
+    # 只有确实匹配到人物素材库/当前人物的说话人才进入自动音频名单。
+    candidate_keys = {name.lower() for name in candidates}
+    auto_audio_names = [
+        name for name in resolved_speaker_order
+        if name.lower() in candidate_keys
+    ]
+    if not auto_audio_names:
+        # 兼容没有结构化台词字段的旧模板，维持历史人物音频关联行为。
+        auto_audio_names = list(base_names)
+
+    if manual_image_characters is None:
+        image_names = list(auto_image_names)
+        image_mode = "auto"
+    else:
+        image_names = _canonicalize_character_names(manual_image_characters, elements)
+        image_mode = "manual"
+    image_names = _order_names_by_reference(
+        image_names,
+        auto_image_names + candidates,
+    )
+
+    if manual_audio_characters is None:
+        audio_names = list(auto_audio_names)
+        audio_selection_mode = "auto"
+    else:
+        audio_names = _canonicalize_character_names(manual_audio_characters, elements)
+        audio_selection_mode = "manual"
+
+    auto_audio_order = _order_names_by_reference(
+        audio_names,
+        resolved_speaker_order + auto_audio_names + candidates,
+    )
+    effective_manual_audio_order = _effective_manual_audio_order(
+        audio_names,
+        _canonicalize_character_names(manual_audio_order or [], elements),
+    )
+    audio_order = (
+        _order_names_by_reference(audio_names, effective_manual_audio_order + auto_audio_order)
+        if effective_manual_audio_order
+        else auto_audio_order
+    )
+
+    return {
+        "auto_image_names": auto_image_names,
+        "image_names": image_names,
+        "image_selection_mode": image_mode,
+        "auto_audio_names": auto_audio_names,
+        "audio_names": audio_names,
+        "audio_selection_mode": audio_selection_mode,
+        "auto_audio_order": auto_audio_order,
+        "audio_order": audio_order,
+        "audio_order_mode": "manual" if effective_manual_audio_order else "auto",
+    }
+
+
+def _resolve_audio_character_order(
+    character_names: List[str],
+    prompt: str,
+    manual_audio_order: Optional[List[str]] = None,
+) -> List[str]:
+    """音频顺序：默认按首次开口；有手动顺序时以手动为首并自动补齐新增人物。"""
+    candidates = _dedup_order_names(character_names)
+    by_key = {name.lower(): name for name in candidates}
+
+    auto_order: List[str] = []
+    auto_seen = set()
+    for speaker in _extract_speaker_order_from_prompt(prompt):
+        matched = by_key.get(speaker.strip().lower())
+        if matched and matched.lower() not in auto_seen:
+            auto_seen.add(matched.lower())
+            auto_order.append(matched)
+
+    # 未发声人物仍可能在关闭“仅说话人”时携带音频，按画面顺序稳定补到末尾。
+    for name in _order_characters_by_visual_appearance(candidates, prompt):
+        key = name.lower()
+        if key not in auto_seen:
+            auto_seen.add(key)
+            auto_order.append(name)
+
+    manual = _effective_manual_audio_order(candidates, manual_audio_order)
+    if not manual:
+        return auto_order
+
+    result: List[str] = []
+    seen = set()
+    for manual_name in manual:
+        if manual_name.lower() not in seen:
+            seen.add(manual_name.lower())
+            result.append(manual_name)
+    for name in auto_order:
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(name)
+    return result
+
+
+def _effective_manual_audio_order(
+    character_names: List[str],
+    manual_audio_order: Optional[List[str]],
+) -> List[str]:
+    """过滤已删除人物，并把手动顺序中的名字映射回当前分镜原名。"""
+    candidates = _dedup_order_names(character_names)
+    by_key = {name.lower(): name for name in candidates}
+    result: List[str] = []
+    seen = set()
+    for raw_name in _dedup_order_names(manual_audio_order or []):
+        matched = by_key.get(raw_name.lower())
+        if not matched or matched.lower() in seen:
+            continue
+        seen.add(matched.lower())
+        result.append(matched)
+    return result
+
+
+def _sort_named_assets(
+    items: List[Any],
+    name_order: List[str],
+    name_index: int = 1,
+) -> List[Any]:
+    """按指定人物名顺序稳定排列素材 tuple，未知名保持原相对顺序并置后。"""
+    rank = {
+        str(name or "").strip().lower(): index
+        for index, name in enumerate(name_order or [])
+        if str(name or "").strip()
+    }
+    fallback = len(rank)
+    indexed = list(enumerate(items or []))
+    indexed.sort(
+        key=lambda pair: (
+            rank.get(
+                str(pair[1][name_index] if len(pair[1]) > name_index else "").strip().lower(),
+                fallback + pair[0],
+            ),
+            pair[0],
+        )
+    )
+    return [item for _, item in indexed]
+
+
+def _extract_declared_section_duration(text: str) -> Optional[float]:
+    """读取模板声明的原始时长，不做截断；用于不允许静默裁时长的渠道校验。"""
+    if not text:
+        return None
+    match = re.search(r"📏?\s*本小节总时长[:：]\s*([\d.]+)\s*秒", text)
+    if not match:
+        return None
+    try:
+        value = float(match.group(1))
+        return value if value > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_section_duration(
+    text: str,
+    max_duration_sec: Optional[int] = None,
+) -> Optional[int]:
     """从分镜 prompt 中提取"📏 本小节总时长：X 秒"。
-    返回四舍五入到整数的秒数(限制在 4-15);找不到返回 None。
+    返回向上取整的整数秒(最小4秒,最大值由当前模型能力决定);找不到返回 None。
+
+    视觉时间轴允许 0.1 秒精度，平台时长却只接受整数。必须用 ceil，
+    否则 12.5 秒经 Python round 会变成 12 秒并截掉末尾画面。
     """
     if not text:
         return None
+    try:
+        max_sec = int(max_duration_sec) if max_duration_sec is not None else 15
+    except (TypeError, ValueError):
+        max_sec = 15
+    if max_sec < 4:
+        max_sec = 15
     import re
     m = re.search(r"📏?\s*本小节总时长[:：]\s*([\d.]+)\s*秒", text)
     if not m:
         return None
     try:
+        import math
         val = float(m.group(1))
-        sec = int(round(val))
+        sec = math.ceil(val)
         if sec < 4:
             sec = 4
-        if sec > 15:
-            sec = 15
+        if sec > max_sec:
+            sec = max_sec
         return sec
     except Exception:
         return None
@@ -3303,6 +6001,8 @@ async def _poll_storyboard_via_cloud(
     #   实测 sb=2478 cool 提交后查到的是 1072(ARK 配置)→ 用 ARK sk-volc 调 cool 上游 → 401
     if provider_type == "pippit_cli":
         provider = get_provider("pippit_cli", await _pippit_provider_config())
+    elif provider_type == "minimax_h3":
+        provider = get_provider("minimax_h3", await _minimax_provider_config())
     else:
         db = await get_db()
         try:
@@ -3313,9 +6013,10 @@ async def _poll_storyboard_via_cloud(
             srow = await cur.fetchone()
             cfg_id = srow["video_config_id"] if srow and srow["video_config_id"] else None
             if not cfg_id:
+                # 兜底:队列路径(老逻辑)
                 cur = await db.execute(
                     "SELECT video_config_id FROM video_task_queue WHERE storyboard_id = ? "
-                    "AND provider IN ('volcengine_ark', 'cool', 'xinglian') ORDER BY id DESC LIMIT 1",
+                    "AND provider IN ('volcengine_ark', 'cool', 'xinglian', 'newapi') ORDER BY id DESC LIMIT 1",
                     (sid,),
                 )
                 qrow = await cur.fetchone()
@@ -3323,8 +6024,26 @@ async def _poll_storyboard_via_cloud(
         finally:
             await db.close()
 
+        cloud_cfg = None
+        if provider_type == "newapi":
+            try:
+                from services.llm_service import LLMService
+                local_cfg = await LLMService.get_by_id(cfg_id, local_only=True)
+                if local_cfg and local_cfg.get("config_type") == "video":
+                    cloud_cfg = {
+                        "id": local_cfg.get("id"),
+                        "name": local_cfg.get("name"),
+                        "baseUrl": local_cfg.get("base_url"),
+                        "apiKey": local_cfg.get("api_key"),
+                        "modelName": local_cfg.get("model_name"),
+                        "providerCode": local_cfg.get("provider_code"),
+                        "extraParams": local_cfg.get("extra_params") or {},
+                    }
+            except Exception as local_error:
+                logger.warning(f"[poll] sid={sid} New API 本地配置读取失败: {local_error}")
         try:
-            cloud_cfg = await get_active_config(config_id=cfg_id, config_type="video")
+            if cloud_cfg is None:
+                cloud_cfg = await get_active_config(config_id=cfg_id, config_type="video")
         except Exception as e:
             return {
                 "id": sid,
@@ -3340,27 +6059,27 @@ async def _poll_storyboard_via_cloud(
                 "fail_reason": f"未找到 {_provider_friendly} 配置",
             }
 
-    # v3.61.107: 企业本地 APIKey 覆盖,跟 submit 同源
-    # v3.61.169: ★ 关键防御 — local_api_key 是企业"火山方舟" AK/SK 解密的 sk-volc 格式
-    #             cool 用户的 key 是 cool 网关自己的 sk-xxx,跟火山完全不同源 →
-    #             轮询时若 provider_type='cool' 错用 local_api_key 会触发 cool 上游 401
-    #             "The API key format is incorrect"(用户已实测)
-    #             修法:仅 ARK 才允许 local_api_key 覆盖,cool 永远走 cloud_cfg.apiKey
-    # v3.61.173: 统一收口 — 非 ARK 一律忽略 local_api_key(cool / xinglian / 未来中转都适用)
-    _local_key = (local_api_key or "").strip()
-    if provider_type != "volcengine_ark":
-        _final_api_key = (cloud_cfg.get("apiKey") or "").strip()
-    else:
-        _final_api_key = _local_key or (cloud_cfg.get("apiKey") or "").strip()
+        # v3.61.107: 企业本地 APIKey 覆盖,跟 submit 同源
+        # v3.61.169: ★ 关键防御 — local_api_key 是企业"火山方舟" AK/SK 解密的 sk-volc 格式
+        #             cool 用户的 key 是 cool 网关自己的 sk-xxx,跟火山完全不同源 →
+        #             轮询时若 provider_type='cool' 错用 local_api_key 会触发 cool 上游 401
+        #             "The API key format is incorrect"(用户已实测)
+        #             修法:仅 ARK 才允许 local_api_key 覆盖,cool 永远走 cloud_cfg.apiKey
+        # v3.61.173: 统一收口 — 非 ARK 一律忽略 local_api_key(cool / xinglian / 未来中转都适用)
+        _local_key = (local_api_key or "").strip()
+        if provider_type != "volcengine_ark":
+            _final_api_key = (cloud_cfg.get("apiKey") or "").strip()
+        else:
+            _final_api_key = _local_key or (cloud_cfg.get("apiKey") or "").strip()
         provider = get_provider(provider_type, {
-        "id": cloud_cfg.get("id"),
-        "name": cloud_cfg.get("name"),
-        "base_url": cloud_cfg.get("baseUrl"),
-        "api_key": _final_api_key,
-        "model_name": cloud_cfg.get("modelName"),
-        "provider_code": cloud_cfg.get("providerCode"),
-        "extra_params": cloud_cfg.get("extraParams") or {},
-    })
+            "id": cloud_cfg.get("id"),
+            "name": cloud_cfg.get("name"),
+            "base_url": cloud_cfg.get("baseUrl"),
+            "api_key": _final_api_key,
+            "model_name": cloud_cfg.get("modelName"),
+            "provider_code": cloud_cfg.get("providerCode"),
+            "extra_params": cloud_cfg.get("extraParams") or {},
+        })
 
     # v3.61.172 codex 复审:加 stale-poll 守卫
     #   场景:同一 sb 老 ARK 任务还在跑(轮询的 submit_id=旧),用户重新提交了 Cool 新任务
@@ -3403,22 +6122,27 @@ async def _poll_storyboard_via_cloud(
             "queue_status": "running",
         }
 
-    if qres.status == "fail":
+    if qres.status in ("fail", "cancelled", "expired"):
         if await _is_stale():
             return {"id": sid, "video_status": "generating", "video_url": None, "stale_poll": True}
+        terminal_reason = qres.fail_reason
+        if not terminal_reason and qres.status == "cancelled":
+            terminal_reason = f"{_provider_friendly} 任务已取消"
+        if not terminal_reason and qres.status == "expired":
+            terminal_reason = f"{_provider_friendly} 任务已过期"
         await storyboard_service.update_video_status(
-            sid, "failed", fail_reason=qres.fail_reason or f"{_provider_friendly} 生成失败"
+            sid, "failed", fail_reason=terminal_reason or f"{_provider_friendly} 生成失败"
         )
         await _finalize_video_log_error(
             storyboard_id=sid,
             submit_id=submit_id,
-            fail_reason=qres.fail_reason or f"{_provider_friendly} generation failed",
+            fail_reason=terminal_reason or f"{_provider_friendly} generation failed",
         )
         return {
             "id": sid,
             "video_status": "failed",
             "video_url": None,
-            "fail_reason": qres.fail_reason,
+            "fail_reason": terminal_reason,
         }
 
     # 3. status = success → 下载视频到本地
@@ -3429,6 +6153,7 @@ async def _poll_storyboard_via_cloud(
                 local_video_path = qres.raw.get("_local_video_path")
             if not local_video_path and qres.video_url and not str(qres.video_url).startswith(("http://", "https://")):
                 local_video_path = qres.video_url
+
             if local_video_path and os.path.isfile(local_video_path):
                 if await _is_stale():
                     return {"id": sid, "video_status": "generating", "video_url": None, "stale_poll": True}
@@ -3448,10 +6173,19 @@ async def _poll_storyboard_via_cloud(
                 local_url = f"/data/videos/{subdir}/{fname}" if subdir else f"/data/videos/{fname}"
                 await storyboard_service.update_video_status(sid, "done", local_url)
                 await _finalize_video_log_success(
-                    storyboard_id=sid, submit_id=submit_id, provider=provider_type,
-                    video_url=local_url, actual_duration=qres.duration or None,
+                    storyboard_id=sid,
+                    submit_id=submit_id,
+                    provider=provider_type,
+                    video_url=local_url,
+                    actual_duration=qres.duration or None,
                 )
-                return {"id": sid, "video_status": "done", "video_url": local_url, "last_frame_path": None}
+                logger.info(f"[pippit-poll] 本地视频已归档 sid={sid} path={target_path}")
+                return {
+                    "id": sid,
+                    "video_status": "done",
+                    "video_url": local_url,
+                    "last_frame_path": None,
+                }
             if qres.video_url and not str(qres.video_url).startswith(("http://", "https://")):
                 qres.video_url = None
 
@@ -3524,13 +6258,22 @@ async def _poll_storyboard_via_cloud(
         os.makedirs(videos_dir, exist_ok=True)
 
         # 下载 mp4 + 友好命名
-        local_url = await _download_remote_video(sid, qres.video_url, videos_dir)
+        local_url, download_error = await _download_remote_video_with_diagnostics(
+            sid,
+            qres.video_url,
+            videos_dir,
+            provider_type=provider_type,
+        )
         if not local_url:
             # v3.61.153 codex P1:下载失败 → download_failed,远程 URL 入库供 retry-download 重试
             # 原代码 "用远程 URL 兜底标 done" 会导致后续接帧/尾帧 hook 都失效
             if await _is_stale():
                 return {"id": sid, "video_status": "generating", "video_url": None, "stale_poll": True}
-            _fail_msg = f"{_provider_friendly} 已生成完成,但本地下载失败。可在视频生成页点重试下载。"
+            _fail_detail = (download_error or "网络、磁盘或远程地址异常")[:240]
+            _fail_msg = (
+                f"{_provider_friendly} 已生成完成,但本地下载失败（{_fail_detail}）。"
+                "可在视频生成页点重试下载。"
+            )
             await storyboard_service.update_video_status(
                 sid, "download_failed", qres.video_url, fail_reason=_fail_msg,
             )
@@ -3606,37 +6349,293 @@ async def _poll_storyboard_via_ark(sid: int, submit_id: str, local_api_key: Opti
     resolved = "volcengine_ark"
     if r and 'video_provider' in r.keys():
         v = (r['video_provider'] or '').lower()
-        if v in ('volcengine_ark', 'cool', 'xinglian'):
+        if v in UNIFIED_VIDEO_PROVIDERS:
             resolved = v
     return await _poll_storyboard_via_cloud(sid, submit_id, resolved, local_api_key)
 
 
-async def _download_remote_video(sid: int, url: str, videos_dir: str) -> Optional[str]:
-    """下载火山方舟视频到本地,按 friendly subdir 命名,返回 /data/videos/... 形式 url"""
+async def _download_remote_video_with_diagnostics(
+    sid: int,
+    url: str,
+    videos_dir: str,
+    *,
+    provider_type: str = "",
+    max_attempts: int = 2,
+    attempt_timeout_seconds: int = 150,
+) -> Tuple[Optional[str], Optional[str]]:
+    """可靠地把云端视频下载到本地，并返回 ``(local_url, error)``。
+
+    v3.61.406:
+    - 旧实现只有一次 aiohttp 直连；用户网络需要系统代理、CDN 中途断流或响应很慢时，
+      会静默等到 300 秒后才失败，点「重试下载」看起来像没反应。
+    - 现在按「直连 → 系统代理/再次直连」重试，并用 Range 续传上一轮的临时文件。
+    - 只在完整响应写完后原子替换正式 mp4，避免半截视频被误标为 done。
+    - 日志只记录 host、HTTP 状态和异常类型，不泄露带签名的完整 URL。
+    """
     import aiohttp
+    from urllib.parse import urlparse
+
+    clean_url = (url or "").strip()
+    provider_label = PROVIDER_FRIENDLY.get(provider_type, provider_type or "云端视频")
+    if not clean_url.startswith(("http://", "https://")):
+        return None, "远程视频 URL 无效"
+
     try:
         path_info = await _build_friendly_video_path(sid, ".mp4")
         if not path_info:
-            return None
+            return None, "无法生成本地视频文件名"
         subdir, fname = path_info
         target_dir = os.path.join(videos_dir, subdir)
         os.makedirs(target_dir, exist_ok=True)
         target_path = os.path.join(target_dir, fname)
+        partial_path = target_path + ".part"
+    except Exception as exc:
+        error = f"创建本地目录失败 {type(exc).__name__}: {exc}"
+        logger.error(f"[video-download] sid={sid} provider={provider_label} {error}", exc_info=True)
+        return None, error
 
-        async with aiohttp.ClientSession(connector=get_aiohttp_connector(), timeout=aiohttp.ClientTimeout(total=300)) as sess:
-            async with sess.get(url) as resp:
-                if resp.status != 200:
-                    logger.warning(f"[ark-poll] 下载视频 HTTP {resp.status} sid={sid}")
-                    return None
-                with open(target_path, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(64 * 1024):
-                        f.write(chunk)
+    host = urlparse(clean_url).netloc or "unknown-host"
+    max_attempts = max(1, min(int(max_attempts or 1), 3))
+    attempt_timeout_seconds = max(30, min(int(attempt_timeout_seconds or 150), 300))
+    last_error = "下载未开始"
 
-        logger.info(f"[ark-poll] 视频下载完成 sid={sid} path={target_path}")
-        return f"/data/videos/{subdir}/{fname}"
-    except Exception as e:
-        logger.error(f"[ark-poll] 下载视频异常 sid={sid}: {e}", exc_info=True)
-        return None
+    # 第一次强制直连，避免坏代理污染；第二次允许 aiohttp 读取系统/环境代理。
+    # 如果机器没有代理，trust_env=True 会自然退化为再次直连。
+    routes = [(False, "直连"), (True, "系统代理/重试"), (False, "直连重试")]
+    routes = routes[:max_attempts]
+
+    headers_base = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36 "
+            "qianshanAI/1.0"
+        ),
+        "Accept": "video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5",
+        "Accept-Encoding": "identity",
+    }
+
+    try:
+        for attempt_index, (trust_env, route_label) in enumerate(routes, start=1):
+            if attempt_index > 1:
+                await asyncio.sleep(2)
+
+            resume_from = 0
+            try:
+                if os.path.exists(partial_path):
+                    resume_from = max(0, os.path.getsize(partial_path))
+            except OSError:
+                resume_from = 0
+
+            headers = dict(headers_base)
+            if resume_from > 0:
+                headers["Range"] = f"bytes={resume_from}-"
+
+            logger.info(
+                f"[video-download] sid={sid} provider={provider_label} host={host} "
+                f"attempt={attempt_index}/{len(routes)} route={route_label} resume={resume_from}"
+            )
+
+            timeout = aiohttp.ClientTimeout(
+                total=attempt_timeout_seconds,
+                connect=20,
+                sock_connect=20,
+                sock_read=60,
+            )
+            try:
+                async with aiohttp.ClientSession(
+                    connector=get_aiohttp_connector(),
+                    timeout=timeout,
+                    trust_env=trust_env,
+                ) as sess:
+                    async with sess.get(
+                        clean_url,
+                        headers=headers,
+                        allow_redirects=True,
+                    ) as resp:
+                        status = resp.status
+
+                        # Range 已经等于服务端文件总长时，部分文件其实是完整的。
+                        if status == 416 and resume_from > 0:
+                            content_range = resp.headers.get("Content-Range", "")
+                            total_match = re.search(r"\*/(\d+)", content_range)
+                            if total_match and int(total_match.group(1)) == resume_from:
+                                os.replace(partial_path, target_path)
+                                local_url = f"/data/videos/{subdir}/{fname}"
+                                logger.info(
+                                    f"[video-download] sid={sid} provider={provider_label} "
+                                    f"续传文件已完整 bytes={resume_from} path={target_path}"
+                                )
+                                return local_url, None
+
+                        if status not in (200, 206):
+                            try:
+                                body_preview = (await resp.text(errors="replace"))[:160].replace("\r", " ").replace("\n", " ")
+                            except Exception:
+                                body_preview = ""
+                            last_error = f"{route_label} HTTP {status}"
+                            if body_preview:
+                                last_error += f": {body_preview}"
+                            logger.warning(
+                                f"[video-download] sid={sid} provider={provider_label} "
+                                f"host={host} attempt={attempt_index} {last_error}"
+                            )
+                            continue
+
+                        content_type = (resp.headers.get("Content-Type") or "").lower()
+                        if content_type.startswith(("text/", "application/json", "application/xml")):
+                            try:
+                                body_preview = (await resp.text(errors="replace"))[:160].replace("\r", " ").replace("\n", " ")
+                            except Exception:
+                                body_preview = ""
+                            last_error = (
+                                f"{route_label} 返回的不是视频"
+                                f"(content-type={content_type or '-'})"
+                            )
+                            if body_preview:
+                                last_error += f": {body_preview}"
+                            logger.warning(
+                                f"[video-download] sid={sid} provider={provider_label} "
+                                f"host={host} attempt={attempt_index} {last_error}"
+                            )
+                            try:
+                                if os.path.exists(partial_path):
+                                    os.remove(partial_path)
+                            except OSError:
+                                pass
+                            continue
+
+                        # 服务端忽略 Range、返回 200 时必须从头覆盖；206 才能 append。
+                        append_mode = status == 206 and resume_from > 0
+                        if append_mode:
+                            range_start_match = re.match(r"bytes\s+(\d+)-", resp.headers.get("Content-Range", ""))
+                            if range_start_match and int(range_start_match.group(1)) != resume_from:
+                                last_error = (
+                                    f"{route_label} 续传起点异常"
+                                    f"(请求 {resume_from}，响应 {range_start_match.group(1)})"
+                                )
+                                logger.warning(
+                                    f"[video-download] sid={sid} provider={provider_label} "
+                                    f"host={host} attempt={attempt_index} {last_error}"
+                                )
+                                try:
+                                    os.remove(partial_path)
+                                except OSError:
+                                    pass
+                                continue
+                        if not append_mode:
+                            resume_from = 0
+                        expected_total: Optional[int] = None
+                        content_range = resp.headers.get("Content-Range", "")
+                        total_match = re.search(r"/(\d+)$", content_range)
+                        if total_match:
+                            expected_total = int(total_match.group(1))
+                        else:
+                            content_length = resp.headers.get("Content-Length")
+                            if content_length and str(content_length).isdigit():
+                                expected_total = resume_from + int(content_length)
+
+                        with open(partial_path, "ab" if append_mode else "wb") as out:
+                            async for chunk in resp.content.iter_chunked(512 * 1024):
+                                if chunk:
+                                    out.write(chunk)
+
+                        actual_size = os.path.getsize(partial_path)
+                        if actual_size <= 0:
+                            last_error = f"{route_label} 返回空文件"
+                            logger.warning(
+                                f"[video-download] sid={sid} provider={provider_label} "
+                                f"host={host} attempt={attempt_index} {last_error}"
+                            )
+                            continue
+                        if expected_total is not None and actual_size < expected_total:
+                            last_error = (
+                                f"{route_label} 下载不完整 "
+                                f"({actual_size}/{expected_total} bytes)"
+                            )
+                            logger.warning(
+                                f"[video-download] sid={sid} provider={provider_label} "
+                                f"host={host} attempt={attempt_index} {last_error}"
+                            )
+                            continue
+
+                        # CDN 偶尔 200 返回 HTML 错误页但错误地标 application/octet-stream。
+                        with open(partial_path, "rb") as check_file:
+                            head = check_file.read(32).lstrip().lower()
+                        if head.startswith((b"<html", b"<!doctype", b"{\"error", b"{\"message")):
+                            last_error = f"{route_label} 返回错误页面而非视频"
+                            logger.warning(
+                                f"[video-download] sid={sid} provider={provider_label} "
+                                f"host={host} attempt={attempt_index} {last_error}"
+                            )
+                            try:
+                                os.remove(partial_path)
+                            except OSError:
+                                pass
+                            continue
+
+                        os.replace(partial_path, target_path)
+                        local_url = f"/data/videos/{subdir}/{fname}"
+                        logger.info(
+                            f"[video-download] sid={sid} provider={provider_label} "
+                            f"下载完成 bytes={actual_size} path={target_path}"
+                        )
+                        return local_url, None
+
+            except PermissionError as exc:
+                last_error = f"本地写盘失败 {type(exc).__name__}: {exc}"
+                logger.error(
+                    f"[video-download] sid={sid} provider={provider_label} "
+                    f"host={host} attempt={attempt_index} {last_error}",
+                    exc_info=True,
+                )
+                break
+            except Exception as exc:
+                # TimeoutError 的 str 常为空，必须把异常类型写进日志，否则用户日志只剩一个冒号。
+                detail = str(exc).strip()
+                last_error = f"{route_label} {type(exc).__name__}"
+                if detail:
+                    last_error += f": {detail}"
+                try:
+                    partial_size = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0
+                except OSError:
+                    partial_size = 0
+                logger.warning(
+                    f"[video-download] sid={sid} provider={provider_label} host={host} "
+                    f"attempt={attempt_index} {last_error} partial={partial_size}",
+                    # CDN 断流/超时是可重试常态，异常类型和 partial 大小已经足够诊断；
+                    # 只有非网络类意外异常才输出整段堆栈，避免用户日志被重复 traceback 淹没。
+                    exc_info=not isinstance(
+                        exc,
+                        (aiohttp.ClientError, asyncio.TimeoutError, OSError),
+                    ),
+                )
+
+        return None, last_error
+    finally:
+        # 一次调用内会续传；所有尝试都失败后删掉临时文件，避免长期堆积半截视频。
+        # 正式文件只会在完整下载后由 os.replace 原子产生。
+        if os.path.exists(partial_path):
+            try:
+                os.remove(partial_path)
+            except OSError:
+                pass
+
+
+async def _download_remote_video(
+    sid: int,
+    url: str,
+    videos_dir: str,
+    *,
+    provider_type: str = "",
+) -> Optional[str]:
+    """兼容旧调用方：下载成功返回 /data/videos/...，失败返回 None。"""
+    local_url, _ = await _download_remote_video_with_diagnostics(
+        sid,
+        url,
+        videos_dir,
+        provider_type=provider_type,
+    )
+    return local_url
 
 
 async def _download_last_frame(sid: int, url: str) -> Optional[str]:
@@ -3665,6 +6664,12 @@ async def _process_batch_generation(storyboard_ids: List[int], video_config_id: 
     """后台批量处理视频生成 - 逐个执行避免CLI速率限制。
     每个分镜按自己 prompt 中的"📏 本小节总时长"覆盖顶部 duration,解决批量用同一个时长导致错配问题。
     """
+    from services.video_model_capabilities import get_video_model_capabilities
+
+    batch_capabilities = get_video_model_capabilities(
+        (params or {}).get("model_version") or (params or {}).get("model")
+    )
+    batch_max_duration = int(batch_capabilities["max_duration_seconds"])
     for sid in storyboard_ids:
         try:
             # 从数据库获取分镜的prompt
@@ -3683,7 +6688,10 @@ async def _process_batch_generation(storyboard_ids: List[int], video_config_id: 
 
             # 每个分镜独立算一次 duration:prompt 里有 "本小节总时长" 就用它,没有就 fallback 到 params
             per_params = dict(params) if params else None
-            section_dur = _extract_section_duration(prompt)
+            section_dur = _extract_section_duration(
+                prompt,
+                max_duration_sec=batch_max_duration,
+            )
             if section_dur is not None:
                 if per_params is None:
                     per_params = {}
@@ -3711,86 +6719,20 @@ async def list_video_tasks(status: str = None):
     return result
 
 
-@router.get("/history")
-async def list_video_history(limit: int = 100, offset: int = 0):
-    """返回本地已完成成片，供独立的历史成片页展示。
-
-    这里只读取已经落库到 storyboards.video_url 的完成记录，不重新查询
-    第三方平台，也不把远端任务列表当成本地历史。视频文件是否仍存在
-    另行返回 exists，旧记录因此仍可保留并给用户明确提示。
-    """
-    limit = max(1, min(int(limit or 100), 200))
-    offset = max(0, int(offset or 0))
-    db = await get_db()
-    try:
-        cursor = await db.execute(
-            """
-            SELECT sb.id, sb.novel_id, sb.script_id, sb.scene_number,
-                   sb.scene_index, sb.section_number, sb.description,
-                   sb.video_url, sb.video_provider, sb.video_submit_time,
-                   sb.created_at, n.name AS novel_name, c.title AS chapter_title
-            FROM storyboards sb
-            LEFT JOIN novels n ON n.id = sb.novel_id
-            LEFT JOIN scripts s ON s.id = sb.script_id
-            LEFT JOIN chapters c ON c.id = s.chapter_id
-            WHERE sb.video_status = 'done'
-              AND sb.video_url IS NOT NULL
-              AND TRIM(sb.video_url) != ''
-            ORDER BY COALESCE(sb.video_submit_time, sb.created_at) DESC, sb.id DESC
-            LIMIT ? OFFSET ?
-            """,
-            (limit, offset),
-        )
-        rows = await cursor.fetchall()
-        count_cursor = await db.execute(
-            """
-            SELECT COUNT(*) AS total
-            FROM storyboards
-            WHERE video_status = 'done'
-              AND video_url IS NOT NULL
-              AND TRIM(video_url) != ''
-            """
-        )
-        count_row = await count_cursor.fetchone()
-    finally:
-        await db.close()
-
-    items = []
-    for row in rows:
-        video_url = str(row["video_url"] or "")
-        local_path = None
-        if video_url.startswith("/data/"):
-            try:
-                local_path = resolve_db_path(video_url)
-            except Exception:
-                local_path = None
-        items.append({
-            "id": row["id"],
-            "novel_id": row["novel_id"],
-            "script_id": row["script_id"],
-            "scene_number": row["scene_number"],
-            "scene_index": row["scene_index"],
-            "section_number": row["section_number"],
-            "description": row["description"] or "",
-            "video_url": video_url,
-            "video_provider": row["video_provider"] or "",
-            "video_submit_time": row["video_submit_time"],
-            "created_at": row["created_at"],
-            "novel_name": row["novel_name"] or "未命名小说",
-            "chapter_title": row["chapter_title"] or "未分章",
-            "exists": bool(local_path and os.path.isfile(local_path)),
-        })
-    return {"success": True, "items": items, "total": int((count_row or {"total": 0})["total"] or 0), "limit": limit, "offset": offset}
-
-
 @router.get("/storyboard-elements/{storyboard_id}")
-async def get_storyboard_elements(storyboard_id: int):
+async def get_storyboard_elements(
+    storyboard_id: int,
+    include_audio_duration: bool = False,
+):
     """获取分镜关联的元素详情（人物、场景、道具）"""
     db = await get_db()
     try:
         # 1. 获取分镜信息
         cursor = await db.execute(
-            "SELECT novel_id, characters, scenes, props, description, excluded_props FROM storyboards WHERE id = ?",
+            "SELECT novel_id, characters, scenes, props, description, prompt, excluded_props, "
+            "excluded_audios, auto_excluded_audios, manual_audio_order, "
+            "jimeng_image_characters, jimeng_audio_characters "
+            "FROM storyboards WHERE id = ?",
             (storyboard_id,)
         )
         row = await cursor.fetchone()
@@ -3821,11 +6763,24 @@ async def get_storyboard_elements(storyboard_id: int):
         scenes = _dedup_keep_first(scenes)
         props = _dedup_keep_first(props)
 
-        result = {"characters": [], "scenes": [], "props": []}
+        result = {
+            "characters": [],
+            "jimeng_characters": [],
+            "scenes": [],
+            "props": [],
+            "visual_character_order": [],
+            "jimeng_image_characters": [],
+            "jimeng_audio_characters": [],
+            "image_selection_mode": "auto",
+            "audio_selection_mode": "auto",
+            "auto_audio_order": [],
+            "audio_order": [],
+            "audio_order_mode": "auto",
+        }
 
         # 2. 预加载该小说的所有元素（人物、场景、道具）用于三级匹配
         cursor = await db.execute(
-            "SELECT id, element_type, name, description, finished_image, reference_image, image_url, grid_image, audio_file, aliases, image_prompt, image_status, volc_asset_id, volc_asset_uri, volc_asset_status, volc_asset_group_id, active_variant_id, updated_at FROM extracted_elements WHERE novel_id = ? AND element_type = 'character'",
+            "SELECT id, element_type, name, description, finished_image, reference_image, image_url, grid_image, audio_file, voice_id, aliases, image_prompt, image_status, volc_asset_id, volc_asset_uri, volc_asset_status, volc_asset_group_id, active_variant_id, updated_at FROM extracted_elements WHERE novel_id = ? AND element_type = 'character'",
             (novel_id,)
         )
         character_elements = await cursor.fetchall()
@@ -3842,19 +6797,126 @@ async def get_storyboard_elements(storyboard_id: int):
         )
         prop_elements = await cursor.fetchall()
 
+        ordering_prompt = (row['prompt'] or '').strip() or (row['description'] or '').strip()
+        props, has_enabled_prop_field = _merge_structured_enabled_props(
+            props,
+            ordering_prompt,
+            list(prop_elements),
+            excluded_props,
+        )
+        manual_image_characters = _optional_json_name_list(row['jimeng_image_characters'])
+        manual_audio_characters = _optional_json_name_list(row['jimeng_audio_characters'])
+        try:
+            manual_audio_order = json.loads(row['manual_audio_order'] or '[]')
+        except Exception:
+            manual_audio_order = []
+        manual_audio_order = _dedup_order_names(manual_audio_order)
+
+        jimeng_refs = _resolve_jimeng_character_references(
+            characters,
+            ordering_prompt,
+            list(character_elements),
+            manual_image_characters,
+            manual_audio_characters,
+            manual_audio_order,
+        )
+        try:
+            manual_excluded = set(json.loads(row['excluded_audios'] or '[]'))
+        except Exception:
+            manual_excluded = set()
+        try:
+            from services.settings_service import (
+                KEY_AUDIO_AUTO_SPEAKER_FILTER as _KEY_AUDIO_FILTER_ELEMENTS,
+                SettingsService as _SettingsServiceElements,
+            )
+            audio_filter_enabled = await _SettingsServiceElements.get_bool(
+                _KEY_AUDIO_FILTER_ELEMENTS,
+                default=False,
+            )
+        except Exception:
+            audio_filter_enabled = False
+        try:
+            auto_excluded = (
+                set(json.loads(row['auto_excluded_audios'] or '[]'))
+                if audio_filter_enabled
+                else set()
+            )
+        except Exception:
+            auto_excluded = set()
+
+        manual_excluded_keys = {
+            name.lower()
+            for name in _canonicalize_character_names(
+                list(manual_excluded),
+                list(character_elements),
+            )
+        }
+        if jimeng_refs["audio_selection_mode"] == "manual":
+            excluded_audio_keys = manual_excluded_keys
+        else:
+            excluded_audio_keys = {
+                name.lower()
+                for name in _canonicalize_character_names(
+                    list(manual_excluded | auto_excluded),
+                    list(character_elements),
+                )
+            }
+
+        image_character_order = list(jimeng_refs["image_names"])
+        active_audio_names = [
+            name
+            for name in jimeng_refs["audio_names"]
+            if name.lower() not in excluded_audio_keys
+        ]
+        active_audio_keys = {name.lower() for name in active_audio_names}
+        auto_audio_order = [
+            name
+            for name in jimeng_refs["auto_audio_order"]
+            if name.lower() in active_audio_keys
+        ]
+        audio_order = [
+            name
+            for name in jimeng_refs["audio_order"]
+            if name.lower() in active_audio_keys
+        ]
+        effective_manual_audio_order = _effective_manual_audio_order(
+            active_audio_names,
+            _canonicalize_character_names(manual_audio_order, list(character_elements)),
+        )
+        jimeng_character_order = _dedup_order_names(
+            image_character_order + audio_order
+        )
+
+        result.update({
+            "visual_character_order": image_character_order,
+            "jimeng_image_characters": image_character_order,
+            "jimeng_audio_characters": active_audio_names,
+            "image_selection_mode": jimeng_refs["image_selection_mode"],
+            "audio_selection_mode": jimeng_refs["audio_selection_mode"],
+            "auto_audio_order": auto_audio_order,
+            "audio_order": audio_order,
+            "audio_order_mode": "manual" if effective_manual_audio_order else "auto",
+        })
+
         # 3. 查询人物元素（使用三级匹配）
         # v3.61.136: name 字段必须用分镜原始名(跟 storyboards.characters/excluded_audios 一致),
         # 不能用 matched["name"](素材库正式名)— 否则前后端 excluded_audios 的 key 对不上
         # 单独加 matched_name 给 UI 提示用("瑶华 → 凌瑶华")
-        for name in characters:
+        _resolved_character_cards: Dict[str, Dict[str, Any]] = {}
+
+        async def _build_character_card(name: str) -> Dict[str, Any]:
+            _cache_key = name.strip().lower()
+            if _cache_key in _resolved_character_cards:
+                return dict(_resolved_character_cards[_cache_key])
             matched = find_best_match(name, character_elements, 'character')
             if matched:
                 # v3.61.158: 人物走 active variant fallback — UI 预览跟视频生成路径一致
                 from services.extraction_service import ExtractionService as _ES_sb
-                resolved = await _ES_sb.resolve_active_character_asset(dict(matched))
+                matched_dict = await _backfill_character_audio_from_voice(db, novel_id, dict(matched))
+                resolved = await _ES_sb.resolve_active_character_asset(matched_dict)
                 _vname = resolved.get("__active_variant_name")
                 logger.info(f"[storyboard-elements] 人物匹配成功: '{name}' -> '{matched['name']}' [马甲={_vname or '本体'}]")
-                result["characters"].append({
+                card = {
                     "id": resolved.get("id"),
                     "name": name,
                     "matched_name": matched["name"],
@@ -3866,10 +6928,42 @@ async def get_storyboard_elements(storyboard_id: int):
                     "audio_file": resolved.get("audio_file"),
                     "active_variant_name": _vname,
                     "updated_at": resolved.get("__asset_updated_at") or resolved.get("updated_at"),
-                })
+                }
+                if include_audio_duration and card.get("audio_file"):
+                    audio_path = resolve_db_path(card["audio_file"])
+                    if audio_path and os.path.isfile(audio_path):
+                        duration_value = await asyncio.to_thread(
+                            _cached_audio_duration_seconds,
+                            audio_path,
+                        )
+                        if duration_value is not None:
+                            card["audio_duration_seconds"] = round(float(duration_value), 3)
             else:
                 logger.info(f"[storyboard-elements] 人物匹配失败: '{name}'")
-                result["characters"].append({"name": name})
+                card = {"name": name}
+            _resolved_character_cards[_cache_key] = dict(card)
+            return card
+
+        for name in characters:
+            card = await _build_character_card(name)
+            card["base_associated"] = True
+            result["characters"].append(card)
+
+        _image_keys = {name.lower() for name in image_character_order}
+        _audio_keys = {name.lower() for name in active_audio_names}
+        _base_keys = {
+            name.lower()
+            for name in _canonicalize_character_names(
+                characters,
+                list(character_elements),
+            )
+        }
+        for name in jimeng_character_order:
+            card = await _build_character_card(name)
+            card["image_enabled"] = name.lower() in _image_keys
+            card["audio_enabled"] = name.lower() in _audio_keys
+            card["base_associated"] = name.lower() in _base_keys
+            result["jimeng_characters"].append(card)
 
         # 4. 查询场景元素（使用三级匹配）
         for name in scenes:
@@ -3913,29 +7007,69 @@ async def get_storyboard_elements(storyboard_id: int):
         )
 
         scan_text = row['description'] or ''
-        if scan_text and prop_elements:
+        if has_enabled_prop_field:
+            logger.info(
+                f"[storyboard-elements] 检测到启用道具权威名单，"
+                f"跳过全文道具补扫 (分镜 {storyboard_id})"
+            )
+        elif scan_text and prop_elements:
             existing_props_lower = set(p.lower() for p in props)
             excluded_props_lower = _effective_excluded_lower
             for elem in prop_elements:
-                prop_name = elem['name'] if elem['name'] else ''
-                if not prop_name or prop_name.lower() in existing_props_lower:
+                elem_dict = dict(elem)
+                prop_name = (elem_dict.get('name') or '').strip()
+                if not prop_name:
                     continue
-                # 直接命中 excluded
-                if prop_name.lower() in excluded_props_lower:
-                    logger.info(f"[storyboard-elements] 道具文本扫描跳过(已排除): '{prop_name}' (分镜 {storyboard_id})")
-                    continue
-                if len(prop_name) >= 2 and prop_name in scan_text:
-                    # 三级匹配看会不会命中已排除元素(防别名/模糊匹配回环)
-                    matched_for_check = find_best_match(prop_name, prop_elements, 'prop')
-                    if matched_for_check and matched_for_check.get("name") and matched_for_check["name"].lower() in excluded_props_lower:
+
+                aliases_raw = elem_dict.get('aliases') or '[]'
+                aliases = []
+                if isinstance(aliases_raw, str):
+                    try:
+                        aliases = json.loads(aliases_raw) if aliases_raw else []
+                    except Exception:
+                        aliases = []
+                elif isinstance(aliases_raw, list):
+                    aliases = aliases_raw
+
+                candidates = []
+                seen_candidates = set()
+
+                def add_candidate(value: Any) -> None:
+                    candidate = str(value or '').strip()
+                    candidate_lower = candidate.lower()
+                    if len(candidate) < 2 or not candidate_lower or candidate_lower in seen_candidates:
+                        return
+                    candidates.append(candidate)
+                    seen_candidates.add(candidate_lower)
+
+                add_candidate(prop_name)
+                for alias in aliases:
+                    add_candidate(alias)
+
+                for candidate in candidates:
+                    matched_for_check = find_best_match(candidate, prop_elements, 'prop') or elem_dict
+                    matched_name = (matched_for_check.get("name") or prop_name or candidate).strip()
+                    candidate_lower = candidate.lower()
+                    matched_lower = matched_name.lower()
+
+                    if candidate_lower in existing_props_lower or matched_lower in existing_props_lower:
+                        continue
+                    # 直接命中 excluded,或三级匹配命中已排除元素(防别名/模糊匹配回环)
+                    if candidate_lower in excluded_props_lower or matched_lower in excluded_props_lower:
                         logger.info(
-                            f"[storyboard-elements] 道具文本扫描跳过(三级匹配命中已排除): "
-                            f"'{prop_name}' → '{matched_for_check['name']}' (分镜 {storyboard_id})"
+                            f"[storyboard-elements] 道具文本扫描跳过(命中已排除): "
+                            f"'{candidate}' → '{matched_name}' (分镜 {storyboard_id})"
                         )
                         continue
-                    props.append(prop_name)
-                    existing_props_lower.add(prop_name.lower())
-                    logger.info(f"[storyboard-elements] 道具文本扫描补充: '{prop_name}' (分镜 {storyboard_id})")
+                    if candidate in scan_text:
+                        props.append(matched_name)
+                        existing_props_lower.add(candidate_lower)
+                        existing_props_lower.add(matched_lower)
+                        if candidate == matched_name:
+                            logger.info(f"[storyboard-elements] 道具文本扫描补充: '{matched_name}' (分镜 {storyboard_id})")
+                        else:
+                            logger.info(f"[storyboard-elements] 道具别名文本扫描补充: '{candidate}' → '{matched_name}' (分镜 {storyboard_id})")
+                        break
 
         # 5. 查询道具元素（使用三级匹配）
         # v3.59.89:遍历 props 时也用 excluded 过滤(双层保险)
@@ -4028,24 +7162,191 @@ class PollStatusRequest(BaseModel):
 _POLL_INFLIGHT: set = set()
 
 
+def _local_video_needs_tail_frame(
+    video_status: Any,
+    video_url: Any,
+    last_frame_path: Any,
+) -> bool:
+    """Return True while a downloaded local video still needs its tail frame.
+
+    The video row is committed as ``done`` before the (potentially slower)
+    tail-frame post-processing finishes.  A concurrent poll must therefore not
+    tell the frontend that the whole pipeline is settled yet, otherwise the
+    frontend stops polling and keeps showing an empty tail-frame column.
+    """
+    return (
+        str(video_status or "").strip().lower() == "done"
+        and isinstance(video_url, str)
+        and video_url.startswith("/data/")
+        and not last_frame_path
+    )
+
+# 单镜/旧批量提交的后端收敛任务。全局队列由 queue_worker 自己轮询；这里专门
+# 接管没有队列记录的即梦任务，使页面被卸载后仍能查询、下载并回写尾帧。
+_STANDALONE_VIDEO_RECONCILE_TASKS: Dict[int, asyncio.Task] = {}
+_STANDALONE_VIDEO_RECONCILE_INTERVAL_SECONDS = 15.0
+
+
+async def _get_standalone_video_reconcile_state(storyboard_id: int) -> Optional[Dict[str, Any]]:
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT id, video_status, submit_id, video_provider "
+            "FROM storyboards WHERE id = ?",
+            (storyboard_id,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        await db.close()
+
+
+async def _run_standalone_video_reconcile(
+    storyboard_id: int,
+    interval_seconds: float = _STANDALONE_VIDEO_RECONCILE_INTERVAL_SECONDS,
+) -> None:
+    """持续推进一个非队列即梦任务，直到数据库进入终态。"""
+    logger.info(f"[video-reconcile] 分镜 {storyboard_id} 后台状态收敛已启动")
+    consecutive_errors = 0
+    try:
+        while True:
+            state = await _get_standalone_video_reconcile_state(storyboard_id)
+            if not state:
+                logger.info(f"[video-reconcile] 分镜 {storyboard_id} 已不存在，停止")
+                return
+
+            status = str(state.get("video_status") or "").strip().lower()
+            submit_id = str(state.get("submit_id") or "").strip()
+            provider = str(state.get("video_provider") or "jimeng").strip().lower()
+            if status != "generating" or not submit_id or provider != "jimeng":
+                logger.info(
+                    f"[video-reconcile] 分镜 {storyboard_id} 已收敛/转交，停止 "
+                    f"(status={status or '-'}, provider={provider or '-'}, submit_id={bool(submit_id)})"
+                )
+                return
+
+            try:
+                response = await poll_video_status(
+                    PollStatusRequest(storyboard_ids=[storyboard_id])
+                )
+                consecutive_errors = 0
+                items = response.get("results") if isinstance(response, dict) else None
+                item = next(
+                    (
+                        candidate
+                        for candidate in (items or [])
+                        if int(candidate.get("id") or 0) == storyboard_id
+                    ),
+                    None,
+                )
+                polled_status = str((item or {}).get("video_status") or "").strip().lower()
+                if polled_status and polled_status != "generating":
+                    logger.info(
+                        f"[video-reconcile] 分镜 {storyboard_id} 后台收敛完成: {polled_status}"
+                    )
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                consecutive_errors += 1
+                # 瞬态查询失败不能结束任务；首轮和每 10 轮记录一次，避免刷爆日志。
+                if consecutive_errors == 1 or consecutive_errors % 10 == 0:
+                    logger.warning(
+                        f"[video-reconcile] 分镜 {storyboard_id} 查询失败"
+                        f"(连续 {consecutive_errors} 次): {type(exc).__name__}: {exc}"
+                    )
+
+            await asyncio.sleep(max(0.1, float(interval_seconds)))
+    except asyncio.CancelledError:
+        logger.info(f"[video-reconcile] 分镜 {storyboard_id} 后台状态收敛已取消")
+        raise
+
+
+def _ensure_standalone_video_reconcile(storyboard_id: int) -> bool:
+    """幂等启动单镜后台收敛任务；返回 True 表示本次新建。"""
+    existing = _STANDALONE_VIDEO_RECONCILE_TASKS.get(storyboard_id)
+    if existing and not existing.done():
+        return False
+
+    task = asyncio.create_task(
+        _run_standalone_video_reconcile(storyboard_id),
+        name=f"video-reconcile-{storyboard_id}",
+    )
+    _STANDALONE_VIDEO_RECONCILE_TASKS[storyboard_id] = task
+
+    def _cleanup(done_task: asyncio.Task, sid: int = storyboard_id) -> None:
+        if _STANDALONE_VIDEO_RECONCILE_TASKS.get(sid) is done_task:
+            _STANDALONE_VIDEO_RECONCILE_TASKS.pop(sid, None)
+        if done_task.cancelled():
+            return
+        try:
+            exc = done_task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc:
+            logger.error(
+                f"[video-reconcile] 分镜 {sid} 后台任务异常退出: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    task.add_done_callback(_cleanup)
+    return True
+
+
+async def start_standalone_video_reconcile_workers() -> int:
+    """应用启动时恢复上次关闭前仍在生成、且不属于全局队列的即梦任务。"""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT s.id FROM storyboards s "
+            "WHERE s.video_status = 'generating' "
+            "  AND s.submit_id IS NOT NULL AND s.submit_id != '' "
+            "  AND (s.video_provider IS NULL OR s.video_provider = '' OR s.video_provider = 'jimeng') "
+            "  AND NOT EXISTS ("
+            "      SELECT 1 FROM video_task_queue q "
+            "      WHERE q.storyboard_id = s.id AND q.status IN ('queued', 'generating')"
+            "  )"
+        )
+        rows = await cursor.fetchall()
+    finally:
+        await db.close()
+
+    started = sum(1 for row in rows if _ensure_standalone_video_reconcile(int(row["id"])))
+    if started:
+        logger.info(f"[video-reconcile] 启动恢复 {started} 个非队列即梦任务")
+    return started
+
+
+async def stop_standalone_video_reconcile_workers() -> None:
+    tasks = list(_STANDALONE_VIDEO_RECONCILE_TASKS.values())
+    if not tasks:
+        return
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _STANDALONE_VIDEO_RECONCILE_TASKS.clear()
+
+
 class RetryDownloadRequest(BaseModel):
     storyboard_id: int
 
 
 @router.post("/retry-download")
 async def retry_download_video(request: RetryDownloadRequest):
-    """v3.61.153 codex review 修复延伸:
-    针对 status=download_failed 的分镜重新下载 — 用 DB 里存的远程 video_url 重下,
-    走标准 update_video_status('done', local_url) 触发尾帧 hook + 队列同步。
+    """v3.61.153 / v3.61.406:
+    针对 status=download_failed 的分镜重新下载。
 
-    前端在 UI 上对 status=download_failed 的卡片显示"重试下载"按钮调本接口。
+    先尝试 DB 保存的远程 URL；失败后，统一异步 provider 会按 submit_id
+    重新查询上游拿最新地址再下载，避免签名 URL 过期后永远重试同一条旧地址。
     """
     sid = request.storyboard_id
     from database.db import get_db
     db = await get_db()
     try:
         cur = await db.execute(
-            "SELECT video_status, video_url FROM storyboards WHERE id = ?", (sid,),
+            "SELECT video_status, video_url, submit_id, video_provider "
+            "FROM storyboards WHERE id = ?",
+            (sid,),
         )
         row = await cur.fetchone()
     finally:
@@ -4054,11 +7355,20 @@ async def retry_download_video(request: RetryDownloadRequest):
         raise HTTPException(status_code=404, detail=f"分镜 {sid} 不存在")
     cur_status = row["video_status"]
     remote_url = row["video_url"] or ""
+    submit_id = row["submit_id"] or ""
+    provider_type = (row["video_provider"] or "").strip().lower()
+    can_refresh_upstream = provider_type in UNIFIED_VIDEO_PROVIDERS and bool(submit_id)
     # 允许从 download_failed 或 done(但 url 是 http远程)两种状态重试
-    if not remote_url or not remote_url.startswith(("http://", "https://")):
+    if (
+        (not remote_url or not remote_url.startswith(("http://", "https://")))
+        and not can_refresh_upstream
+    ):
         raise HTTPException(
             status_code=400,
-            detail=f"分镜 {sid} 没有可用的远程 URL(当前 video_url={remote_url!r}),无法重下载。请重新提交本镜。",
+            detail=(
+                f"分镜 {sid} 没有可用的远程 URL，也没有可反查的上游任务 ID，"
+                "无法重下载。请重新提交本镜。"
+            ),
         )
     if cur_status not in ("download_failed", "done", "failed"):
         raise HTTPException(
@@ -4067,27 +7377,103 @@ async def retry_download_video(request: RetryDownloadRequest):
         )
 
     videos_dir = os.path.normpath(media_subdir("videos"))
-    local_url = await _download_remote_video(sid, remote_url, videos_dir)
+    logger.info(
+        f"[retry-download] 开始 sid={sid} provider={provider_type or '-'} "
+        f"submit_id={submit_id or '-'} has_remote_url={bool(remote_url)}"
+    )
+
+    # 已保存 URL 先做一次快速可靠下载。失败后云端 provider 再查最新地址，
+    # 因此这里限制为单轮 120 秒，避免按钮一直静默等待旧签名 URL。
+    local_url: Optional[str] = None
+    download_error: Optional[str] = None
+    if remote_url.startswith(("http://", "https://")):
+        local_url, download_error = await _download_remote_video_with_diagnostics(
+            sid,
+            remote_url,
+            videos_dir,
+            provider_type=provider_type,
+            max_attempts=1,
+            attempt_timeout_seconds=120,
+        )
+
+    # 统一异步 provider：旧 URL 失败后强制重新查询任务，拿新的 result.url 再下载。
+    if not local_url and can_refresh_upstream:
+        logger.info(
+            f"[retry-download] sid={sid} 旧 URL 下载失败({download_error or '无可用 URL'})，"
+            f"重新查询 {PROVIDER_FRIENDLY.get(provider_type, provider_type)} task={submit_id}"
+        )
+        refreshed = await _poll_storyboard_via_cloud(
+            sid,
+            submit_id,
+            provider_type=provider_type,
+        )
+        refreshed_status = refreshed.get("video_status")
+        refreshed_url = refreshed.get("video_url")
+        if refreshed_status == "done" and refreshed_url:
+            logger.info(
+                f"[retry-download] 分镜 {sid} 上游刷新后重试下载成功 → {refreshed_url}"
+            )
+            return {
+                "success": True,
+                "id": sid,
+                "video_status": "done",
+                "video_url": refreshed_url,
+                "message": "已刷新上游地址并下载成功",
+            }
+
+        # 上游查询失败/仍在处理时，DB 里的 download_failed 保持可恢复；
+        # 如果上游明确 failed，_poll_storyboard_via_cloud 已把真实状态落库。
+        result_status = (
+            refreshed_status
+            if refreshed_status in ("failed", "download_failed")
+            else "download_failed"
+        )
+        refresh_reason = refreshed.get("fail_reason") or refreshed.get("error")
+        message_parts = []
+        if download_error:
+            message_parts.append(f"本地下载失败：{download_error}")
+        if refresh_reason:
+            message_parts.append(f"上游刷新：{refresh_reason}")
+        elif refreshed_status == "generating":
+            message_parts.append("上游当前仍未返回可下载视频，请稍后再试")
+        else:
+            message_parts.append("已刷新上游地址，但下载仍未成功")
+        return {
+            "success": False,
+            "id": sid,
+            "video_status": result_status,
+            "video_url": refreshed_url or remote_url or None,
+            "fail_reason": "；".join(message_parts),
+            "message": "；".join(message_parts),
+        }
+
     if not local_url:
         # 下载又失败,保留 download_failed 状态(已经是 download_failed 就维持)
-        if cur_status != "download_failed":
-            await storyboard_service.update_video_status(
-                sid, "download_failed", remote_url,
-                fail_reason="重试下载失败:网络/磁盘/超时。可再次点重试。",
-            )
+        fail_message = (
+            f"重试下载失败：{download_error or '网络、磁盘或远程地址异常'}。"
+            "远程地址仍保留，可稍后再次重试。"
+        )
+        await storyboard_service.update_video_status(
+            sid,
+            "download_failed",
+            remote_url,
+            fail_reason=fail_message,
+        )
         return {
             "success": False,
             "id": sid,
             "video_status": "download_failed",
-            "message": "重试下载失败,远程 URL 仍记录在 video_url 字段,可继续重试",
+            "video_url": remote_url or None,
+            "fail_reason": fail_message,
+            "message": fail_message,
         }
 
     # 下载成功 → 走标准 update_video_status('done'),自动触发尾帧抽取 hook + 队列同步
     await storyboard_service.update_video_status(sid, "done", local_url)
     await _finalize_video_log_success(
         storyboard_id=sid,
-        submit_id=None,
-        provider="retry-download",
+        submit_id=submit_id or None,
+        provider=provider_type or "retry-download",
         video_url=local_url,
     )
     logger.info(f"[retry-download] 分镜 {sid} 重试下载成功 → {local_url}")
@@ -4126,16 +7512,28 @@ async def poll_video_status(request: PollStatusRequest):
         # 先把 skip 的填上(读 DB 不重查即梦)
         for _ssid in skipped_concurrent:
             _cur = await db.execute(
-                "SELECT video_status, video_url, video_fail_reason FROM storyboards WHERE id=?",
+                "SELECT video_status, video_url, video_fail_reason, last_frame_path "
+                "FROM storyboards WHERE id=?",
                 (_ssid,),
             )
             _row = await _cur.fetchone()
             if _row:
+                _tail_frame_finalizing = _local_video_needs_tail_frame(
+                    _row["video_status"],
+                    _row["video_url"],
+                    _row["last_frame_path"],
+                )
                 results.append({
                     "id": _ssid,
-                    "video_status": _row["video_status"],
+                    # Another poll/reconcile worker is still inside the done
+                    # hook.  Keep the visible pipeline in generating state for
+                    # these few seconds so the UI does not stop before the tail
+                    # frame is written.
+                    "video_status": "generating" if _tail_frame_finalizing else _row["video_status"],
                     "video_url": _row["video_url"],
                     "fail_reason": _row["video_fail_reason"],
+                    "last_frame_path": _row["last_frame_path"],
+                    "finalizing_tail_frame": _tail_frame_finalizing,
                     "skipped_concurrent": True,
                 })
             else:
@@ -4143,7 +7541,9 @@ async def poll_video_status(request: PollStatusRequest):
 
         for sid in process_ids:
             cursor = await db.execute(
-                "SELECT id, submit_id, video_status, video_url, video_submit_time, video_fail_reason, video_provider FROM storyboards WHERE id = ?", (sid,)
+                "SELECT id, submit_id, video_status, video_url, video_submit_time, "
+                "video_fail_reason, video_provider, last_frame_path "
+                "FROM storyboards WHERE id = ?", (sid,)
             )
             row = await cursor.fetchone()
             if not row:
@@ -4163,8 +7563,8 @@ async def poll_video_status(request: PollStatusRequest):
                     now = now_beijing().replace(tzinfo=None)
                     # 按 provider 决定阈值
                     _sb_prov_to_threshold = (row['video_provider'] if 'video_provider' in row.keys() else None) or 'jimeng'
-                    # v3.61.175: cloud provider (ark/cool/xinglian) 走 helper,jimeng CLI 走旧常量
-                    if _sb_prov_to_threshold in ('volcengine_ark', 'cool', 'xinglian', 'pippit_cli'):
+                    # v3.61.175: unified provider (ark/cool/xinglian/pippit_cli) 走 helper,jimeng CLI 走旧常量
+                    if _sb_prov_to_threshold in UNIFIED_VIDEO_PROVIDERS:
                         _timeout_min = _cloud_timeout_minutes(_sb_prov_to_threshold)
                     else:
                         _timeout_min = TIMEOUT_MINUTES_JIMENG
@@ -4210,7 +7610,7 @@ async def poll_video_status(request: PollStatusRequest):
                         # ★ v3.61.121:按 provider 路由 — 火山方舟/Cool 走 cloud HTTP API 查询,即梦走 CLI
                         # v3.61.168: cool 跟 ark 复用 _poll_storyboard_via_cloud(provider_type 透传)
                         _sb_provider_to = (row['video_provider'] if 'video_provider' in row.keys() else None) or 'jimeng'
-                        if _sb_provider_to in ('volcengine_ark', 'cool', 'xinglian', 'pippit_cli'):
+                        if _sb_provider_to in UNIFIED_VIDEO_PROVIDERS:
                             # 云端 HTTP 超时强查 — 复用 _poll_storyboard_via_cloud(query + 下载 + 状态写回 + 抽尾帧 hook)
                             try:
                                 _ark_to = await _poll_storyboard_via_cloud(
@@ -4224,6 +7624,28 @@ async def poll_video_status(request: PollStatusRequest):
                                 elif _ark_status == 'failed':
                                     logger.warning(f"[poll-status/ark] 分镜 {sid} 超时强查为 failed: {_ark_to.get('fail_reason')}")
                                 else:
+                                    _hard_limit_min = _cloud_hard_limit_minutes(_sb_provider_to)
+                                    _elapsed_min_cloud = (now - submit_time).total_seconds() / 60.0
+                                    if _hard_limit_min and _elapsed_min_cloud >= _hard_limit_min:
+                                        _hard_msg = (
+                                            f"{PROVIDER_FRIENDLY.get(_sb_provider_to, _sb_provider_to)} "
+                                            f"超过 {int(_elapsed_min_cloud)} 分钟仍未出结果,已标记失败,请重新生成。"
+                                        )
+                                        logger.warning(f"[poll-status/ark] 分镜 {sid} {_hard_msg}")
+                                        await storyboard_service.update_video_status(sid, "failed", fail_reason=_hard_msg)
+                                        await _finalize_video_log_error(
+                                            storyboard_id=sid,
+                                            submit_id=row['submit_id'],
+                                            fail_reason=_hard_msg,
+                                        )
+                                        results.append({
+                                            "id": sid,
+                                            "video_status": "failed",
+                                            "video_url": None,
+                                            "fail_reason": _hard_msg,
+                                            "timeout": True,
+                                        })
+                                        continue
                                     # 仍在跑 — 只有真实超过阈值才标记 overtime。
                                     # force=True 是用户手动刷新状态,不能误导前端显示"已超过30分钟"。
                                     logger.info(
@@ -4404,11 +7826,12 @@ async def poll_video_status(request: PollStatusRequest):
                                 # v3.61.256 修复:querying 是即梦"进行中"返回值,但任务在即梦后台卡死
                                 #   或被用户在即梦端取消时,query_result 会一直返回 querying,旧逻辑无限保留
                                 #   generating 死等(实测 4504 次空转)。也兜住 v3.61.254「无效 submit_id 进轮询」的副作用。
-                                #   硬止损:超过 360 分钟(6 小时)仍 querying → 标失败,
+                                #   硬止损:超过 480 分钟(8 小时)仍 querying → 标失败,
                                 #   让用户能重新生成;未到硬上限的 querying 仍保留 generating,不误杀真排队。
                                 #   v3.61.259:180→360,给即梦超长排队更大余地(用户要求)。
+                                #   v3.61.336:360→480,即梦 CLI 视频最长等待 8 小时。
                                 _elapsed_min_qy = (now - submit_time).total_seconds() / 60.0
-                                _HARD_LIMIT_MIN = 360
+                                _HARD_LIMIT_MIN = 480
                                 if _elapsed_min_qy >= _HARD_LIMIT_MIN:
                                     _hard_msg = (
                                         f"即梦超过 {int(_elapsed_min_qy)} 分钟仍未出结果(状态 {timeout_gen_status}),"
@@ -4479,7 +7902,37 @@ async def poll_video_status(request: PollStatusRequest):
 
             # 如果已完成且有视频URL，直接返回
             if row['video_status'] == 'done' and row['video_url']:
-                results.append({"id": sid, "video_status": row['video_status'], "video_url": row['video_url']})
+                _last_frame_path = row['last_frame_path']
+                # Self-heal old/racy rows: the video is already local and done,
+                # but the tail-frame hook either had not finished when another
+                # poll stopped the UI, or an older build failed before writing
+                # last_frame_path.  Re-extract once on the next real poll.
+                if _local_video_needs_tail_frame(
+                    row['video_status'], row['video_url'], _last_frame_path
+                ):
+                    try:
+                        logger.info(
+                            f"[poll-status] 分镜 {sid} 已完成但缺少尾帧，执行自愈抽帧"
+                        )
+                        await storyboard_service._extract_and_save_last_frame(
+                            sid, row['video_url']
+                        )
+                        _lf_cur = await db.execute(
+                            "SELECT last_frame_path FROM storyboards WHERE id = ?",
+                            (sid,),
+                        )
+                        _lf_row = await _lf_cur.fetchone()
+                        _last_frame_path = _lf_row['last_frame_path'] if _lf_row else None
+                    except Exception as _tail_err:
+                        logger.warning(
+                            f"[poll-status] 分镜 {sid} 尾帧自愈失败(视频仍保留完成): {_tail_err}"
+                        )
+                results.append({
+                    "id": sid,
+                    "video_status": row['video_status'],
+                    "video_url": row['video_url'],
+                    "last_frame_path": _last_frame_path,
+                })
                 continue
 
             # v3.59.86:已标 failed 的分镜不再重查即梦
@@ -4487,26 +7940,62 @@ async def poll_video_status(request: PollStatusRequest):
             # v3.61.175: failed 早退加 force=True 例外 ——
             #   场景:逆向即梦号(xinglian)排队超 30 min 老版本误判 failed,
             #   实际上游异步可能已经出包,用户点「刷新状态」(force=True)就该再去捞一次。
-            #   放过条件:force=True + submit_id 非空 + provider in (ark/cool/xinglian)
+            #   放过条件:
+            #     1) force=True + submit_id 非空 + provider in (ark/cool/xinglian)
+            #     2) v3.61.278:用户手动中止的即梦任务。手动中止只解除本地占用,
+            #        即梦上游可能还在跑,允许用户点「刷新状态」按 submit_id 捞回。
             #     - 自动轮询(force=False)不重查,避免后台死循环
-            #     - 即梦 CLI failed 多半是审核拒/账号封,重查无意义(维持不放过)
+            #     - 普通即梦 failed 多半是审核拒/账号封,重查无意义(维持不放过)
             #   落到后面的 _poll_storyboard_via_cloud 后:
             #     - 上游已出 url → 自动 success → 下载视频 → status 自动改 done
             #     - 上游 success+url 空且未超 xinglian 180min → 继续 generating(老超时 30min 用户可救)
             #     - 上游 success+url 空且超 180min → friendly failed(写明已重试)
             _sb_prov_for_failed = (row['video_provider'] if 'video_provider' in row.keys() else None) or 'jimeng'
+            _manual_abort_failed = str(db_fail_reason or "").startswith("已手动中止生成")
+            _fail_reason_text = str(db_fail_reason or "")
+            _jimeng_ghost_failed = (
+                (
+                    "即梦 CLI 返回了任务ID" in _fail_reason_text
+                    and (
+                        "处理中列表连续查不到" in _fail_reason_text
+                        or "任务列表连续查不到" in _fail_reason_text
+                    )
+                )
+                or (
+                    "即梦 CLI 返回任务正在排队/生成" in _fail_reason_text
+                    and "幽灵任务" in _fail_reason_text
+                )
+            )
             _allow_failed_force_retry = (
                 request.force
                 and row['submit_id']
-                and _sb_prov_for_failed in ('volcengine_ark', 'cool', 'xinglian', 'pippit_cli')
+                and (
+                    _sb_prov_for_failed in UNIFIED_VIDEO_PROVIDERS
+                    or (_sb_prov_for_failed == 'jimeng' and (_manual_abort_failed or _jimeng_ghost_failed))
+                )
             )
             if row['video_status'] == 'failed':
                 if not _allow_failed_force_retry:
+                    _display_fail_reason = db_fail_reason
+                    _raw_fail_low = str(db_fail_reason or "").lower()
+                    _needs_translate = any(k in _raw_fail_low for k in (
+                        "post-tns", "tns check", "generation failed", "final generation failed",
+                        "aigccompliance", "exceedconcurrencylimit", "ratelimit", "rate limit",
+                        "context deadline", "no file upload", "upload phase",
+                    ))
+                    if _sb_prov_for_failed == "jimeng" and db_fail_reason and _needs_translate:
+                        _translated = _translate_jimeng_fail_reason(str(db_fail_reason), "")
+                        if _translated != db_fail_reason:
+                            _display_fail_reason = _translated
+                            try:
+                                await storyboard_service.update_video_status(sid, "failed", fail_reason=_translated)
+                            except Exception as _e:
+                                logger.debug(f"[poll-status] failed reason translate backfill skipped sb={sid}: {_e}")
                     results.append({
                         "id": sid,
                         "video_status": "failed",
                         "video_url": row['video_url'],
-                        "fail_reason": db_fail_reason,
+                        "fail_reason": _display_fail_reason,
                     })
                     continue
                 logger.info(
@@ -4524,7 +8013,7 @@ async def poll_video_status(request: PollStatusRequest):
             # storyboard.video_provider 标记了用哪个 provider 提交的
             # v3.61.168: cool 跟 ark 都走 _poll_storyboard_via_cloud,provider_type 透传
             sb_provider = (row['video_provider'] if 'video_provider' in row.keys() else None) or 'jimeng'
-            if sb_provider in ('volcengine_ark', 'cool', 'xinglian', 'pippit_cli'):
+            if sb_provider in UNIFIED_VIDEO_PROVIDERS:
                 # 云端 HTTP API 查询
                 ark_result = await _poll_storyboard_via_cloud(
                     sid, submit_id,
@@ -4720,6 +8209,72 @@ async def poll_video_status(request: PollStatusRequest):
                     # 仍在排队/生成中
                     queue_info = data.get("queue_info", {})
                     logger.info(f"[poll-status] 分镜 {sid} 仍在生成中，gen_status={gen_status}")
+                    if row['video_status'] == 'failed' and _allow_failed_force_retry:
+                        try:
+                            await storyboard_service.update_video_status(sid, "generating")
+                            logger.info(
+                                f"[poll-status] sb={sid} failed 强刷救回,DB 改回 generating + 清 fail_reason"
+                            )
+                        except Exception as _e:
+                            logger.warning(
+                                f"[poll-status] sb={sid} 即梦 failed 强刷救回落库失败: {_e}"
+                            )
+
+                    # 强幽灵兜底:客户机器的 Jimeng CLI 本地库可能残留 querying 死记录,
+                    # list_task 会一直列出它们,但 query_result.queue_info 为空且网页端并无任务。
+                    # 因此这里不再用 list_task 缺失作为释放条件;只在同一 submit_id 超过 6 小时、
+                    # 且 queue_info 连续为空时释放本地状态。只要 queue_info 里出现 Queueing/Generating
+                    # 等远端队列信息,就认为任务仍被即梦接住,不触发强幽灵。
+                    try:
+                        _queue_status_l = ""
+                        _queue_info_empty = True
+                        if isinstance(queue_info, dict):
+                            _queue_status_l = str(queue_info.get("queue_status") or "").lower()
+                            _queue_info_empty = not any(
+                                str(v or "").strip() for v in queue_info.values()
+                            )
+                        _gen_status_l = str(gen_status or "").lower()
+                        _submitted_at = None
+                        if row["video_submit_time"]:
+                            _submitted_at = datetime.strptime(row["video_submit_time"], "%Y-%m-%d %H:%M:%S")
+                        _elapsed = (now_beijing().replace(tzinfo=None) - _submitted_at).total_seconds() if _submitted_at else 0
+                        _still_running_status = _gen_status_l in ("querying", "generating", "pending", "running", "")
+                        _should_ghost_check = (
+                            submit_id
+                            and _elapsed >= _JIMENG_STRONG_GHOST_MIN_SECONDS
+                            and _still_running_status
+                            and _queue_info_empty
+                        )
+                        if _should_ghost_check:
+                            _miss = _JIMENG_GHOST_MISS_COUNTS.get(str(submit_id), 0) + 1
+                            _JIMENG_GHOST_MISS_COUNTS[str(submit_id)] = _miss
+                            logger.warning(
+                                f"[poll-status] 分镜 {sid} submit_id={submit_id} 已 querying {int(_elapsed)}s,"
+                                f"且 query_result.queue_info 连续为空 {_miss}/{_JIMENG_GHOST_MISS_LIMIT}"
+                            )
+                            if _miss >= _JIMENG_GHOST_MISS_LIMIT:
+                                _JIMENG_GHOST_MISS_COUNTS.pop(str(submit_id), None)
+                                _ghost_msg = (
+                                    "即梦 CLI 返回了任务ID,但超过6小时仍无远端队列信息(queue_info为空)。"
+                                    "这通常是本机即梦 CLI 本地库残留幽灵任务导致,已释放本地生成状态,请重新生成。"
+                                )
+                                await storyboard_service.update_video_status(sid, "failed", fail_reason=_ghost_msg)
+                                await _finalize_video_log_error(
+                                    storyboard_id=sid,
+                                    submit_id=submit_id,
+                                    fail_reason=_ghost_msg,
+                                )
+                                results.append({
+                                    "id": sid,
+                                    "video_status": "failed",
+                                    "video_url": None,
+                                    "fail_reason": _ghost_msg,
+                                })
+                                continue
+                        else:
+                            _JIMENG_GHOST_MISS_COUNTS.pop(str(submit_id), None)
+                    except Exception as _ghost_err:
+                        logger.debug(f"[poll-status] 即梦幽灵任务反查跳过 sb={sid}: {_ghost_err}")
                     results.append({
                         "id": sid, 
                         "video_status": "generating", 
@@ -4872,6 +8427,35 @@ async def delete_extra_reference(storyboard_id: int):
         return {"success": True, "message": "删除成功"}
     finally:
         await db.close()
+
+
+class CaptureLastFrameRequest(BaseModel):
+    capture_time: float
+
+    @field_validator("capture_time")
+    @classmethod
+    def validate_capture_time(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("capture_time 必须大于等于 0")
+        return value
+
+
+@router.post("/storyboard/{storyboard_id}/last-frame-capture")
+async def capture_custom_last_frame(storyboard_id: int, request: CaptureLastFrameRequest):
+    """按用户选择的时间点重新截取该分镜尾帧。"""
+    try:
+        return await storyboard_service.capture_custom_last_frame(
+            storyboard_id,
+            request.capture_time,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
 
 @router.get("/storyboard/{storyboard_id}/last-frame-download")
@@ -5138,6 +8722,11 @@ class UpdateExtraRefDescRequest(BaseModel):
     desc: str
 
 
+class UpdateTopviewPromptsRequest(BaseModel):
+    start_prompt: Optional[str] = None
+    end_prompt: Optional[str] = None
+
+
 @router.put("/storyboard/{storyboard_id}/extra-reference-desc")
 async def update_extra_reference_desc(storyboard_id: int, request: UpdateExtraRefDescRequest):
     """更新额外参考图描述"""
@@ -5157,6 +8746,78 @@ async def update_extra_reference_desc(storyboard_id: int, request: UpdateExtraRe
         await db.commit()
 
         return {"success": True, "message": "更新成功"}
+    finally:
+        await db.close()
+
+
+@router.get("/storyboard/{storyboard_id}/topview-chain")
+async def get_storyboard_topview_chain(storyboard_id: int):
+    """返回当前分镜生成视频时会使用的俯视人物调度图链。
+
+    prev_topview 只来自 find_chainable_prev_topview,即同一物理场景且文件存在的上一小节
+    结尾俯视图;不会按列表顺序无脑展示。
+    """
+    prev = await find_chainable_prev_topview(storyboard_id)
+    prev_public = None
+    if prev:
+        prev_public = {k: v for k, v in prev.items() if k != "abs_path"}
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT id, topview_image, topview_prompt, topview_start_prompt, topview_end_prompt "
+            "FROM storyboards WHERE id = ?",
+            (storyboard_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="分镜不存在")
+        start_prompt = (row["topview_start_prompt"] or "").strip() or DEFAULT_TOPVIEW_START_PROMPT
+        end_prompt = (
+            (row["topview_end_prompt"] or "").strip()
+            or (row["topview_prompt"] or "").strip()
+            or DEFAULT_TOPVIEW_END_PROMPT
+        )
+        return {
+            "prev_topview": prev_public,
+            "current_topview": {
+                "storyboard_id": row["id"],
+                "image_path": row["topview_image"],
+            } if row["topview_image"] else None,
+            "start_prompt": start_prompt,
+            "end_prompt": end_prompt,
+            "default_start_prompt": DEFAULT_TOPVIEW_START_PROMPT,
+            "default_end_prompt": DEFAULT_TOPVIEW_END_PROMPT,
+        }
+    finally:
+        await db.close()
+
+
+@router.put("/storyboard/{storyboard_id}/topview-prompts")
+async def update_topview_prompts(storyboard_id: int, request: UpdateTopviewPromptsRequest):
+    """保存当前分镜的俯视人物调度图 A/B 说明。
+
+    start_prompt 描述"上一节可接俯视图作为本镜开始 A";end_prompt 描述本镜 topview_image
+    作为结束 B。旧字段 topview_prompt 同步写 B,保持兼容。
+    """
+    start_prompt = (request.start_prompt or "").strip() or DEFAULT_TOPVIEW_START_PROMPT
+    end_prompt = (request.end_prompt or "").strip() or DEFAULT_TOPVIEW_END_PROMPT
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT id FROM storyboards WHERE id = ?", (storyboard_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="分镜不存在")
+        await db.execute(
+            "UPDATE storyboards SET topview_start_prompt = ?, topview_end_prompt = ?, topview_prompt = ? WHERE id = ?",
+            (start_prompt, end_prompt, end_prompt, storyboard_id),
+        )
+        await db.commit()
+        return {
+            "success": True,
+            "start_prompt": start_prompt,
+            "end_prompt": end_prompt,
+            "message": "更新成功",
+        }
     finally:
         await db.close()
 
@@ -5197,9 +8858,9 @@ async def mark_queued(request: MarkQueuedRequest):
         placeholders = ",".join("?" * len(request.storyboard_ids))
         await db.execute(
             f"UPDATE storyboards SET video_status = 'queued', "
-            f"  video_fail_reason = NULL, submit_id = NULL "
+            f"  video_fail_reason = NULL, submit_id = NULL, video_submit_time = ? "
             f"WHERE id IN ({placeholders})",
-            request.storyboard_ids,
+            [now_beijing_str(), *request.storyboard_ids],
         )
         await db.commit()
         logger.info(f"[mark-queued] 已把 {len(request.storyboard_ids)} 个分镜置为 queued: {request.storyboard_ids}")
@@ -5300,117 +8961,6 @@ async def get_storyboard_chain_prev(storyboard_id: int):
 
 
 # ============================================================
-# v3.61.383: 用户可主动解除卡住的本地视频任务占用。
-class AbortStuckVideoRequest(BaseModel):
-    storyboard_ids: List[int]
-    reason: Optional[str] = None
-
-
-class RecoverChainRequest(BaseModel):
-    storyboard_id: int
-    storyboard_ids: Optional[List[int]] = None
-
-
-@router.post("/abort-stuck-video")
-async def abort_stuck_video(request: AbortStuckVideoRequest):
-    """将指定的 generating/queued 任务标记失败，允许用户重新生成。
-
-    这里只解除本地占用，不宣称取消上游任务；部分 provider 没有可靠的取消接口。
-    """
-    if not request.storyboard_ids:
-        return {"success": True, "aborted": 0, "aborted_ids": []}
-    reason = request.reason or "已手动中止生成，可重新勾选生成"
-    db = await get_db()
-    aborted_ids: list = []
-    try:
-        placeholder = ",".join(["?"] * len(request.storyboard_ids))
-        cursor = await db.execute(
-            f"SELECT id FROM storyboards WHERE id IN ({placeholder}) AND video_status IN ('generating','queued')",
-            request.storyboard_ids,
-        )
-        targets = [r["id"] for r in await cursor.fetchall()]
-        for tid in targets:
-            await db.execute(
-                "UPDATE storyboards SET video_status = ?, video_fail_reason = ?, "
-                "submit_id = CASE WHEN COALESCE(video_provider, 'jimeng') = 'jimeng' THEN NULL ELSE submit_id END "
-                "WHERE id = ?",
-                ("failed", reason, tid),
-            )
-            await db.execute(
-                "UPDATE video_task_queue SET status = 'aborted', finished_at = ?, "
-                "error_code = 'USER_ABORTED', error_message = ? "
-                "WHERE storyboard_id = ? AND status IN ('queued','generating')",
-                (_now_str_simple(), reason, tid),
-            )
-            aborted_ids.append(tid)
-        await db.commit()
-        return {"success": True, "aborted": len(aborted_ids), "aborted_ids": aborted_ids}
-    finally:
-        await db.close()
-
-
-@router.post("/recover-chain")
-async def recover_chain(request: RecoverChainRequest):
-    """恢复串行尾帧模式下被 chain_aborted 阻断的后续分镜。
-
-    只解除本地链路中断状态，不取消或改写上游已提交任务。
-    """
-    db = await get_db()
-    recovered_ids: list[int] = []
-    try:
-        cursor = await db.execute(
-            "SELECT id, novel_id, script_id, sort_order FROM storyboards WHERE id = ?",
-            (request.storyboard_id,),
-        )
-        source = await cursor.fetchone()
-        if not source:
-            raise HTTPException(status_code=404, detail=f"分镜 id={request.storyboard_id} 不存在")
-
-        explicit_ids = [int(x) for x in (request.storyboard_ids or []) if int(x) > 0]
-        if explicit_ids:
-            placeholder = ",".join(["?"] * len(explicit_ids))
-            cursor = await db.execute(
-                f"SELECT id FROM storyboards WHERE id IN ({placeholder}) AND video_status = 'chain_aborted'",
-                explicit_ids,
-            )
-        else:
-            script_id = source["script_id"]
-            if script_id is None:
-                cursor = await db.execute(
-                    "SELECT id FROM storyboards "
-                    "WHERE novel_id = ? AND script_id IS NULL AND sort_order > ? AND video_status = 'chain_aborted' "
-                    "ORDER BY sort_order ASC, id ASC",
-                    (source["novel_id"], source["sort_order"] or 0),
-                )
-            else:
-                cursor = await db.execute(
-                    "SELECT id FROM storyboards "
-                    "WHERE novel_id = ? AND script_id = ? AND sort_order > ? AND video_status = 'chain_aborted' "
-                    "ORDER BY sort_order ASC, id ASC",
-                    (source["novel_id"], script_id, source["sort_order"] or 0),
-                )
-        recovered_ids = [int(row["id"]) for row in await cursor.fetchall()]
-        if not recovered_ids:
-            return {"success": True, "recovered": 0, "storyboard_ids": []}
-
-        placeholder = ",".join(["?"] * len(recovered_ids))
-        await db.execute(
-            f"UPDATE storyboards SET video_status = NULL, video_fail_reason = NULL, submit_id = NULL "
-            f"WHERE id IN ({placeholder}) AND video_status = 'chain_aborted'",
-            recovered_ids,
-        )
-        await db.execute(
-            f"UPDATE video_task_queue SET status = 'aborted', finished_at = ?, "
-            f"error_code = 'CHAIN_RECOVERED', error_message = '链路已手动恢复，旧队列占用已清理' "
-            f"WHERE storyboard_id IN ({placeholder}) AND status IN ('queued','generating')",
-            [_now_str_simple(), *recovered_ids],
-        )
-        await db.commit()
-        return {"success": True, "recovered": len(recovered_ids), "storyboard_ids": recovered_ids}
-    finally:
-        await db.close()
-
-
 # v3.61.100: 火山方舟视频任务修复工具
 # ============================================================
 #
@@ -5450,12 +9000,11 @@ async def ark_force_sync(req: ArkForceSyncRequest):
         raise HTTPException(status_code=404, detail=f"分镜 id={req.storyboard_id} 不存在")
     if not row["submit_id"]:
         raise HTTPException(status_code=400, detail="该分镜没有 submit_id,无法同步")
-    # v3.61.169: cool 也走云端 HTTP 路径,放行
     provider = (row["video_provider"] if "video_provider" in row.keys() else None) or "jimeng"
-    if provider not in ("volcengine_ark", "cool", "xinglian"):
+    if provider not in UNIFIED_VIDEO_PROVIDERS:
         raise HTTPException(
             status_code=400,
-            detail=f"该分镜 provider={provider},不是云端 HTTP 类型(volcengine_ark/cool/xinglian),请用对应通道的刷新按钮",
+            detail=f"该分镜 provider={provider},不是可强同步的视频 provider({UNIFIED_VIDEO_PROVIDERS})",
         )
 
     logger.info(f"[ark/force-sync] 强同步 sb={req.storyboard_id} provider={provider} submit_id={row['submit_id']}")
@@ -5467,15 +9016,16 @@ async def ark_force_sync(req: ArkForceSyncRequest):
 class ArkSyncAllPendingRequest(BaseModel):
     novel_id: Optional[int] = None
     script_id: Optional[int] = None
+    provider: Optional[str] = None  # v3.61.308: 可按当前渠道过滤(pippit_cli/cool/xinglian/volcengine_ark)
     local_api_key: Optional[str] = None  # v3.61.107: 企业本地 APIKey
 
 
 @router.post("/ark/sync-all-pending")
 async def ark_sync_all_pending(req: ArkSyncAllPendingRequest = None):
-    """v3.61.100 + v3.61.169 + 173: 一键同步本地所有 云端 HTTP provider(volcengine_ark / cool / xinglian)generating 状态的分镜
+    """v3.61.100 + v3.61.169 + 173: 一键同步本地所有统一 provider generating 状态的分镜
 
     用户不用输入 task_id,后端自动:
-      1. 查所有 video_provider IN ('volcengine_ark', 'cool', 'xinglian') AND video_status='generating' AND submit_id IS NOT NULL 的分镜
+      1. 查所有 video_provider IN UNIFIED_VIDEO_PROVIDERS AND video_status='generating' AND submit_id IS NOT NULL 的分镜
       2. 对每条调 _poll_storyboard_via_ark(alias 会按 storyboards.video_provider 真值分流)
       3. 返回修复报告:成功转 done 几个 / 失败几个 / 仍在跑几个
     """
@@ -5484,12 +9034,19 @@ async def ark_sync_all_pending(req: ArkSyncAllPendingRequest = None):
     novel_id = req.novel_id
     script_id = req.script_id
     local_api_key = req.local_api_key
-    sql = (
-        "SELECT id, submit_id, scene_index, section_number, video_provider FROM storyboards "
-        "WHERE video_provider IN ('volcengine_ark', 'cool', 'xinglian') AND video_status='generating' "
-        "AND submit_id IS NOT NULL AND submit_id != ''"
-    )
-    params: List[Any] = []
+    provider_filter = (req.provider or "").strip().lower()
+    if provider_filter and provider_filter not in UNIFIED_VIDEO_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"不支持同步该视频渠道: {provider_filter}")
+    sql = "SELECT id, submit_id, scene_index, section_number, video_provider FROM storyboards WHERE "
+    if provider_filter:
+        sql += "video_provider = ? AND video_status='generating' AND submit_id IS NOT NULL AND submit_id != ''"
+        params: List[Any] = [provider_filter]
+    else:
+        sql += (
+            f"video_provider IN ({','.join(['?'] * len(UNIFIED_VIDEO_PROVIDERS))}) AND video_status='generating' "
+            "AND submit_id IS NOT NULL AND submit_id != ''"
+        )
+        params = list(UNIFIED_VIDEO_PROVIDERS)
     if novel_id is not None:
         sql += " AND novel_id=?"
         params.append(novel_id)
@@ -5512,7 +9069,7 @@ async def ark_sync_all_pending(req: ArkSyncAllPendingRequest = None):
             "done": 0,
             "still_generating": 0,
             "failed": 0,
-            "message": "本地没有「生成中」的云端(火山方舟 / Cool)分镜,无需同步",
+            "message": "本地没有「生成中」的可同步视频任务,无需同步",
             "items": [],
         }
 
@@ -5634,7 +9191,7 @@ class ArkClaimRequest(BaseModel):
 
 
 # v3.61.173: claim 接口允许写入的 provider 白名单
-_CLAIM_ALLOWED_PROVIDERS = ("volcengine_ark", "cool", "xinglian")
+_CLAIM_ALLOWED_PROVIDERS = UNIFIED_VIDEO_PROVIDERS
 
 
 @router.post("/ark/claim-by-task-id")

@@ -21,7 +21,6 @@ from typing import Optional, List, Dict, Any
 
 import aiohttp
 from utils.ssl_helper import get_aiohttp_connector
-from services.trusted_providers import require_trusted_model_url
 
 from .base import VideoProviderBase, ProviderType, SubmitResult, QueryResult
 from utils.paths import resolve_db_path
@@ -60,7 +59,7 @@ class VolcengineArkProvider(VideoProviderBase):
 
     def __init__(self, config: dict):
         super().__init__(config)
-        self.base_url = require_trusted_model_url(config.get("base_url") or DEFAULT_BASE_URL)
+        self.base_url = (config.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
         self.api_key = config.get("api_key") or ""
         self.model_id = config.get("model_name") or "doubao-seedance-2-0-260128"
         # 默认参数
@@ -590,7 +589,7 @@ class VolcengineArkProvider(VideoProviderBase):
                 "解决方法:\n"
                 "  1) 换成漫画/卡通/Q版风格的角色图\n"
                 "  2) 切回即梦CLI模式生成\n"
-                "  3) 换 Seedance 1.5 Pro 模型(允许真人)",
+                "  3) 改用非真人脸参考图后重试",
                 "REVIEW"
             )
 

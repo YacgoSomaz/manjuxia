@@ -1,0 +1,45 @@
+{
+  "appId": "site.anyq.manjuxia",
+  "productName": "漫剧虾",
+  "copyright": "Copyright © 2026 漫剧虾",
+  "directories": {
+    "output": "packaging/commercial"
+  },
+  "asar": false,
+  "compression": "maximum",
+  "afterPack": "packaging/after-pack.cjs",
+  "files": [
+    "electron/**/*",
+    "!electron/main.js",
+    "!electron/main.jsc",
+    "package.json",
+    "!node_modules/**/*"
+  ],
+  "extraResources": [
+    { "from": "packaging/release/漫剧虾-0.1.38/resources/frontend", "to": "frontend" },
+    { "from": "packaging/release/漫剧虾-0.1.38/resources/backend", "to": "backend" },
+    { "from": "packaging/release/漫剧虾-0.1.38/resources/public", "to": "public" },
+    { "from": "packaging/release/漫剧虾-0.1.38/resources/build", "to": "build" },
+    { "from": "packaging/release/漫剧虾-0.1.38/resources/python", "to": "python" },
+    { "from": "packaging/release/漫剧虾-0.1.38/resources/release_config.json", "to": "release_config.json" }
+  ],
+  "win": {
+    "target": [{ "target": "nsis", "arch": ["x64"] }],
+    "icon": "build/icon.ico",
+    "signAndEditExecutable": false,
+    "executableName": "漫剧虾",
+    "artifactName": "漫剧虾-${version}-Setup.${ext}"
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "installerIcon": "build/icon.ico",
+    "uninstallerIcon": "build/icon.ico",
+    "perMachine": false,
+    "deleteAppDataOnUninstall": false,
+    "installerLanguages": ["zh_CN"],
+    "language": 2052
+  }
+}

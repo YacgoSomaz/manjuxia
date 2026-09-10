@@ -83,7 +83,8 @@ class NovelTagsUpdateRequest(BaseModel):
     tags: List[Dict[str, Any]]
 
 
-def _parse_tag_form_value(raw: Optional[str], dimension: str) -> List[str]:
+def _parse_visual_tags(raw: Optional[str]) -> List[str]:
+    """Parse manual visual tags from JSON/form text; only visual_medium survives."""
     if not raw:
         return []
     values: List[Any]
@@ -91,21 +92,84 @@ def _parse_tag_form_value(raw: Optional[str], dimension: str) -> List[str]:
         parsed = json.loads(raw)
         values = parsed if isinstance(parsed, list) else [parsed]
     except Exception:
-        values = [part.strip() for part in str(raw).split(",") if part.strip()]
-    result = []
+        values = [part.strip() for part in str(raw).split(",")]
+    result: List[str] = []
+    seen = set()
     for value in values:
-        item = normalize_tag(value, dimension)
-        if item and item["label"] not in result:
+        item = normalize_tag(value, "visual_medium")
+        if item and item["label"] not in seen:
+            seen.add(item["label"])
             result.append(item["label"])
     return result[:1]
 
 
-def _parse_visual_tags(raw: Optional[str]) -> List[str]:
-    return _parse_tag_form_value(raw, "visual_medium")
-
-
 def _parse_screen_mode_tags(raw: Optional[str]) -> List[str]:
-    return _parse_tag_form_value(raw, "screen_mode")
+    """Parse manual screen mode tags from JSON/form text; only screen_mode survives."""
+    if not raw:
+        return []
+    values: List[Any]
+    try:
+        parsed = json.loads(raw)
+        values = parsed if isinstance(parsed, list) else [parsed]
+    except Exception:
+        values = [part.strip() for part in str(raw).split(",")]
+    result: List[str] = []
+    seen = set()
+    for value in values:
+        item = normalize_tag(value, "screen_mode")
+        if item and item["label"] not in seen:
+            seen.add(item["label"])
+            result.append(item["label"])
+    return result[:1]
+
+
+async def _load_novel_tag_source(novel_id: int) -> Dict[str, Any]:
+    """Load enough text to analyze tags. Team sync novels may keep raw_content empty."""
+    novel = await NovelService.get_by_id(novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail="小说不存在")
+    name = str(novel.get("name") or "")
+    mode = str(novel.get("mode") or "")
+    content = str(novel.get("raw_content") or "")
+    if not content.strip():
+        db = await get_db()
+        try:
+            cur = await db.execute(
+                """
+                SELECT COALESCE(s.content, c.content, '') AS content
+                FROM chapters c
+                LEFT JOIN scripts s ON s.chapter_id = c.id
+                WHERE c.novel_id = ?
+                ORDER BY c.sort_order ASC, c.id ASC
+                LIMIT 12
+                """,
+                (novel_id,),
+            )
+            content = "\n\n".join(str(row["content"] or "") for row in await cur.fetchall())
+        finally:
+            await db.close()
+    return {"name": name, "mode": mode, "content": content}
+
+
+async def _analyze_novel_tags_best_effort(
+    novel_id: int,
+    name: str,
+    content: str,
+    selected_visual: Optional[List[str]] = None,
+    selected_screen_mode: Optional[List[str]] = None,
+    mode: str = "",
+) -> None:
+    try:
+        await TagService.analyze_and_save(
+            novel_id=novel_id,
+            name=name,
+            content=content,
+            selected_visual=selected_visual or [],
+            selected_screen_mode=selected_screen_mode or [],
+            mode=mode,
+        )
+    except Exception as exc:
+        logger.warning("[novel-tags] 标签分析失败 novel_id=%s: %s", novel_id, exc)
 
 
 async def _read_upload_raw_content(file: UploadFile) -> tuple[str, str]:
@@ -144,41 +208,6 @@ async def _read_upload_raw_content(file: UploadFile) -> tuple[str, str]:
     return filename, raw_content
 
 
-async def _load_novel_tag_source(novel_id: int) -> Dict[str, Any]:
-    novel = await NovelService.get_by_id(novel_id)
-    if not novel:
-        raise HTTPException(status_code=404, detail="小说不存在")
-    content = novel.get("raw_content") or ""
-    if not content:
-        chapters = await NovelService.get_chapters(novel_id)
-        content = "\n\n".join(ch.get("content") or "" for ch in chapters)
-    return {
-        "name": novel.get("name") or "",
-        "mode": novel.get("mode") or "",
-        "content": content,
-    }
-
-
-async def _analyze_novel_tags_best_effort(
-    novel_id: int,
-    name: str,
-    content: str,
-    selected_visual: Optional[List[str]] = None,
-    selected_screen_mode: Optional[List[str]] = None,
-    mode: str = "",
-) -> None:
-    try:
-        tags = TagService._heuristic_tags(
-            name=name,
-            content=content,
-            selected_visual=selected_visual or [],
-            selected_screen_mode=selected_screen_mode or [],
-        )
-        await TagService.save_novel_tags(novel_id, tags)
-    except Exception as exc:
-        logger.warning("[novel-tags] 自动打标签失败 novel_id=%s: %s", novel_id, exc)
-
-
 class BatchRewriteRequest(BaseModel):
     chapter_ids: List[int]
     llm_config_id: int
@@ -195,13 +224,13 @@ async def get_novels():
 
 @router.get("/tag-definitions")
 async def list_tag_definitions():
-    """作品标签库。"""
+    """作品标签库。workflow(短剧/短片)不在这里,只属于分镜模板。"""
     return {"tags": await TagService.list_definitions()}
 
 
 @router.post("/analyze-tags")
 async def analyze_tags(request: TagAnalysisRequest):
-    """仅分析文本标签，不落库，给前端预览/手动重算使用。"""
+    """仅分析文本标签,不落库。给前端预览/手动重算使用。"""
     if not (request.content or "").strip():
         raise HTTPException(status_code=400, detail="分析内容不能为空")
     return await TagService.analyze_content(
@@ -300,6 +329,15 @@ async def upload_novel(
     return created
 
 
+@router.get("/{novel_id}", response_model=NovelResponse)
+async def get_novel(novel_id: int):
+    """获取小说详情"""
+    novel = await NovelService.get_by_id(novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail="小说不存在")
+    return novel
+
+
 @router.get("/{novel_id}/tags")
 async def get_novel_tags(novel_id: int):
     """获取小说/剧本内容标签。"""
@@ -314,27 +352,39 @@ async def update_novel_tags(novel_id: int, request: NovelTagsUpdateRequest):
     if not await NovelService.get_by_id(novel_id):
         raise HTTPException(status_code=404, detail="小说不存在")
     normalized_tags = []
-    for raw in request.tags or []:
-        item = normalize_tag(raw.get("code") or raw.get("label"), raw.get("dimension"))
+    for tag in (request.tags or []):
+        item = normalize_tag((tag or {}).get("code") or (tag or {}).get("label"), (tag or {}).get("dimension"))
         if item:
-            normalized_tags.append({
-                "code": item["code"],
-                "label": item["label"],
-                "dimension": item["dimension"],
-                "score": raw.get("score", 1.0),
-                "source": raw.get("source") or "manual",
-                "evidence": raw.get("evidence") or "",
-            })
-    saved = await TagService.save_novel_tags(novel_id, normalized_tags)
-    missing = TagService.missing_required_conversion_tags(saved)
-    return {"tags": saved, "missing_required_tags": missing}
+            normalized_tags.append(item)
+    screen_count = sum(1 for tag in normalized_tags if tag.get("dimension") == "screen_mode")
+    visual_count = sum(1 for tag in normalized_tags if tag.get("dimension") == "visual_medium")
+    content_tag_count = sum(1 for tag in normalized_tags if tag.get("dimension") in ("audience", "genre", "trope"))
+    missing = []
+    if screen_count != 1:
+        missing.append("屏幕模式")
+    if visual_count != 1:
+        missing.append("视觉标签")
+    if content_tag_count < 1:
+        missing.append("受众/题材标签")
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "NOVEL_TAG_REQUIRED",
+                "message": f"小说需要选择且只能选择一个屏幕模式、一个视觉标签，并至少保留一个受众/题材标签。当前缺少{'和'.join(missing)}。",
+                "missing_tags": missing,
+                "novel_id": novel_id,
+            },
+        )
+    saved = await TagService.save_novel_tags(novel_id, request.tags)
+    return {"tags": saved}
 
 
 @router.post("/{novel_id}/tags/analyze")
 async def analyze_existing_novel_tags(novel_id: int, request: ExistingNovelTagAnalysisRequest):
-    """重新分析内容标签。视觉和屏幕模式只回显用户选择。"""
+    """重新分析内容标签。视觉标签只回显用户选择,不在这里直接落库。"""
     source = await _load_novel_tag_source(novel_id)
-    return await TagService.analyze_content(
+    result = await TagService.analyze_content(
         name=source["name"],
         content=source["content"],
         selected_visual=request.visual_tags or [],
@@ -342,15 +392,7 @@ async def analyze_existing_novel_tags(novel_id: int, request: ExistingNovelTagAn
         mode=source["mode"],
         novel_id=novel_id,
     )
-
-
-@router.get("/{novel_id}", response_model=NovelResponse)
-async def get_novel(novel_id: int):
-    """获取小说详情"""
-    novel = await NovelService.get_by_id(novel_id)
-    if not novel:
-        raise HTTPException(status_code=404, detail="小说不存在")
-    return novel
+    return result
 
 
 @router.get("/{novel_id}/template-context")
@@ -793,6 +835,14 @@ async def script_to_novel(request: ScriptToNovelRequest):
 
         # 自动解析章节
         chapter_count = await NovelService.parse_chapters(novel_id)
+        asyncio.create_task(_analyze_novel_tags_best_effort(
+            novel_id=novel_id,
+            name=request.name,
+            content=result,
+            selected_visual=[],
+            selected_screen_mode=["竖屏"],
+            mode="script_to_novel",
+        ))
 
         return {
             "novel_id": novel_id,
@@ -872,6 +922,14 @@ async def script_to_script(request: ScriptToScriptRequest):
             f"[SCRIPT2SCRIPT-v1] novel_id={novel_id} 格式化完成 "
             f"成功={convert.get('success_count')} 失败={convert.get('failed_count')}"
         )
+        asyncio.create_task(_analyze_novel_tags_best_effort(
+            novel_id=novel_id,
+            name=request.name,
+            content=request.content,
+            selected_visual=[],
+            selected_screen_mode=["竖屏"],
+            mode="script_to_script",
+        ))
 
         return {
             "novel_id": novel_id,
@@ -906,6 +964,8 @@ async def batch_rewrite(novel_id: int, request: BatchRewriteRequest):
     novel = await NovelService.get_by_id(novel_id)
     if not novel:
         raise HTTPException(status_code=404, detail="小说不存在")
+    if (novel.get("mode") or "") in {"script_import", "script_to_script", "team_script_sync", "short_drama_sync"}:
+        raise HTTPException(status_code=400, detail="批量洗稿仅支持小说内容,剧本导入/同步项目请先转为小说后再使用")
 
     # 初始化任务状态
     _rewrite_tasks[novel_id] = {

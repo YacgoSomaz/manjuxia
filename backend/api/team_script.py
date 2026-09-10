@@ -24,6 +24,7 @@ from services import cloud_token_service as cloud_token
 from services import team_context_service as team_ctx
 from api.short_drama_sync import _ensure_sync_columns
 from services.novel_service import NovelService
+from services.tag_service import TagService
 from utils.timezone import now_beijing_str
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,20 @@ def _safe_int(v, default: int = 0) -> int:
         return default
 
 _BASE = "/tools/web/team-script"
+
+
+async def _analyze_tags_best_effort(novel_id: int, name: str, content: str, mode: str) -> None:
+    try:
+        await TagService.analyze_and_save(
+            novel_id=novel_id,
+            name=name,
+            content=content,
+            selected_visual=[],
+            selected_screen_mode=["竖屏"],
+            mode=mode,
+        )
+    except Exception as exc:
+        logger.warning("[team-script] 标签分析失败 novel_id=%s: %s", novel_id, exc)
 
 
 async def _cloud_get(path: str, timeout: float = 30.0) -> Any:
@@ -164,11 +179,14 @@ async def sync_project(req: SyncProjectReq):
     acked = 0
     ack_failed = 0
     skipped_dirty = 0
+    analysis_chunks: List[str] = []
     for ch in chapters:
         cid = ch.get("chapterId")
         detail = await _cloud_get(f"{_BASE}/assigned-chapters/{cid}", timeout=60.0)
         if not isinstance(detail, dict):
             continue
+        if detail.get("content"):
+            analysis_chunks.append(str(detail.get("content") or ""))
         r = await _land_chapter(detail)
         novel_id = r.get("novelId")
         if r.get("skippedDirty"):
@@ -184,6 +202,8 @@ async def sync_project(req: SyncProjectReq):
                 # 云端版本已变 → 重拉重落;★P1:重落后若 dirty 也不能 ack
                 d2 = await _cloud_get(f"{_BASE}/assigned-chapters/{cid}", timeout=60.0)
                 if isinstance(d2, dict):
+                    if d2.get("content"):
+                        analysis_chunks.append(str(d2.get("content") or ""))
                     r2 = await _land_chapter(d2)
                     novel_id = r2.get("novelId")
                     if r2.get("skippedDirty"):
@@ -200,6 +220,14 @@ async def sync_project(req: SyncProjectReq):
             else:
                 # 本地已落但云端回执失败
                 ack_failed += 1
+
+    if novel_id and analysis_chunks:
+        asyncio.create_task(_analyze_tags_best_effort(
+            novel_id=novel_id,
+            name=str(chapters[0].get("projectName") or f"团队剧本{req.projectId}"),
+            content="\n\n".join(analysis_chunks[:12]),
+            mode="team_script_sync",
+        ))
 
     return {
         "novelId": novel_id,
@@ -321,7 +349,7 @@ async def _land_chapter_locked(project_id, project_name, chapter_id, episode_no,
         # script:按 chapter_id 定位,存正文 + remote_version(diff 用);
         #   remote_version=-1 表示用户本地改过(脏标记),不被云端覆盖。
         cur = await db.execute(
-            "SELECT id, remote_version FROM scripts WHERE chapter_id=? LIMIT 1",
+            "SELECT id, remote_version, content FROM scripts WHERE chapter_id=? LIMIT 1",
             (local_chapter_id,),
         )
         existing = await cur.fetchone()
@@ -329,11 +357,22 @@ async def _land_chapter_locked(project_id, project_name, chapter_id, episode_no,
         skipped_dirty = bool(existing and existing["remote_version"] == -1)
         if existing:
             if not skipped_dirty and content:
-                await db.execute(
-                    "UPDATE scripts SET content=?, remote_version=?, remote_chapter_id=? WHERE id=?",
-                    (content, version, chapter_id, existing["id"]),
-                )
+                # v3.61.279:本次同步若把剧本正文覆盖更新(内容真变了)→ 置 sync_outdated=1,
+                #   前端据此把这一集显示成"未转换",提醒用户重新「开始转换」处理;
+                #   内容没变则保持原 sync_outdated(不打扰已转换状态)。
+                _content_changed = (existing["content"] or "") != content
+                if _content_changed:
+                    await db.execute(
+                        "UPDATE scripts SET content=?, remote_version=?, remote_chapter_id=?, sync_outdated=1 WHERE id=?",
+                        (content, version, chapter_id, existing["id"]),
+                    )
+                else:
+                    await db.execute(
+                        "UPDATE scripts SET remote_version=?, remote_chapter_id=? WHERE id=?",
+                        (version, chapter_id, existing["id"]),
+                    )
         elif content:
+            # 首次同步落地:算"已转换"(sync_outdated=0 默认),符合"初次同步即已转换"的预期
             await db.execute(
                 """INSERT INTO scripts
                        (novel_id, chapter_id, content, scene_meta, remote_chapter_id, remote_version, created_at)

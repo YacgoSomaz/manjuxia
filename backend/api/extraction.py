@@ -4,16 +4,24 @@ import asyncio
 import json
 import base64
 import logging
+import re
 import secrets  # v3.61.202:原子写 tmp 文件名加随机 token,防并发抢同一 tmp
-from typing import Any, Literal, Optional, List
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Form
+from urllib.parse import urlparse
+from io import BytesIO
+from typing import Optional, List, Literal, Any
+import httpx
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Form, Request
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 # v3.61.165: 修 create_character_variant / _safe_remove_file 等用了 logger 但模块顶部没 import 导致
 #             "name 'logger' is not defined" 致命 500 错(用户 v3.61.163/164 新建马甲全挂)
 logger = logging.getLogger(__name__)
 from models.extraction import (
     ExtractionRequest,
+    OfficialExtractionPromptRequest,
+    OfficialExtractionResultRequest,
     ExtractedElementCreate,
     ExtractedElementUpdate,
     ExtractedElementResponse,
@@ -30,168 +38,19 @@ from models.extraction import (
 from services.extraction_service import ExtractionService
 from services.image_service import ImageService
 from services.novel_service import NovelService
+from services.template_service import get_by_id as get_template_by_id
+from database.db import get_db
 from utils.paths import get_data_dir, media_subdir, resolve_db_path
 
 router = APIRouter(prefix="/api/extraction", tags=["extraction"])
 
+# 全景生成是长请求。浏览器刷新会丢掉前端临时状态，但后端请求仍会继续执行；
+# 用进程内注册表把真实运行状态注入元素查询结果。桌面端后端为单进程，进程重启时
+# 请求本身也会终止，因此这里不落永久状态，避免崩溃后留下永远转圈的脏数据。
+_running_panorama_generations: dict[int, dict] = {}
 
-async def _ensure_novel_visible(novel_id: int) -> None:
-    if not await NovelService.get_by_id(novel_id):
-        raise HTTPException(status_code=404, detail="小说不存在或不属于当前账号")
-
-
-async def _ensure_element_visible(element_id: int) -> dict:
-    element = await ExtractionService.get_element(element_id)
-    if not element:
-        raise HTTPException(status_code=404, detail="元素不存在")
-    if not await NovelService.get_by_id(element.get("novel_id")):
-        raise HTTPException(status_code=404, detail="元素不存在或不属于当前账号")
-    return element
-
-
-async def _ensure_variant_visible(variant_id: int) -> dict:
-    variant = await ExtractionService.get_variant(variant_id)
-    if not variant:
-        raise HTTPException(status_code=404, detail="马甲不存在")
-    await _ensure_element_visible(variant.get("element_id"))
-    return variant
-
-
-# v3.61.383: 千山同源的本地音色能力。路由放在 /{element_id} 之前，避免 voices 被当成数字 ID。
-class BindVoiceRequest(BaseModel):
-    voice_id: Optional[str] = None
-
-
-class VoicePreviewRequest(BaseModel):
-    voice_id: str
-    text: Optional[str] = None
-
-
-class PolishDescriptionRequest(BaseModel):
-    llm_config_id: Optional[int] = None
-    instruction: Optional[str] = None
-    current_description: Optional[str] = None
-
-
-async def _copy_voice_source_to_standard_audio(src_path: str, element: dict, variant: Optional[dict] = None) -> str:
-    if not src_path or not os.path.exists(src_path):
-        raise HTTPException(status_code=400, detail="音频文件不存在，请重新选择音色")
-    novel = await NovelService.get_by_id(element.get("novel_id"))
-    novel_part = ImageService._safe_name_part((novel or {}).get("name"), 24) or "未命名小说"
-    name_part = ImageService._safe_name_part(element.get("name"), 24) or f"角色{element.get('id') or 'unknown'}"
-    suffix = ""
-    if variant:
-        suffix = "_" + (ImageService._safe_name_part(variant.get("variant_name"), 24) or f"马甲{variant.get('id')}")
-    ext = os.path.splitext(src_path)[1].lower() or ".mp3"
-    rel_name = f"{novel_part}/音频/音频_{name_part}{suffix}{ext}"
-    dest = os.path.join(media_subdir("images"), rel_name.replace("/", os.sep))
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    if os.path.abspath(src_path) != os.path.abspath(dest):
-        import shutil
-        shutil.copyfile(src_path, dest)
-    return f"/data/images/{rel_name}"
-
-
-@router.get("/voices")
-async def get_voices(element_id: Optional[int] = Query(None)):
-    from services import voice_service
-    return {"voices": await voice_service.list_voices(element_id=element_id)}
-
-
-@router.post("/voices/custom-audio")
-async def add_custom_audio_voice(element_id: int = Form(...), label: str = Form(...), file: UploadFile = File(...)):
-    from services import voice_service
-    element = await _ensure_element_visible(element_id)
-    if element.get("element_type") != "character":
-        raise HTTPException(status_code=400, detail="只有人物类型支持导入音色")
-    label = (label or "").strip()
-    if not label:
-        raise HTTPException(status_code=400, detail="请填写音色名称")
-    ext = _get_audio_extension(file.filename or "voice.mp3")
-    if ext not in ALLOWED_AUDIO_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="不支持的音频格式")
-    content = await file.read()
-    if not content or len(content) > MAX_AUDIO_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="音频为空或超过 50MB 限制")
-    label_part = ImageService._safe_name_part(label, 32) or "未命名音色"
-    rel_name = f"音色_{label_part}{ext}"
-    path = os.path.join(media_subdir("audios"), rel_name)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as handle:
-        handle.write(content)
-    voice = await voice_service.save_custom_audio_voice(label=label, audio_file=f"/data/audios/{rel_name}")
-    return {"success": True, "voice": voice, "voices": await voice_service.list_voices(element_id=element_id)}
-
-
-@router.delete("/voices/custom")
-async def remove_custom_voice(voice_id: str = Query(...)):
-    from services import voice_service
-    deleted = await voice_service.delete_custom_voice(voice_id)
-    return {"success": True, "deleted": deleted, "voices": await voice_service.list_voices()}
-
-
-@router.post("/voices/preview")
-async def voice_preview_standalone(req: VoicePreviewRequest):
-    from services import voice_service
-    result = await voice_service.synthesize_preview(element_id=0, voice_id=req.voice_id, novel_id=None,
-                                                    novel_name=None, character_name=None,
-                                                    text=req.text or voice_service.DEMO_TEXT)
-    if not result.get("success"):
-        raise HTTPException(status_code=502, detail=result.get("message") or "语音合成失败")
-    return result
-
-
-@router.post("/element/{element_id}/voice")
-async def bind_voice(element_id: int, req: BindVoiceRequest):
-    from services import voice_service
-    element = await _ensure_element_visible(element_id)
-    if element.get("element_type") != "character":
-        raise HTTPException(status_code=400, detail="只有人物类型支持音色")
-    audio_file = None
-    if req.voice_id:
-        source = await voice_service.resolve_voice_audio_source_path(req.voice_id)
-        audio_file = await _copy_voice_source_to_standard_audio(source, element)
-    elif element.get("audio_file"):
-        _safe_remove_file(element.get("audio_file"))
-    updated = await ExtractionService.update_element_audio(element_id, audio_file)
-    updated = await ExtractionService.update_element_voice(element_id, req.voice_id) or updated
-    return {"success": True, "voice_id": req.voice_id, "audio_file": audio_file, "updated_at": (updated or {}).get("updated_at")}
-
-
-@router.post("/variant/{variant_id}/voice")
-async def bind_variant_voice(variant_id: int, req: BindVoiceRequest):
-    from services import voice_service
-    variant = await _ensure_variant_visible(variant_id)
-    element = await _ensure_element_visible(variant.get("element_id"))
-    if element.get("element_type") != "character":
-        raise HTTPException(status_code=400, detail="只有人物马甲支持音色")
-    audio_file = None
-    if req.voice_id:
-        source = await voice_service.resolve_voice_audio_source_path(req.voice_id)
-        audio_file = await _copy_voice_source_to_standard_audio(source, element, variant)
-    elif variant.get("audio_file"):
-        _safe_remove_file(variant.get("audio_file"))
-    updated = await ExtractionService.update_variant(variant_id, audio_file=audio_file)
-    return {"success": True, "voice_id": req.voice_id, "audio_file": audio_file, "updated_at": (updated or {}).get("updated_at")}
-
-
-@router.post("/element/{element_id}/voice-preview")
-async def voice_preview(element_id: int, req: VoicePreviewRequest):
-    from services import voice_service
-    element = await _ensure_element_visible(element_id)
-    if element.get("element_type") != "character":
-        raise HTTPException(status_code=400, detail="只有人物类型支持音色")
-    novel = await NovelService.get_by_id(element.get("novel_id"))
-    result = await voice_service.synthesize_preview(element_id=element_id, voice_id=req.voice_id,
-                                                    novel_id=element.get("novel_id"),
-                                                    novel_name=(novel or {}).get("name"),
-                                                    character_name=element.get("name"),
-                                                    text=req.text or voice_service.DEMO_TEXT)
-    if not result.get("success"):
-        raise HTTPException(status_code=502, detail=result.get("message") or "语音合成失败")
-    return result
-
-
+# 批量全景/宫格必须脱离前端页面生命周期运行。刷新或切菜单后，前端通过
+# batch/status 重新订阅；停止只阻止派发后续项，当前图片请求自然收尾。
 _extraction_batch_jobs: dict[str, dict[str, Any]] = {}
 _extraction_batch_tasks: dict[str, asyncio.Task] = {}
 
@@ -206,16 +65,77 @@ class ExtractionBatchStartRequest(BaseModel):
     llm_config_id: Optional[int] = None
 
 
+class OfficialImageResultRequest(BaseModel):
+    """Authenticated desktop bridge payload for a completed official image job."""
+    image_url: str
+    image_prompt: Optional[str] = None
+
+
+class OfficialImageStatusRequest(BaseModel):
+    """State bridge for a desktop-owned official image job.
+
+    The official job itself runs in Electron, rather than ImageService.  The
+    normal card refresh loop still reads ``image_status`` from this backend,
+    so it needs this small, explicit state hand-off while the remote job runs.
+    """
+    status: Literal["generating", "error"]
+
+
+_OFFICIAL_IMAGE_DELIVERY_HOSTS = {
+    "imgcdn.aicodeme.cn",
+    # Official results are copied once from the provider CDN into OSS.  The
+    # desktop downloads from this signed OSS URL, so a user's inability to
+    # reach the provider CDN no longer turns a completed job into FAILED.
+    "software-update0012.oss-cn-guangzhou.aliyuncs.com",
+}
+
+
+async def _download_official_image(raw_url: str) -> bytes:
+    """Download an official CDN result without inheriting desktop proxy state.
+
+    Proxy/VPN programs commonly leave HTTP(S)_PROXY variables behind.  The
+    Chromium renderer can still open the CDN while httpx follows those stale
+    variables and fails, which previously turned a completed official job into
+    a FAILED card.  Use a direct connection and retry short-lived CDN races.
+    """
+    last_error: Exception | None = None
+    headers = {
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "User-Agent": "ManJuXia/0.1.37 official-image-downloader",
+    }
+    for attempt, delay in enumerate((0, 2, 5), start=1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            timeout = httpx.Timeout(300.0, connect=30.0)
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=False,
+                trust_env=False,
+                headers=headers,
+            ) as client:
+                response = await client.get(raw_url)
+            if response.status_code == 200 and response.content:
+                return response.content
+            last_error = RuntimeError(f"CDN HTTP {response.status_code}")
+        except Exception as exc:
+            last_error = exc
+        logger.warning(
+            "下载官方图片重试 host=%s attempt=%s error=%s",
+            (urlparse(raw_url).hostname or "").lower(),
+            attempt,
+            type(last_error).__name__ if last_error else "empty_response",
+        )
+    raise RuntimeError("下载官方图片失败") from last_error
+
+
 def _public_batch_job(job: dict[str, Any]) -> dict[str, Any]:
     element_ids = list(job.get("element_ids") or [])
     success_ids = list(job.get("success_ids") or [])
     failed_ids = list(job.get("failed_ids") or [])
     processed_ids = set(success_ids) | set(failed_ids)
     current_id = job.get("current_element_id")
-    remaining_ids = [
-        item_id for item_id in element_ids
-        if item_id not in processed_ids and item_id != current_id
-    ]
+    remaining_ids = [item_id for item_id in element_ids if item_id not in processed_ids and item_id != current_id]
     return {
         "job_id": job.get("job_id"),
         "novel_id": job.get("novel_id"),
@@ -303,7 +223,10 @@ async def _run_extraction_batch(job_id: str) -> None:
                 job["current_element_id"] = None
                 job["current_name"] = ""
 
-        job["status"] = "stopped" if job.get("stop_requested") else "completed"
+        if job.get("stop_requested"):
+            job["status"] = "stopped"
+        else:
+            job["status"] = "completed"
     except asyncio.CancelledError:
         job["status"] = "stopped"
         job["stop_requested"] = True
@@ -331,9 +254,18 @@ async def start_extraction_batch(request: ExtractionBatchStartRequest):
         raise HTTPException(status_code=400, detail="没有可执行的卡片")
     if request.action == "grid" and (not request.template_id or not request.llm_config_id):
         raise HTTPException(status_code=400, detail="批量宫格必须选择提示词模板和视觉大语言模型")
+    if request.action == "grid" and (
+        int(request.llm_config_id or 0) in (-900001, -900002)
+        or int(request.config_id or 0) in (-900001, -900002)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="批量宫格暂不支持官方算力，请选择本地大语言模型和图片模型配置",
+        )
     if request.action == "panorama" and request.element_type != "scene":
         raise HTTPException(status_code=400, detail="批量全景只支持场景卡片")
 
+    # 启动前一次性验证归属和基础条件，避免任务进后台后才发现整批参数错误。
     for element_id in element_ids:
         element = await ExtractionService.get_element(element_id)
         if not element or int(element.get("novel_id") or 0) != int(request.novel_id):
@@ -400,6 +332,49 @@ async def stop_extraction_batch(job_id: str):
     return {"success": True, "job": _public_batch_job(job)}
 
 
+def _is_panorama_generating(element_id: int) -> bool:
+    return int(element_id) in _running_panorama_generations
+
+
+def _attach_panorama_runtime_status(element: dict, active_before_query: Optional[set[int]] = None) -> dict:
+    element_id = int(element.get("id") or 0)
+    # 同时看查询前快照和查询后的实时值：若任务恰好在 DB 查询期间完成，快照仍会
+    # 让前端多轮询一次，从而拿到刚落库的 panorama_url，不会卡在旧列表结果。
+    element["panorama_generating"] = (
+        element_id in (active_before_query or set())
+        or _is_panorama_generating(element_id)
+    )
+    return element
+
+
+class PolishDescriptionRequest(BaseModel):
+    instruction: str = ""
+    current_description: Optional[str] = None
+    llm_config_id: Optional[int] = None
+
+
+async def _ensure_novel_visible(novel_id: int) -> None:
+    if not await NovelService.get_by_id(novel_id):
+        raise HTTPException(status_code=404, detail="小说不存在或不属于当前账号")
+
+
+async def _ensure_element_visible(element_id: int) -> dict:
+    element = await ExtractionService.get_element(element_id)
+    if not element:
+        raise HTTPException(status_code=404, detail="元素不存在")
+    if not await NovelService.get_by_id(element.get("novel_id")):
+        raise HTTPException(status_code=404, detail="元素不存在或不属于当前账号")
+    return element
+
+
+async def _ensure_variant_visible(variant_id: int) -> dict:
+    variant = await ExtractionService.get_variant(variant_id)
+    if not variant:
+        raise HTTPException(status_code=404, detail="马甲不存在")
+    await _ensure_element_visible(variant.get("element_id"))
+    return variant
+
+
 def _is_recent_image_generation(element: dict, max_age_seconds: int = 45 * 60) -> bool:
     """Return True when an element is already in a fresh image generation run."""
     if element.get("image_status") != "generating":
@@ -433,19 +408,67 @@ def _fill_template_placeholders(template: str, element_type: str, description: s
     return template + "\n" + description if template else description
 
 
+LEGACY_DENOISE_BLOCK = """【真实质感 · 降噪(反 AI 塑料感)】
+This image is a film still captured during a real shoot - it should appear slightly soft and imperfect like a real photograph, this softness is intentional and desired. Soft natural lighting with realistic falloff, not punchy HDR. Subtle organic film grain only, NOT heavy digital noise, NOT artificial grain overlay. Skin texture must be natural with visible pores and imperfections, NO plastic smoothing, NO beauty-filter aesthetic. Materials should look photographically captured, not 3D-rendered or AI-stylized. Slightly soft focus character with natural lens DOF, NOT digitally tack-sharp. Colors with realistic restraint, slight gray tone, NOT oversaturated, NOT HDR-pumped.
+Avoid: oversharpening, artificial sharpness, heavy digital grain, HDR effect, beauty-filter skin, AI-generated aesthetic, overpolished studio look, plastic smoothing, oversaturation, glossy highlight blowout, generic AI image quality, default model aesthetic bias."""
+
+PREVIOUS_DENOISE_BLOCK = """【真实质感 · 通用降噪 · 反 AI 塑料感】
+
+The image should feel naturally produced within its chosen visual style, with believable material texture, soft and restrained lighting, and no over-polished AI look. Keep the overall image slightly soft, organic, and visually coherent, not digitally over-sharpened.
+
+Use natural light falloff, gentle contrast, realistic shadow transitions, and restrained colors with a slight gray cinematic tone. Avoid punchy HDR, excessive saturation, glossy highlight blowout, or artificial studio perfection.
+
+Skin, fabric, hair, metal, wood, stone, and other materials should have clear but natural texture. Skin should not look plastic, waxy, airbrushed, or beauty-filtered. Fabric should show believable weave, folds, thickness, and weight. Hair should have natural strand structure, not helmet-like or overly smooth.
+
+For 3D realistic / cinematic style: make it feel like a real photographed subject with subtle lens depth of field, slight optical softness, and natural imperfections.
+
+For 3D Chinese animation style: keep the stylized character design, but materials, lighting, skin, hair, and clothing should have believable physical texture and avoid game-render plastic, cheap CG gloss, or overly smooth surfaces.
+
+For 2D Chinese animation style: keep clean 2D line art and painted surfaces, but avoid flat generic AI coloring, excessive digital sharpness, over-smooth gradients, fake texture overlays, and overly glossy highlights. The image should feel hand-crafted, layered, and naturally painted.
+
+Subtle organic grain or texture is allowed only when it fits the chosen style. Do not add heavy digital noise, artificial grain overlay, dirty compression artifacts, or random speckles.
+
+Avoid: oversharpening, artificial sharpness, punchy HDR, heavy digital grain, fake noise overlay, beauty-filter skin, plastic smoothing, waxy skin, glossy CG highlights, oversaturation, overexposed highlights, cheap game-render look, generic AI image quality, default model aesthetic bias, over-polished studio look, flat lifeless coloring."""
+
+DENOISE_BLOCK = """画面风格要求:
+柔焦边缘,克制的细节表达,
+大色块优先
+材质统一干净,避免堆砌细碎纹理,整体通透高级。参考电影摄影质感:浅景深柔光、自然胶片颗粒、Kodak Portra 400 色调,像一张精心打光的电影剧照,而不是高清数码照片。"""
+
+
+def _normalize_style_prompt(prompt: str) -> str:
+    text = (prompt or "").replace("\r\n", "\n")
+    if not text:
+        return text
+    # Remove only the exact system-injected style blocks. User-authored visual
+    # style content remains untouched.
+    for block in (DENOISE_BLOCK, PREVIOUS_DENOISE_BLOCK, LEGACY_DENOISE_BLOCK):
+        text = text.replace(block, "")
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 # 后端兜底默认模板:用户没在前端打开过"风格设置"对话框时,
 # 生成图片不会无风格(出图变成纯描述,效果差)
-# 与前端 ExtractionView.vue 的 CHARACTER/SCENE/PROP_TEMPLATE 保持等价
-# v3.61.47: 默认视觉风格清空,让用户自己选标签或手写,避免硬塞写实词导致都出真人脸
+# 与前端 ExtractionView.vue 的默认模板保持等价。人物默认走通用三视图。
 DEFAULT_STYLE_TEMPLATES = {
-    "character": """【视觉风格】
-
+    "character": """古装电视剧剧照,真人电影级写实摄影
 
 【角色信息】
 {角色信息}
 
-【画质要求】
-4K 高精度渲染,320DPI,纯白底版,无噪点无模糊无畸变,人物比例自然,符合中国人审美
+【一致性约束·必须严格遵守】
+所有视图中的角色为同一人,面部骨骼结构、眼型、鼻梁、唇形、脸型完全一致;
+表情图中的每张脸与正视图面部特征 100% 相同,仅表情肌肉变化;
+全图同一套光影逻辑、色温、透视角度,无风格突变;
+色彩严格统一,无色偏,肤色/发色/服色与角色设定完全匹配。
+
+【视图排布·按编号顺序排列在 16:9 画布内】
+• 面部极致正视特写 左侧1/3
+• 全身正视图
+• 全身背视图
+• 全身侧视图
+
+背景白底,不拿任何道具
 """,
     "scene": """场景背景图,不要出现人物。
 
@@ -495,10 +518,70 @@ def _clean_polished_description(text: str) -> str:
         if lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
         cleaned = "\n".join(lines).strip()
-    for prefix in ("润色后：", "润色后:", "优化后：", "优化后:", "人物描述：", "人物描述:"):
+    for prefix in (
+        "润色后：", "润色后:", "优化后：", "优化后:",
+        "人物描述：", "人物描述:", "场景描述：", "场景描述:",
+    ):
         if cleaned.startswith(prefix):
             cleaned = cleaned[len(prefix):].strip()
     return cleaned.strip().strip('"').strip("'").strip()
+
+
+def _build_description_polish_messages(
+    element_type: str,
+    element_name: str,
+    description: str,
+    instruction: str = "",
+) -> List[dict]:
+    if element_type == "scene":
+        default_instruction = (
+            "在不改变原地点、时代、内外景、时段和剧情用途的前提下，重点增强空间层次、"
+            "环境材质、光影色温、天气空气感与可见的叙事氛围，让场景更精致、更有纵深。"
+        )
+        system_prompt = (
+            "你是资深影视美术指导、场景概念设计师和 AI 场景提示词优化师。"
+            "任务是润色场景描述，供 AI 生成纯场景环境图、全景图和多视角图使用。\n"
+            "要求：\n"
+            "1. 只输出润色后的最终场景描述，不要解释、不要标题、不要 Markdown，也不要重复输出场景名。\n"
+            "2. 严格保留原场景的地点、时代、内外景、时段、季节天气、剧情功能、空间结构、出入口和关键固定物，"
+            "不得擅自换地点、换时代或改变用途。\n"
+            "3. 优先补强前景、中景、远景的空间层次与动线，再补建筑、地面、墙面、家具陈设、植被等材质细节和真实使用痕迹。\n"
+            "4. 明确主光源与辅光源、方向、冷暖色温、明暗关系，并用薄雾、雨丝、尘埃、倒影、树影、帘幕等"
+            "符合原设定的可见环境证据营造氛围；不要只堆砌“唯美、高级、氛围感”等空泛形容词。\n"
+            "5. 必须是无人纯场景空镜：禁止出现人物、角色、人体、肢体、人脸、人影、剪影或人群。\n"
+            "6. 不添加镜头运动、分镜编号、对白、字幕、文字、水印、品牌，也不重复全局画风模板。\n"
+            "7. 输出中文自然段或逗号分隔短句，信息密度高、画面可执行，建议控制在 120～260 个汉字。"
+        )
+        label = "场景"
+    else:
+        default_instruction = "在不改变角色身份、年龄段、时代背景和核心设定的前提下，让人物形象描述更适合 AI 生图。"
+        system_prompt = (
+            "你是影视角色视觉设定助手。任务是润色人物提示词描述，供 AI 生成人物图使用。\n"
+            "要求：\n"
+            "1. 只输出润色后的最终人物描述，不要解释、不要标题、不要 Markdown。\n"
+            "2. 保留角色姓名、性别、年龄段、身份、时代背景、服装类型和核心气质，不要改成人设。\n"
+            "3. 根据用户补充要求增强外貌、身材、气质、服装质感、五官、发型、姿态等视觉细节。\n"
+            "4. 不要加入情色、裸露、未成年人性化、血腥暴力或与原设定冲突的内容。\n"
+            "5. 输出应是中文自然段或逗号分隔短句，适合作为人物描述字段保存。"
+        )
+        label = "角色"
+
+    user_instruction = (instruction or "").strip() or default_instruction
+    return [
+        {
+            "role": "system",
+            "content": system_prompt,
+        },
+        {
+            "role": "user",
+            "content": (
+                f"{label}名：{element_name or f'未命名{label}'}\n\n"
+                f"当前{label}描述：\n{description}\n\n"
+                f"用户润色要求：\n{user_instruction}\n\n"
+                f"请输出润色后的完整{label}描述。"
+            ),
+        },
+    ]
 
 
 @router.get("/element/{element_id}/full-prompt")
@@ -531,7 +614,7 @@ async def get_element_full_prompt(element_id: int, variant_id: Optional[int] = N
     style = await ExtractionService.get_image_style(
         element.get("novel_id"), element_type
     )
-    prefix = (style.get("prefix_prompt") or "").strip()
+    prefix = _normalize_style_prompt((style.get("prefix_prompt") or "").strip())
     suffix = (style.get("suffix_prompt") or "").strip()
 
     prompt = _fill_template_placeholders(prefix, element_type, description) if prefix else description
@@ -540,6 +623,19 @@ async def get_element_full_prompt(element_id: int, variant_id: Optional[int] = N
     # v3.61.63: 场景生图运行时注入"不要出现人物"约束,预览跟实际生图一致
     prompt = _ensure_scene_no_human(prompt, element_type)
     return {"success": True, "prompt": prompt}
+
+
+@router.post("/element/{element_id}/official-image-status")
+async def set_official_image_status(element_id: int, request: OfficialImageStatusRequest):
+    """Keep the native extraction card in sync with an Electron official job."""
+    element = await _ensure_element_visible(element_id)
+    if not element:
+        raise HTTPException(status_code=404, detail="元素不存在")
+    await ExtractionService.update_element_image(
+        element_id=element_id,
+        image_status=request.status,
+    )
+    return {"success": True, "image_status": request.status}
 
 
 @router.post("/extract")
@@ -559,12 +655,183 @@ async def extract_elements(request: ExtractionRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/official-prompt")
+async def build_official_extraction_prompt(request: OfficialExtractionPromptRequest):
+    """在本地展开提取模板，交由开发环境官方语言算力执行。"""
+    await _ensure_novel_visible(request.novel_id)
+    if request.element_type not in {"character", "scene", "prop"}:
+        raise HTTPException(status_code=400, detail="不支持的提取类型")
+    template = await get_template_by_id(request.template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    chapters = await NovelService.get_chapters(request.novel_id)
+    selected = {int(item) for item in (request.chapter_ids or [])}
+    chapters = [item for item in chapters if not selected or int(item.get("id")) in selected]
+    if not chapters:
+        raise HTTPException(status_code=400, detail="没有可处理的章节")
+    db = await get_db()
+    try:
+        parts = []
+        chapter_ids = []
+        missing = []
+        for chapter in chapters:
+            chapter_id = int(chapter["id"])
+            cur = await db.execute(
+                "SELECT content FROM scripts WHERE chapter_id = ? AND novel_id = ?",
+                (chapter_id, request.novel_id),
+            )
+            row = await cur.fetchone()
+            content = (dict(row).get("content") if row else "") or ""
+            if not content.strip():
+                missing.append(str(chapter.get("title") or chapter_id))
+                continue
+            chapter_ids.append(chapter_id)
+            parts.append(f"【章节 {chapter.get('title') or chapter_id}】\n{content}")
+    finally:
+        await db.close()
+    if not parts:
+        raise HTTPException(status_code=400, detail="所选章节尚未生成剧本，请先到「剧本转换」生成剧本后再提取")
+    prompt = (template.get("content") or "").strip()
+    prompt += (
+        "\n\n请仅返回 JSON 数组，不要 Markdown、不写解释。每项必须是对象，"
+        "包含 name（名称）、description（完整视觉与剧情描述）、attributes（对象）三个字段。"
+        f"\n\n待提取类型：{request.element_type}\n\n以下是待分析剧本：\n{"\n\n".join(parts)}"
+    )
+    return {"success": True, "prompt": prompt, "chapter_ids": chapter_ids, "skipped_chapters": missing}
+
+
+@router.post("/official-result")
+async def save_official_extraction_result(request: OfficialExtractionResultRequest):
+    await _ensure_novel_visible(request.novel_id)
+    if request.element_type not in {"character", "scene", "prop"}:
+        raise HTTPException(status_code=400, detail="不支持的提取类型")
+    result = await ExtractionService.save_official_result(
+        request.novel_id, request.element_type,
+        [int(item) for item in (request.chapter_ids or [])], request.content,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=422, detail=result.get("message") or "官方结果无法保存")
+    return result
+
+
+@router.get("/novel/{novel_id}", response_model=List[ExtractedElementResponse])
+async def get_novel_elements(
+    novel_id: int,
+    response: Response,
+    element_type: Optional[str] = Query(None, description="筛选类型: character/scene/prop"),
+):
+    """获取某小说的所有提取结果"""
+    # Extraction cards contain mutable generation state.  Do not let the
+    # renderer reuse a cached response (e.g. an old `generating`/`error`
+    # state after the image has already been downloaded successfully).
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    await _ensure_novel_visible(novel_id)
+    try:
+        active_before_query = set(_running_panorama_generations)
+        elements = await ExtractionService.get_elements(novel_id, element_type)
+        for element in elements:
+            _attach_panorama_runtime_status(element, active_before_query)
+        return elements
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/voices")
+async def get_voices(element_id: Optional[int] = Query(None)):
+    """当前语音配置对应的内置音色 + 本地「我的音色」。
+    ⚠️ 必须定义在 /{element_id} 之前,否则会被 catch-all 当成 element_id=voices → 422。"""
+    from services import voice_service
+    return {"voices": await voice_service.list_voices(element_id=element_id)}
+
+
+@router.post("/voices/custom-audio")
+async def add_custom_audio_voice(
+    element_id: int = Form(...),
+    label: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """导入一段外部音频到「我的音色」。不暴露 voice_id 给用户。"""
+    from services import voice_service
+    try:
+        element = await _ensure_element_visible(element_id)
+        if element.get("element_type") != "character":
+            raise HTTPException(status_code=400, detail="只有人物类型支持导入音色")
+        label = (label or "").strip()
+        if not label:
+            raise HTTPException(status_code=400, detail="请填写音色名称")
+
+        ext = _get_audio_extension(file.filename or "voice.mp3")
+        if ext not in ALLOWED_AUDIO_EXTENSIONS:
+            raise HTTPException(status_code=400, detail=f"不支持的音频格式，仅支持: {', '.join(sorted(ALLOWED_AUDIO_EXTENSIONS))}")
+
+        content = await file.read()
+        if len(content) > MAX_AUDIO_FILE_SIZE:
+            raise HTTPException(status_code=400, detail=f"文件大小超过限制，最大允许 {MAX_AUDIO_FILE_SIZE // (1024*1024)}MB")
+
+        # “我的音色库”是工具级资产,不属于某一本剧。导入时放到 data/audios;
+        # 只有绑定角色/马甲时才复制到对应剧本的 images/{剧名}/音频/音频_*.ext 标准路径。
+        label_part = ImageService._safe_name_part(label, 32) or "未命名音色"
+        rel_name = f"音色_{label_part}{ext}"
+        audios_dir = media_subdir("audios")
+        file_path = os.path.join(audios_dir, rel_name.replace("/", os.sep))
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+        with open(file_path, "wb") as f:
+            f.write(content)
+
+        try:
+            dur = _probe_audio_duration_seconds(file_path)
+            if dur is not None and (dur < JIMENG_AUDIO_MIN_DURATION or dur > JIMENG_AUDIO_MAX_DURATION):
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"音频时长 {dur:.2f} 秒,不在即梦允许范围 "
+                        f"[{JIMENG_AUDIO_MIN_DURATION:g}, {JIMENG_AUDIO_MAX_DURATION:g}] 秒内。"
+                        "请提供约 2~30 秒的音频片段；提交时还会按所选模型复核。"
+                    ),
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+        audio_file = f"/data/audios/{rel_name}"
+        voice = await voice_service.save_custom_audio_voice(label=label, audio_file=audio_file)
+        return {
+            "success": True,
+            "voice": voice,
+            "voices": await voice_service.list_voices(element_id=element_id),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"导入外部音色失败: {e}")
+
+
+@router.delete("/voices/custom")
+async def remove_custom_voice(voice_id: str = Query(...)):
+    """从本地「我的音色」库删除一条自定义 voice_id。已绑定角色不会被自动解绑。"""
+    from services import voice_service
+    try:
+        deleted = await voice_service.delete_custom_voice(voice_id)
+        return {"success": True, "deleted": deleted, "voices": await voice_service.list_voices()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除自定义音色失败: {e}")
+
+
 @router.post("/element/{element_id}/polish-description")
-async def polish_character_description(element_id: int, request: PolishDescriptionRequest):
-    """Use the active LLM config to polish a character description without saving it."""
+async def polish_element_description(element_id: int, request: PolishDescriptionRequest):
+    """Polish a character or scene description without saving it."""
     element = await _ensure_element_visible(element_id)
-    if element.get("element_type") != "character":
-        raise HTTPException(status_code=400, detail="只有人物描述支持 AI 润色")
+    element_type = element.get("element_type")
+    if element_type not in ("character", "scene"):
+        raise HTTPException(status_code=400, detail="目前仅人物和场景描述支持 AI 润色")
 
     description = (
         request.current_description
@@ -573,7 +840,8 @@ async def polish_character_description(element_id: int, request: PolishDescripti
     )
     description = (description or "").strip()
     if not description:
-        raise HTTPException(status_code=400, detail="人物描述为空，无法润色")
+        label = "人物" if element_type == "character" else "场景"
+        raise HTTPException(status_code=400, detail=f"{label}描述为空，无法润色")
 
     instruction = (request.instruction or "").strip()
     try:
@@ -587,42 +855,25 @@ async def polish_character_description(element_id: int, request: PolishDescripti
         if not cfg:
             raise HTTPException(status_code=400, detail="未找到可用的大语言模型配置，请先在大模型配置中配置默认 LLM")
 
-        character_name = (element.get("name") or "").strip()
-        user_instruction = instruction or "在不改变角色身份、年龄段、时代背景和核心设定的前提下，让人物形象描述更适合 AI 生图。"
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "你是影视角色视觉设定助手。任务是润色人物提示词描述，供 AI 生成人物图使用。\n"
-                    "要求：\n"
-                    "1. 只输出润色后的最终人物描述，不要解释、不要标题、不要 Markdown。\n"
-                    "2. 保留角色姓名、性别、年龄段、身份、时代背景、服装类型和核心气质，不要改成人设。\n"
-                    "3. 根据用户补充要求增强外貌、身材、气质、服装质感、五官、发型、姿态等视觉细节。\n"
-                    "4. 不要加入情色、裸露、未成年人性化、血腥暴力或与原设定冲突的内容。\n"
-                    "5. 输出应是中文自然段或逗号分隔短句，适合作为人物描述字段保存。"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"角色名：{character_name or '未命名人物'}\n\n"
-                    f"当前人物描述：\n{description}\n\n"
-                    f"用户润色要求：\n{user_instruction}\n\n"
-                    "请输出润色后的完整人物描述。"
-                ),
-            },
-        ]
+        element_name = (element.get("name") or "").strip()
+        messages = _build_description_polish_messages(
+            element_type,
+            element_name,
+            description,
+            instruction,
+        )
+        is_scene = element_type == "scene"
         result = await LLMService.call_llm(
             config_id=int(cfg["id"]),
             messages=messages,
             temperature=0.45,
-            max_tokens=1000,
+            max_tokens=1200 if is_scene else 1000,
             timeout=120,
-            task_type="character_description_polish",
+            task_type="scene_description_polish" if is_scene else "character_description_polish",
             novel_id=element.get("novel_id"),
-            chapter_title=f"{character_name or '人物'} AI润色",
+            chapter_title=f"{element_name or ('场景' if is_scene else '人物')} AI润色",
             source_id=element_id,
-            source_type="extraction_character",
+            source_type="extraction_scene" if is_scene else "extraction_character",
         )
         polished = _clean_polished_description(result)
         if not polished:
@@ -631,31 +882,18 @@ async def polish_character_description(element_id: int, request: PolishDescripti
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("AI 润色人物描述失败 element_id=%s", element_id)
+        logger.exception("AI 润色描述失败 element_id=%s type=%s", element_id, element_type)
         raise HTTPException(status_code=500, detail=f"AI 润色失败: {e}")
-
-
-@router.get("/novel/{novel_id}", response_model=List[ExtractedElementResponse])
-async def get_novel_elements(
-    novel_id: int,
-    element_type: Optional[str] = Query(None, description="筛选类型: character/scene/prop")
-):
-    """获取某小说的所有提取结果"""
-    await _ensure_novel_visible(novel_id)
-    try:
-        elements = await ExtractionService.get_elements(novel_id, element_type)
-        return elements
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/{element_id}", response_model=ExtractedElementResponse)
 async def get_element(element_id: int):
     """获取单个元素详情"""
+    active_before_query = set(_running_panorama_generations)
     element = await _ensure_element_visible(element_id)
     if not element:
         raise HTTPException(status_code=404, detail="元素不存在")
-    return element
+    return _attach_panorama_runtime_status(element, active_before_query)
 
 
 @router.post("/", response_model=ExtractedElementResponse)
@@ -750,7 +988,7 @@ async def _run_element_image_generation(
         style = await ExtractionService.get_image_style(novel_id, element_type)
         
         # 拼接最终提示词:占位符({角色信息}/{场景信息}/{道具信息})被替换为 description
-        prefix = style.get("prefix_prompt", "").strip()
+        prefix = _normalize_style_prompt(style.get("prefix_prompt", "").strip())
         suffix = style.get("suffix_prompt", "").strip()
         # 兜底:用户没在前端打开过"风格设置"对话框 → prefix 为空 → 出图无风格
         # 改用对应类型的内置默认模板,保证出图至少有"电影写真质感+8K+真实光影"
@@ -813,6 +1051,76 @@ async def _run_element_image_generation(
             image_status="error"
         )
         return {"success": False, "message": str(e), "image_url": None}
+
+
+@router.post("/element/{element_id}/official-image-result")
+async def save_official_image_result(element_id: int, request: OfficialImageResultRequest):
+    """Persist a finished official-compute image as a normal local generated asset.
+
+    Official jobs run through the desktop main process, so their remote result
+    never enters ``ImageService.generate_image``.  Without this bridge the UI
+    receives a URL but the element keeps its ``generating`` state and loses the
+    result after the provider's temporary URL expires.
+    """
+    element = await _ensure_element_visible(element_id)
+    if not element:
+        raise HTTPException(status_code=404, detail="元素不存在")
+    raw_url = str(request.image_url or "").strip()
+    parsed = urlparse(raw_url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or host not in _OFFICIAL_IMAGE_DELIVERY_HOSTS:
+        raise HTTPException(status_code=400, detail="官方图片地址无效")
+    try:
+        content = await _download_official_image(raw_url)
+        if not content or len(content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=502, detail="官方图片内容无效或超过大小限制")
+        try:
+            with Image.open(BytesIO(content)) as image:
+                image.verify()
+            with Image.open(BytesIO(content)) as image:
+                image_format = (image.format or "PNG").upper()
+        except (UnidentifiedImageError, OSError) as exc:
+            raise HTTPException(status_code=502, detail="官方图片格式无效") from exc
+        extension = {"JPEG": ".jpg", "JPG": ".jpg", "PNG": ".png", "WEBP": ".webp"}.get(image_format)
+        if not extension:
+            raise HTTPException(status_code=502, detail="官方图片格式暂不支持")
+        relative = await _build_asset_rel(element_id, "generated", extension)
+        if not relative:
+            relative = f"official_{element_id}_{int(time.time() * 1000)}{extension}"
+        output_path = os.path.join(_ensure_images_dir(), relative.replace("/", os.sep))
+        old_image = element.get("image_url")
+        _write_image_atomic(output_path, content)
+        image_path = f"/data/images/{relative}"
+        await ExtractionService.update_element_image(
+            element_id=element_id,
+            image_url=image_path,
+            image_prompt=request.image_prompt or element.get("image_prompt"),
+            image_status="success",
+        )
+        _cleanup_old_asset_after_db(output_path, old_image)
+        return {"success": True, "message": "官方图片已保存", "image_url": image_path}
+    except HTTPException:
+        await ExtractionService.update_element_image(element_id=element_id, image_status="error")
+        raise
+    except Exception as exc:
+        # The official server has already completed the paid task and returned
+        # a validated CDN URL.  If only the embedded Python downloader is
+        # blocked by a machine-specific proxy/certificate policy, retain that
+        # URL so Chromium can display the generated image instead of replacing
+        # a successful job with a permanent FAILED tile.
+        logger.exception("保存官方图片到本地失败，改用远端地址 element=%s host=%s", element_id, host)
+        await ExtractionService.update_element_image(
+            element_id=element_id,
+            image_url=raw_url,
+            image_prompt=request.image_prompt or element.get("image_prompt"),
+            image_status="success",
+        )
+        return {
+            "success": True,
+            "message": "官方图片已生成，当前使用远端地址显示",
+            "image_url": raw_url,
+            "remote_only": True,
+        }
 
 
 @router.post("/element/{element_id}/generate-image")
@@ -892,6 +1200,7 @@ async def generate_panorama_endpoint(element_id: int, request: GeneratePanoramaR
     v3.61.156:支持 prompt_override — 用户在弹窗里编辑过的 prompt 直接生效,
     跳过 _wrap_panorama_prompt 二次包装,让用户拥有完整控制权
     """
+    registered = False
     try:
         element = await _ensure_element_visible(element_id)
         if not element:
@@ -902,7 +1211,17 @@ async def generate_panorama_endpoint(element_id: int, request: GeneratePanoramaR
         if not description and not (request.prompt_override or "").strip():
             raise HTTPException(status_code=400, detail="场景没有描述,无法生成全景图")
 
+        if _is_panorama_generating(element_id):
+            raise HTTPException(status_code=409, detail="该场景的全景图仍在生成中,请等待完成")
+
         novel_id = element.get("novel_id")
+        _running_panorama_generations[element_id] = {
+            "novel_id": novel_id,
+            "config_id": request.config_id,
+            "started_at": time.time(),
+        }
+        registered = True
+        logger.info("[panorama] 注册运行任务 element=%s novel=%s", element_id, novel_id)
         # 参考图自动从 element.reference_image 读
         reference_image_path = element.get("reference_image")
         if reference_image_path:
@@ -911,7 +1230,7 @@ async def generate_panorama_endpoint(element_id: int, request: GeneratePanoramaR
             )
 
         # v3.61.156: prompt_override 优先,用户编辑后的 prompt 不再包装
-        # 没传(走老路径) → 仍用 description + _wrap_panorama_prompt
+        # 没传(走老路径) → 按成品图同口径拼场景风格模板,再由 _wrap_panorama_prompt 加 ERP 硬约束
         if request.prompt_override and request.prompt_override.strip():
             result = await ImageService.generate_panorama_raw(
                 config_id=request.config_id,
@@ -921,9 +1240,23 @@ async def generate_panorama_endpoint(element_id: int, request: GeneratePanoramaR
                 reference_image_path=reference_image_path,
             )
         else:
+            style = await ExtractionService.get_image_style(novel_id, "scene")
+            prefix = _normalize_style_prompt((style.get("prefix_prompt") or "").strip())
+            suffix = (style.get("suffix_prompt") or "").strip()
+            if not prefix:
+                prefix = DEFAULT_STYLE_TEMPLATES.get("scene", "")
+            panorama_scene_prompt = _fill_template_placeholders(prefix, "scene", description) if prefix else description
+            if suffix:
+                panorama_scene_prompt = panorama_scene_prompt + "\n" + suffix
+            panorama_scene_prompt = _ensure_scene_no_human(panorama_scene_prompt, "scene")
+            panorama_scene_prompt = "\n".join([
+                "【场景描述与风格】",
+                "以下内容按场景成品图同口径生成:风格设置模板中的【场景信息】已替换为当前场景描述;只用于定义场景结构、材质、色彩、光影和画面质感,不得改变上方 2:1 等距柱状投影、720° VR 全景、无人物空景要求。",
+                panorama_scene_prompt,
+            ])
             result = await ImageService.generate_panorama(
                 config_id=request.config_id,
-                prompt=description,
+                prompt=panorama_scene_prompt,
                 element_id=element_id,
                 novel_id=novel_id,
                 reference_image_path=reference_image_path,
@@ -943,16 +1276,20 @@ async def generate_panorama_endpoint(element_id: int, request: GeneratePanoramaR
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if registered:
+            _running_panorama_generations.pop(element_id, None)
+            logger.info("[panorama] 注销运行任务 element=%s", element_id)
 
 
 class PanoramaToGridRequest(BaseModel):
-    view_count: int = 12  # 默认 12 视角,每 30°
+    view_count: int = 9  # 默认 9 视图,每 40°
 
 
 @router.post("/element/{element_id}/panorama/grid")
 async def panorama_to_grid_endpoint(element_id: int, request: PanoramaToGridRequest):
     """v3.61.156 复活:把元素的 panorama_url 按 N 视角(每 360/N°)采样,拼成网格图写入 grid_image。
-    用户参考工作流:12 视角 / 4×3 / 单格 16:9。也支持 6 / 9 视角。
+    默认 9 视图 / 3×3 / 单格 16:9。仍支持 6 / 12 视角。
     """
     from services.panorama_service import panorama_to_views
     try:
@@ -1184,7 +1521,7 @@ async def _generate_single_image(
         # 获取该元素类型的风格设置
         if elem_type != default_element_type:
             elem_style = await ExtractionService.get_image_style(novel_id, elem_type)
-            elem_prefix = elem_style.get("prefix_prompt", "").strip()
+            elem_prefix = _normalize_style_prompt(elem_style.get("prefix_prompt", "").strip())
             elem_suffix = elem_style.get("suffix_prompt", "").strip()
         else:
             elem_prefix = default_prefix
@@ -1279,7 +1616,7 @@ async def batch_generate_images(novel_id: int, request: BatchGenerateImageReques
         # 获取该类型的风格设置
         element_type = request.element_type or elements_to_process[0].get("element_type", "character")
         style = await ExtractionService.get_image_style(novel_id, element_type)
-        prefix = style.get("prefix_prompt", "").strip()
+        prefix = _normalize_style_prompt(style.get("prefix_prompt", "").strip())
         suffix = style.get("suffix_prompt", "").strip()
         
         # v3.61.235:批量生图限并发。
@@ -1377,6 +1714,215 @@ async def save_image_style(novel_id: int, element_type: str, data: ImageStyleSet
         return style
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+_STYLE_REFERENCE_MAX_FILES = 4
+_STYLE_REFERENCE_MAX_FILE_SIZE = 10 * 1024 * 1024
+_STYLE_REFERENCE_MAX_EDGE = 1600
+
+
+def _style_reference_data_url(content: bytes) -> str:
+    """Validate and resize a reference screenshot before sending it to the LLM."""
+    try:
+        with Image.open(BytesIO(content)) as source:
+            image = ImageOps.exif_transpose(source)
+            image.seek(0)
+            image.load()
+            if image.width < 64 or image.height < 64:
+                raise ValueError("截图尺寸过小，宽高至少为 64 像素")
+            if image.width > 16000 or image.height > 16000:
+                raise ValueError("截图尺寸过大，宽高不能超过 16000 像素")
+            image.thumbnail(
+                (_STYLE_REFERENCE_MAX_EDGE, _STYLE_REFERENCE_MAX_EDGE),
+                Image.Resampling.LANCZOS,
+            )
+            if image.mode in ("RGBA", "LA") or (
+                image.mode == "P" and "transparency" in image.info
+            ):
+                rgba = image.convert("RGBA")
+                flattened = Image.new("RGB", rgba.size, (255, 255, 255))
+                flattened.paste(rgba, mask=rgba.getchannel("A"))
+                image = flattened
+            else:
+                image = image.convert("RGB")
+            output = BytesIO()
+            image.save(output, format="JPEG", quality=86, optimize=True)
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as exc:
+        raise ValueError("文件不是有效的 PNG、JPEG 或 WebP 图片") from exc
+    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _parse_style_reference_json(raw_text: str) -> dict[str, Any]:
+    text = (raw_text or "").strip()
+    if text.startswith("```"):
+        first_newline = text.find("\n")
+        if first_newline >= 0:
+            text = text[first_newline + 1:]
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3].rstrip()
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        object_start = text.find("{")
+        if object_start < 0:
+            raise ValueError("视觉模型未返回可解析的 JSON")
+        try:
+            parsed, _ = json.JSONDecoder().raw_decode(text[object_start:])
+        except json.JSONDecodeError as exc:
+            raise ValueError("视觉模型返回格式不正确，请重试或更换视觉模型") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError("视觉模型返回的结果不是对象")
+
+    def clean_text(key: str, limit: int = 3000) -> str:
+        value = parsed.get(key, "")
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            value = str(value)
+        return value.strip()[:limit]
+
+    warnings = parsed.get("warnings") or []
+    if isinstance(warnings, str):
+        warnings = [warnings]
+    if not isinstance(warnings, list):
+        warnings = []
+    normalized_warnings = [str(item).strip()[:300] for item in warnings if str(item).strip()][:8]
+
+    result = {
+        "preset_name": clean_text("preset_name", 80) or "截图风格预设",
+        "summary": clean_text("summary", 600),
+        "shared_visual_style": clean_text("shared_visual_style"),
+        "character_visual_style": clean_text("character_visual_style", 1600),
+        "scene_visual_style": clean_text("scene_visual_style", 1600),
+        "prop_visual_style": clean_text("prop_visual_style", 1600),
+        "negative_prompt": clean_text("negative_prompt", 1600),
+        "layout_style": clean_text("layout_style", 1600),
+        "warnings": normalized_warnings,
+    }
+    if not result["shared_visual_style"]:
+        raise ValueError("视觉模型没有提取出共享视觉风格，请换一张更清晰的截图后重试")
+    return result
+
+
+@router.post("/novel/{novel_id}/analyze-style-reference")
+async def analyze_style_reference(
+    novel_id: int,
+    llm_config_id: int = Form(...),
+    analyze_layout: bool = Form(False),
+    files: List[UploadFile] = File(...),
+):
+    """Infer a reusable visual preset from screenshots without changing saved templates."""
+    await _ensure_novel_visible(novel_id)
+    if not files or len(files) > _STYLE_REFERENCE_MAX_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"请上传 1-{_STYLE_REFERENCE_MAX_FILES} 张参考截图",
+        )
+
+    from services.llm_service import LLMService
+
+    try:
+        config = await LLMService.get_by_id(llm_config_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not config or (config.get("config_type") or "").lower() != "llm":
+        raise HTTPException(status_code=400, detail="请选择有效的大语言模型配置")
+
+    provider = (config.get("provider_code") or "").lower()
+    model_name = (config.get("model_name") or "").lower()
+    api_style = (config.get("api_style") or "").lower()
+    if provider == "deepseek" or "deepseek" in model_name:
+        raise HTTPException(status_code=400, detail="DeepSeek 不支持截图识别，请选择视觉大语言模型")
+    if api_style == "gemini_native":
+        raise HTTPException(
+            status_code=400,
+            detail="当前 Gemini 原生配置尚未接入图片输入，请选择 OpenAI 兼容的视觉大语言模型",
+        )
+    if api_style == "wuyinkeji_chat" and len(files) > 1:
+        raise HTTPException(status_code=400, detail="当前速创视觉接口仅支持 1 张截图，请减少截图或更换视觉模型")
+
+    image_urls: list[str] = []
+    for index, file in enumerate(files, start=1):
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail=f"第 {index} 张截图为空")
+        if len(content) > _STYLE_REFERENCE_MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail=f"第 {index} 张截图超过 10MB")
+        try:
+            image_urls.append(_style_reference_data_url(content))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"第 {index} 张截图无效：{exc}") from exc
+
+    layout_rule = (
+        "同时分析版式语言，layout_style 只描述可复用的网格、留白、信息层级与视图组织；"
+        "不得要求直接覆盖人物三/九视图、场景单图、道具静物的现有版式。"
+        if analyze_layout
+        else "本次不分析版式，layout_style 必须返回空字符串。"
+    )
+    analysis_prompt = f"""请综合分析随后提供的 {len(image_urls)} 张截图，提取可复用的视觉风格预设。
+
+分析目标：
+1. shared_visual_style：三类素材共同使用的视觉母版，只写媒介/渲染方式、色彩体系、明暗与光线、材质纹理、镜头与景深、整体氛围。
+2. character_visual_style：人物专属适配，只写肤质、发丝、服装材质、妆面和人物呈现质感，不写人物身份、动作、视图数量或排版。
+3. scene_visual_style：场景专属适配，只写空间氛围、环境材质、天气、光源和纵深，不复述截图里的具体地点。
+4. prop_visual_style：道具专属适配，只写材质、工艺、磨损、反光和微距/静物质感，不复述具体道具。
+5. negative_prompt：只写与该风格冲突的通用负面约束。
+6. {layout_rule}
+
+硬性规则：
+- 不要输出截图中的人物姓名、具体剧情、具体建筑名、具体道具名、文字、水印或 UI。
+- 静态截图无法证明运镜，不得臆造镜头运动。
+- 不确定的信息留空，不要编造。
+- 输出简洁中文提示词，可直接插入现有【视觉风格】段。
+- 只输出一个 JSON 对象，不要 Markdown、解释或代码围栏。
+
+JSON 字段必须完整：
+{{
+  "preset_name": "预设名称",
+  "summary": "一句话风格摘要",
+  "shared_visual_style": "共享视觉母版",
+  "character_visual_style": "人物适配",
+  "scene_visual_style": "场景适配",
+  "prop_visual_style": "道具适配",
+  "negative_prompt": "负面约束",
+  "layout_style": "版式建议或空字符串",
+  "warnings": ["不确定项或截图局限"]
+}}"""
+
+    user_content: list[dict[str, Any]] = [{"type": "text", "text": analysis_prompt}]
+    for index, image_url in enumerate(image_urls, start=1):
+        user_content.append({"type": "text", "text": f"参考截图 {index}"})
+        user_content.append({"type": "image_url", "image_url": {"url": image_url}})
+    messages = [
+        {
+            "role": "system",
+            "content": "你是影视视觉风格分析师。你只提取可迁移的视觉语言，并严格按用户要求输出 JSON。",
+        },
+        {"role": "user", "content": user_content},
+    ]
+
+    try:
+        raw_result = await LLMService.call_llm(
+            config_id=llm_config_id,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=2400,
+            timeout=180.0,
+            task_type="style_reference_analysis",
+            novel_id=novel_id,
+        )
+        result = _parse_style_reference_json(raw_result)
+        return {"success": True, **result}
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("截图风格分析失败 novel_id=%s", novel_id)
+        raise HTTPException(status_code=500, detail=f"截图风格分析失败：{exc}") from exc
 
 
 # 允许的图片扩展名
@@ -1698,6 +2244,14 @@ async def generate_grid_image(element_id: int, request: GenerateGridImageRequest
     第二步：调用图片模型生成宫格图（详细prompt + 成品图作为参考图 → 图片模型 → 宫格图）
     """
     try:
+        if (
+            int(request.llm_config_id or 0) in (-900001, -900002)
+            or int(request.config_id or 0) in (-900001, -900002)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="宫格图暂不支持官方算力，请选择本地大语言模型和图片模型配置",
+            )
         # 获取元素信息
         element = await _ensure_element_visible(element_id)
         if not element:
@@ -1996,10 +2550,17 @@ async def add_element_watermark(element_id: int, request: WatermarkRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"打水印异常: {e}")
 
+    updated = None
+    if target_field == "finished_image":
+        updated = await ExtractionService.update_element_image(element_id, finished_image=target_path)
+    elif target_field == "image_url":
+        updated = await ExtractionService.update_element_image(element_id, image_url=target_path)
+
     return {
         "success": True,
         "target_field": target_field,
         "image_path": target_path,
+        "updated_at": (updated or {}).get("updated_at"),
         "face_mode": request.face_mode,
         "message": "AI 合规标识已添加" + ("(面部覆盖模式)" if request.face_mode else ""),
     }
@@ -2087,10 +2648,10 @@ async def upload_grid_image(element_id: int, file: UploadFile = File(...)):
 # 允许的音频扩展名
 ALLOWED_AUDIO_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.ogg', '.flac'}
 MAX_AUDIO_FILE_SIZE = 50 * 1024 * 1024  # 50MB
-# v3.59.59:即梦视频生成对参考音频时长的硬限制 — 必须在 [2, 15] 秒之间
-# 太短(< 2s)或太长(> 15s)即梦会拒收,报 "duration X.X is out of allowed range [2, 15]"
-JIMENG_AUDIO_MIN_DURATION = 2.0
-JIMENG_AUDIO_MAX_DURATION = 15.0
+# 素材库按当前最宽的 Seedance 2.5 容差接收音频。具体提交时长仍由
+# 当前视频模型二次校验：2.0 为 2-15s，2.5 用户口径为 2-30s。
+JIMENG_AUDIO_MIN_DURATION = 1.8
+JIMENG_AUDIO_MAX_DURATION = 30.2
 
 def _get_audio_extension(filename: str) -> str:
     """获取音频扩展名"""
@@ -2172,8 +2733,7 @@ async def upload_audio(element_id: int, file: UploadFile = File(...)):
         with open(file_path, 'wb') as f:
             f.write(content)
 
-        # ★ v3.59.59:上传时立即探测时长,不在即梦允许范围内的直接拒收
-        # 这样用户在「信息提取」就知道,不用等到生成视频时再看到 "duration out of allowed range"
+        # 上传时按最宽的 2.5 容差探测；生成前再按所选 2.0/2.5 模型复核。
         try:
             dur = _probe_audio_duration_seconds(file_path)
             if dur is not None and (dur < JIMENG_AUDIO_MIN_DURATION or dur > JIMENG_AUDIO_MAX_DURATION):
@@ -2183,8 +2743,9 @@ async def upload_audio(element_id: int, file: UploadFile = File(...)):
                 raise HTTPException(
                     status_code=400,
                     detail=(
-                        f"音频时长 {dur:.2f} 秒,不在即梦允许范围 [{JIMENG_AUDIO_MIN_DURATION:.0f}, {JIMENG_AUDIO_MAX_DURATION:.0f}] 秒内,无法用于视频生成。"
-                        f"请提供时长 2~15 秒之间的音频片段。"
+                        f"音频时长 {dur:.2f} 秒,不在即梦允许范围 "
+                        f"[{JIMENG_AUDIO_MIN_DURATION:g}, {JIMENG_AUDIO_MAX_DURATION:g}] 秒内。"
+                        "请提供约 2~30 秒的音频片段；提交时还会按所选模型复核。"
                     )
                 )
         except HTTPException:
@@ -2202,7 +2763,7 @@ async def upload_audio(element_id: int, file: UploadFile = File(...)):
         
         # 更新数据库
         audio_file_path = f"/data/images/{rel_name}"
-        await ExtractionService.update_element_audio(
+        updated = await ExtractionService.update_element_audio(
             element_id=element_id,
             audio_file=audio_file_path
         )
@@ -2210,7 +2771,8 @@ async def upload_audio(element_id: int, file: UploadFile = File(...)):
         return {
             "success": True,
             "message": "音频上传成功",
-            "audio_file": audio_file_path
+            "audio_file": audio_file_path,
+            "updated_at": (updated or {}).get("updated_at"),
         }
         
     except HTTPException:
@@ -2242,13 +2804,567 @@ async def delete_audio(element_id: int):
             element_id=element_id,
             audio_file=None
         )
-        
-        return {"success": True, "message": "音频已删除"}
+        updated = await ExtractionService.update_element_voice(
+            element_id=element_id,
+            voice_id=None
+        )
+
+        return {"success": True, "message": "音频已删除", "audio_file": None, "voice_id": None, "updated_at": (updated or {}).get("updated_at")}
         
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"删除音频失败: {str(e)}")
+
+
+# ============================================================
+# v3.61.x: 角色音色(TTS)— 第一步:列音色 / 绑音色 / 试听
+# ============================================================
+
+class BindVoiceRequest(BaseModel):
+    voice_id: Optional[str] = None
+
+
+class VoicePreviewRequest(BaseModel):
+    voice_id: str
+    text: Optional[str] = None
+
+
+async def _copy_voice_source_to_standard_audio(
+    src_path: str,
+    element: dict,
+    variant: Optional[dict] = None,
+) -> str:
+    """Copy a selected voice audio into the current novel's standard audio path."""
+    if not src_path or not os.path.exists(src_path):
+        raise HTTPException(status_code=400, detail="音频文件不存在,请重新选择音色")
+
+    ext = os.path.splitext(src_path)[1].lower() or ".mp3"
+    novel = await NovelService.get_by_id(element.get("novel_id"))
+    novel_part = ImageService._safe_name_part((novel or {}).get("name"), 24) or "未命名小说"
+    name_part = ImageService._safe_name_part(element.get("name"), 24) or f"角色{element.get('id') or element.get('element_id') or 'unknown'}"
+    if variant:
+        variant_part = ImageService._safe_name_part(variant.get("variant_name"), 24) or f"马甲{variant.get('id') or 'unknown'}"
+        filename = f"音频_{name_part}_{variant_part}{ext}"
+    else:
+        filename = f"音频_{name_part}{ext}"
+    rel_name = f"{novel_part}/音频/{filename}"
+    dest_path = os.path.join(media_subdir("images"), rel_name.replace("/", os.sep))
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    if os.path.abspath(src_path) != os.path.abspath(dest_path):
+        import shutil
+        shutil.copyfile(src_path, dest_path)
+    return f"/data/images/{rel_name}"
+
+
+VOICE_VIDEO_EXTENSIONS = {
+    ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".ts", ".mpeg", ".mpg"
+}
+MAX_VOICE_VIDEO_SIZE = 1024 * 1024 * 1024
+VOICE_SOURCE_TTL_SECONDS = 60 * 60
+_prepared_voice_sources: dict[str, dict[str, Any]] = {}
+
+
+def _remove_prepared_voice_source(source_token: str, *, force: bool = False) -> bool:
+    source = _prepared_voice_sources.get(source_token)
+    if not source:
+        return False
+    if int(source.get("in_use") or 0) > 0 and not force:
+        source["cleanup_requested"] = True
+        return False
+    _prepared_voice_sources.pop(source_token, None)
+    if source.get("owned"):
+        try:
+            source_path = str(source.get("path") or "")
+            if source_path and os.path.exists(source_path):
+                os.remove(source_path)
+        except OSError:
+            logger.warning("[人声提取] 清理预处理源失败 token=%s", source_token)
+    return True
+
+
+def _expire_prepared_voice_sources() -> None:
+    deadline = time.time() - VOICE_SOURCE_TTL_SECONDS
+    for source_token, source in list(_prepared_voice_sources.items()):
+        if int(source.get("in_use") or 0) <= 0 and float(source.get("last_access") or 0) < deadline:
+            _remove_prepared_voice_source(source_token, force=True)
+
+
+def _safe_media_folder_name(value: Any, fallback: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', str(value or "")).strip().rstrip('.')
+    return cleaned or fallback
+
+
+@router.get("/element/{element_id}/voice-source-recommendation")
+async def get_voice_source_recommendation(element_id: int):
+    """Return the earliest source chapter's generated-video directory for a character."""
+    element = await _ensure_element_visible(element_id)
+    if element.get("element_type") != "character":
+        raise HTTPException(status_code=400, detail="只有人物类型支持推荐音色来源目录")
+    novel_id = int(element.get("novel_id") or 0)
+    novel = await NovelService.get_by_id(novel_id)
+    chapter_ids = element.get("chapter_ids") or []
+    if isinstance(chapter_ids, str):
+        try:
+            chapter_ids = json.loads(chapter_ids)
+        except (TypeError, ValueError):
+            chapter_ids = []
+    normalized_ids: list[int] = []
+    for chapter_id in chapter_ids if isinstance(chapter_ids, list) else []:
+        try:
+            normalized_ids.append(int(chapter_id))
+        except (TypeError, ValueError):
+            continue
+
+    chapter = None
+    if normalized_ids:
+        placeholders = ",".join("?" for _ in normalized_ids)
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                f"SELECT id, title, sort_order FROM chapters "
+                f"WHERE novel_id = ? AND id IN ({placeholders}) ORDER BY sort_order, id LIMIT 1",
+                (novel_id, *normalized_ids),
+            )
+            row = await cursor.fetchone()
+            chapter = dict(row) if row else None
+        finally:
+            await db.close()
+
+    videos_root = os.path.normpath(media_subdir("videos"))
+    novel_dir = _safe_media_folder_name((novel or {}).get("name"), "未命名")
+    novel_path = os.path.normpath(os.path.join(videos_root, novel_dir))
+    chapter_title = str((chapter or {}).get("title") or "")
+    target_path = novel_path
+    if chapter_title:
+        target_path = os.path.normpath(
+            os.path.join(novel_path, _safe_media_folder_name(chapter_title, "未分章"))
+        )
+    default_path = target_path
+    while default_path and not os.path.isdir(default_path):
+        parent = os.path.dirname(default_path)
+        if not parent or parent == default_path:
+            default_path = videos_root
+            break
+        default_path = parent
+    return {
+        "success": True,
+        "abs_path": target_path,
+        "default_path": default_path if os.path.isdir(default_path) else videos_root,
+        "exists": os.path.isdir(target_path),
+        "novel_id": novel_id,
+        "novel_name": (novel or {}).get("name") or "未命名",
+        "chapter_id": (chapter or {}).get("id"),
+        "chapter_title": chapter_title,
+    }
+
+
+@router.post("/voice-source/prepare")
+async def prepare_voice_source(
+    file: Optional[UploadFile] = File(None),
+    local_path: Optional[str] = Form(None),
+):
+    """Prepare one source video once and return a compact waveform for range selection."""
+    from services.vocal_extraction_service import VocalExtractionError, analyze_audio_waveform
+
+    _expire_prepared_voice_sources()
+    if not file and not local_path:
+        raise HTTPException(status_code=400, detail="请选择一个包含人物对白的视频")
+    source_token = secrets.token_urlsafe(18)
+    owned = bool(file)
+    source_path = ""
+    filename = ""
+    registered = False
+    work_dir = os.path.join(get_data_dir(), "temp", "voice-extract")
+    os.makedirs(work_dir, exist_ok=True)
+    try:
+        if file:
+            filename = file.filename or "voice.mp4"
+            suffix = os.path.splitext(filename)[1].lower()
+            if suffix not in VOICE_VIDEO_EXTENSIONS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"不支持的视频格式，仅支持: {', '.join(sorted(VOICE_VIDEO_EXTENSIONS))}",
+                )
+            source_path = os.path.join(work_dir, f"prepared_{source_token}{suffix}")
+            total = 0
+            with open(source_path, "wb") as output:
+                while True:
+                    chunk = await file.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_VOICE_VIDEO_SIZE:
+                        raise HTTPException(status_code=413, detail="视频文件超过 1GB，建议先裁出包含对白的片段")
+                    output.write(chunk)
+            if total == 0:
+                raise HTTPException(status_code=400, detail="上传的视频为空")
+        else:
+            source_path = os.path.abspath(os.path.expanduser(str(local_path or "").strip()))
+            filename = os.path.basename(source_path)
+            suffix = os.path.splitext(source_path)[1].lower()
+            if suffix not in VOICE_VIDEO_EXTENSIONS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"不支持的视频格式，仅支持: {', '.join(sorted(VOICE_VIDEO_EXTENSIONS))}",
+                )
+            if not os.path.isfile(source_path):
+                raise HTTPException(status_code=400, detail="所选视频文件不存在，请重新选择")
+            if os.path.getsize(source_path) > MAX_VOICE_VIDEO_SIZE:
+                raise HTTPException(status_code=413, detail="视频文件超过 1GB，建议先裁出包含对白的片段")
+
+        try:
+            waveform = await asyncio.to_thread(analyze_audio_waveform, source_path)
+        except VocalExtractionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        now = time.time()
+        _prepared_voice_sources[source_token] = {
+            "path": source_path,
+            "filename": filename,
+            "owned": owned,
+            "created_at": now,
+            "last_access": now,
+            "in_use": 0,
+            "cleanup_requested": False,
+        }
+        registered = True
+        return {
+            "success": True,
+            "source_token": source_token,
+            "filename": filename,
+            "duration": waveform.get("duration"),
+            "waveform": waveform.get("peaks") or [],
+            "media_url": f"/api/extraction/voice-source/{source_token}/media",
+        }
+    finally:
+        if owned and not registered and source_path and os.path.exists(source_path):
+            try:
+                os.remove(source_path)
+            except OSError:
+                pass
+        if file:
+            try:
+                await file.close()
+            except Exception:
+                pass
+
+
+@router.get("/voice-source/{source_token}/media")
+async def stream_prepared_voice_source(source_token: str, request: Request):
+    """Stream a prepared source so Electron dev and packaged builds share one preview path."""
+    _expire_prepared_voice_sources()
+    source = _prepared_voice_sources.get(source_token)
+    source_path = str((source or {}).get("path") or "")
+    if not source or not os.path.isfile(source_path):
+        raise HTTPException(status_code=404, detail="视频源已失效，请重新选择视频")
+    source["last_access"] = time.time()
+    file_size = os.path.getsize(source_path)
+    media_type = "video/" + (os.path.splitext(source_path)[1].lower().lstrip(".") or "mp4")
+    if media_type == "video/mov":
+        media_type = "video/quicktime"
+    base_headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-store",
+    }
+    range_header = request.headers.get("range")
+    if not range_header:
+        return FileResponse(source_path, media_type=media_type, headers=base_headers)
+
+    if not range_header.startswith("bytes=") or file_size <= 0:
+        return Response(
+            status_code=416,
+            headers={**base_headers, "Content-Range": f"bytes */{file_size}"},
+        )
+    range_value = range_header.removeprefix("bytes=").split(",", 1)[0].strip()
+    start_text, _, end_text = range_value.partition("-")
+    try:
+        if start_text == "":
+            suffix_length = int(end_text)
+            if suffix_length <= 0:
+                raise ValueError
+            start = max(file_size - suffix_length, 0)
+            end = file_size - 1
+        else:
+            start = int(start_text)
+            end = int(end_text) if end_text else file_size - 1
+    except (TypeError, ValueError):
+        return Response(
+            status_code=416,
+            headers={**base_headers, "Content-Range": f"bytes */{file_size}"},
+        )
+    end = min(end, file_size - 1)
+    if start < 0 or start >= file_size or end < start:
+        return Response(
+            status_code=416,
+            headers={**base_headers, "Content-Range": f"bytes */{file_size}"},
+        )
+    content_length = end - start + 1
+
+    def iter_file_range():
+        with open(source_path, "rb") as media_file:
+            media_file.seek(start)
+            remaining = content_length
+            while remaining > 0:
+                chunk = media_file.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    return StreamingResponse(
+        iter_file_range(),
+        status_code=206,
+        media_type=media_type,
+        headers={
+            **base_headers,
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Content-Length": str(content_length),
+        },
+    )
+
+
+@router.delete("/voice-source/{source_token}")
+async def cleanup_voice_source(source_token: str):
+    removed = _remove_prepared_voice_source(source_token)
+    return {"success": True, "removed": removed}
+
+
+@router.post("/element/{element_id}/extract-voice-from-video")
+async def extract_character_voice_from_video(
+    element_id: int,
+    file: Optional[UploadFile] = File(None),
+    start_time: float = Form(...),
+    duration: float = Form(5.0),
+    variant_id: Optional[int] = Form(None),
+    source_token: Optional[str] = Form(None),
+    repeat_to_seconds: Optional[float] = Form(None),
+):
+    """Separate vocals from a selected video segment and bind them to a character."""
+    from services import voice_service
+    from services.vocal_extraction_service import VocalExtractionError, extract_vocals_from_video
+
+    element = await _ensure_element_visible(element_id)
+    if element.get("element_type") != "character":
+        raise HTTPException(status_code=400, detail="只有人物类型支持从视频提取音色")
+    variant = None
+    if variant_id is not None:
+        variant = await _ensure_variant_visible(variant_id)
+        if int(variant.get("element_id") or 0) != int(element_id):
+            raise HTTPException(status_code=400, detail="所选马甲不属于当前人物")
+    if start_time < 0:
+        raise HTTPException(status_code=400, detail="起始时间不能小于 0 秒")
+    if not JIMENG_AUDIO_MIN_DURATION <= duration <= JIMENG_AUDIO_MAX_DURATION:
+        raise HTTPException(status_code=400, detail="人声片段需约为 2-30 秒（实际容差 1.8-30.2 秒）")
+    if repeat_to_seconds is not None and not duration < repeat_to_seconds <= JIMENG_AUDIO_MAX_DURATION:
+        raise HTTPException(status_code=400, detail="循环补足时长必须大于当前选区且不超过 30 秒")
+
+    work_dir = os.path.join(get_data_dir(), "temp", "voice-extract")
+    os.makedirs(work_dir, exist_ok=True)
+    token = secrets.token_hex(8)
+    video_path = ""
+    wav_path = os.path.join(work_dir, f"vocals_{element_id}_{token}.wav")
+    direct_upload = False
+    prepared_source = None
+    try:
+        if source_token:
+            _expire_prepared_voice_sources()
+            prepared_source = _prepared_voice_sources.get(source_token)
+            if not prepared_source or not os.path.isfile(str(prepared_source.get("path") or "")):
+                raise HTTPException(status_code=400, detail="视频源已失效，请重新选择视频")
+            prepared_source["in_use"] = int(prepared_source.get("in_use") or 0) + 1
+            prepared_source["last_access"] = time.time()
+            video_path = str(prepared_source.get("path"))
+        elif file:
+            suffix = os.path.splitext(file.filename or "voice.mp4")[1].lower()
+            if suffix not in VOICE_VIDEO_EXTENSIONS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"不支持的视频格式，仅支持: {', '.join(sorted(VOICE_VIDEO_EXTENSIONS))}",
+                )
+            video_path = os.path.join(work_dir, f"source_{element_id}_{token}{suffix}")
+            direct_upload = True
+            total = 0
+            with open(video_path, "wb") as output:
+                while True:
+                    chunk = await file.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_VOICE_VIDEO_SIZE:
+                        raise HTTPException(status_code=413, detail="视频文件超过 1GB，建议先裁出包含对白的片段")
+                    output.write(chunk)
+            if total == 0:
+                raise HTTPException(status_code=400, detail="上传的视频为空")
+        else:
+            raise HTTPException(status_code=400, detail="请选择视频或重新载入音轨")
+
+        try:
+            report = await asyncio.to_thread(
+                extract_vocals_from_video,
+                video_path,
+                wav_path,
+                start_time=float(start_time),
+                duration=float(duration),
+                repeat_to_seconds=float(repeat_to_seconds) if repeat_to_seconds else None,
+            )
+        except VocalExtractionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        audio_file = await _copy_voice_source_to_standard_audio(wav_path, element, variant)
+        destination = resolve_db_path(audio_file)
+        if variant:
+            old_audio = variant.get("audio_file")
+            updated = await ExtractionService.update_variant(variant_id, audio_file=audio_file)
+            voice_id = voice_service.local_audio_voice_id(audio_file)
+        else:
+            old_audio = element.get("audio_file")
+            updated = await ExtractionService.update_element_audio(element_id, audio_file)
+            voice_id = voice_service.local_audio_voice_id(audio_file)
+            updated = await ExtractionService.update_element_voice(element_id, voice_id) or updated
+        if old_audio:
+            old_path = resolve_db_path(old_audio)
+            if old_path and destination and os.path.abspath(old_path) != os.path.abspath(destination):
+                _safe_remove_file(old_audio)
+
+        return {
+            "success": True,
+            "voice_id": voice_id,
+            "audio_file": audio_file,
+            "updated_at": (updated or {}).get("updated_at"),
+            "report": report,
+            "voices": await voice_service.list_voices(element_id=element_id),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[人声提取] element=%s 提取失败", element_id)
+        raise HTTPException(status_code=500, detail=f"本地人声提取失败: {exc}") from exc
+    finally:
+        if file:
+            try:
+                await file.close()
+            except Exception:
+                pass
+        if prepared_source is not None:
+            prepared_source["in_use"] = max(0, int(prepared_source.get("in_use") or 0) - 1)
+            prepared_source["last_access"] = time.time()
+            if prepared_source.get("cleanup_requested") and source_token:
+                _remove_prepared_voice_source(source_token)
+        temp_paths = [wav_path]
+        if direct_upload and video_path:
+            temp_paths.append(video_path)
+        for temp_path in temp_paths:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
+
+
+@router.post("/voices/preview")
+async def voice_preview_standalone(req: VoicePreviewRequest):
+    """无角色上下文的音色试听。用于生成打包预置试听资产。"""
+    from services import voice_service
+    res = await voice_service.synthesize_preview(
+        element_id=0,
+        voice_id=req.voice_id,
+        novel_id=None,
+        novel_name=None,
+        character_name=None,
+        text=req.text or voice_service.DEMO_TEXT,
+    )
+    if not res.get("success"):
+        raise HTTPException(status_code=502, detail=res.get("message") or "语音合成失败")
+    return res
+
+
+@router.post("/element/{element_id}/voice")
+async def bind_voice(element_id: int, req: BindVoiceRequest):
+    """给角色绑定音色 voice_id。"""
+    from services import voice_service
+    element = await _ensure_element_visible(element_id)
+    if element.get("element_type") != "character":
+        raise HTTPException(status_code=400, detail="只有人物类型支持音色")
+    audio_file_path = None
+    voice_id_to_save = req.voice_id
+    if req.voice_id:
+        src_path = await voice_service.resolve_voice_audio_source_path(req.voice_id)
+        if not src_path:
+            raise HTTPException(status_code=400, detail="该音色没有可用的本地音频,请重新导入或更新音色资源")
+        audio_file_path = await _copy_voice_source_to_standard_audio(src_path, element)
+        updated = await ExtractionService.update_element_audio(element_id, audio_file_path)
+    else:
+        old_audio = element.get("audio_file")
+        if old_audio:
+            _safe_remove_file(old_audio)
+        updated = await ExtractionService.update_element_audio(element_id, None)
+    updated = await ExtractionService.update_element_voice(element_id, voice_id_to_save) or updated
+    res = {"success": True, "voice_id": voice_id_to_save}
+    if audio_file_path is not None:
+        res["audio_file"] = audio_file_path
+    res["updated_at"] = (updated or {}).get("updated_at")
+    return res
+
+
+@router.post("/variant/{variant_id}/voice")
+async def bind_variant_voice(variant_id: int, req: BindVoiceRequest):
+    """给人物马甲绑定音色音频。
+
+    预制音色走打包试听音频,「我的」外部音频走工具级 data/audios;
+    绑定时统一复制到当前剧本标准路径:
+    images/{剧名}/音频/音频_{角色名}_{马甲名}.ext,然后写 character_variants.audio_file。
+    """
+    from services import voice_service
+    variant = await _ensure_variant_visible(variant_id)
+    element = await _ensure_element_visible(variant.get("element_id"))
+    if element.get("element_type") != "character":
+        raise HTTPException(status_code=400, detail="只有人物马甲支持音色")
+
+    audio_file_path = None
+    voice_id_to_return = req.voice_id
+    if req.voice_id:
+        src_path = await voice_service.resolve_voice_audio_source_path(req.voice_id)
+        if not src_path:
+            raise HTTPException(status_code=400, detail="该音色没有可用的本地音频,请重新导入或更新音色资源")
+        audio_file_path = await _copy_voice_source_to_standard_audio(src_path, element, variant)
+        dest_path = resolve_db_path(audio_file_path)
+        old_audio = variant.get("audio_file")
+        if old_audio:
+            old_path = resolve_db_path(old_audio)
+            if old_path and os.path.exists(old_path) and os.path.abspath(old_path) != os.path.abspath(dest_path):
+                try:
+                    os.remove(old_path)
+                except Exception:
+                    pass
+        updated = await ExtractionService.update_variant(variant_id, audio_file=audio_file_path)
+        voice_id_to_return = voice_service.local_audio_voice_id(audio_file_path)
+    else:
+        old_audio = variant.get("audio_file")
+        if old_audio:
+            _safe_remove_file(old_audio)
+        updated = await ExtractionService.update_variant(variant_id, audio_file=None)
+    return {"success": True, "voice_id": voice_id_to_return, "audio_file": audio_file_path, "updated_at": (updated or {}).get("updated_at")}
+
+
+@router.post("/element/{element_id}/voice-preview")
+async def voice_preview(element_id: int, req: VoicePreviewRequest):
+    """合成 ≤5s 试听 demo,返回可播放 url(不改角色绑定)。"""
+    from services import voice_service
+    element = await _ensure_element_visible(element_id)
+    if element.get("element_type") != "character":
+        raise HTTPException(status_code=400, detail="只有人物类型支持音色")
+    novel = await NovelService.get_by_id(element.get("novel_id"))
+    res = await voice_service.synthesize_preview(
+        element_id=element_id,
+        voice_id=req.voice_id,
+        novel_id=element.get("novel_id"),
+        novel_name=(novel or {}).get("name"),
+        character_name=element.get("name"),
+        text=req.text or voice_service.DEMO_TEXT,
+    )
+    if not res.get("success"):
+        raise HTTPException(status_code=502, detail=res.get("message") or "语音合成失败")
+    return res
 
 
 # ============================================================
@@ -2550,10 +3666,16 @@ async def add_variant_watermark(variant_id: int, request: WatermarkRequest):
         raise
     except Exception as e:
         raise HTTPException(500, f"打水印异常: {e}")
+    updated = None
+    if target_field == "finished_image":
+        updated = await ExtractionService.update_variant(variant_id, finished_image=target_path)
+    elif target_field == "image_url":
+        updated = await ExtractionService.update_variant(variant_id, image_url=target_path)
     return {
         "success": True,
         "target_field": target_field,
         "image_path": target_path,
+        "updated_at": (updated or {}).get("updated_at"),
         "face_mode": request.face_mode,
         "message": "AI 合规标识已添加" + ("(面部覆盖模式)" if request.face_mode else ""),
     }
@@ -2620,8 +3742,8 @@ async def upload_variant_audio(variant_id: int, file: UploadFile = File(...)):
                 status_code=400,
                 detail=(
                     f"音频时长 {dur:.2f} 秒,不在即梦允许范围 "
-                    f"[{JIMENG_AUDIO_MIN_DURATION:.0f}, {JIMENG_AUDIO_MAX_DURATION:.0f}] 秒。"
-                    f"请提供 2~15 秒之间的片段。"
+                    f"[{JIMENG_AUDIO_MIN_DURATION:g}, {JIMENG_AUDIO_MAX_DURATION:g}] 秒。"
+                    "请提供约 2~30 秒的片段；提交时还会按所选模型复核。"
                 )
             )
     except HTTPException:
@@ -2636,8 +3758,8 @@ async def upload_variant_audio(variant_id: int, file: UploadFile = File(...)):
         if old_path and os.path.exists(old_path) and os.path.abspath(old_path) != os.path.abspath(dest):
             try: os.remove(old_path)
             except Exception: pass
-    await ExtractionService.update_variant(variant_id, audio_file=rel)
-    return {"success": True, "audio_file": rel}
+    updated = await ExtractionService.update_variant(variant_id, audio_file=rel)
+    return {"success": True, "audio_file": rel, "updated_at": (updated or {}).get("updated_at")}
 
 
 @router.delete("/variant/{variant_id}/audio")
@@ -2646,8 +3768,8 @@ async def delete_variant_audio(variant_id: int):
     if not v:
         raise HTTPException(404, "马甲不存在")
     _safe_remove_file(v.get("audio_file"))  # round9 #3
-    await ExtractionService.update_variant(variant_id, audio_file=None)
-    return {"success": True}
+    updated = await ExtractionService.update_variant(variant_id, audio_file=None)
+    return {"success": True, "updated_at": (updated or {}).get("updated_at")}
 
 
 # ----- variant 生图(自己组 prompt,不让通用 generate_image 偷读 element) -----
@@ -2674,7 +3796,7 @@ async def generate_variant_image(variant_id: int, req: GenerateVariantImageReque
     # 风格 prefix 跟普通生图同款
     novel_id = el.get("novel_id")
     style = await ExtractionService.get_image_style(novel_id, "character")
-    prefix = (style.get("prefix_prompt") or "").strip() or DEFAULT_STYLE_TEMPLATES.get("character", "")
+    prefix = _normalize_style_prompt((style.get("prefix_prompt") or "").strip()) or DEFAULT_STYLE_TEMPLATES.get("character", "")
     suffix = (style.get("suffix_prompt") or "").strip()
     final_prompt = _fill_template_placeholders(prefix, "character", desc) if prefix else desc
     if suffix:

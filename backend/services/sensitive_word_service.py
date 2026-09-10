@@ -13,7 +13,6 @@ import aiohttp
 from utils.ssl_helper import get_aiohttp_connector
 from database.db import get_db
 from utils.timezone import now_beijing_str
-from services.offline_guard import require_cloud
 
 logger = logging.getLogger(__name__)
 
@@ -21,17 +20,17 @@ ADMIN_API_URL = "https://xiaoshuo.qianshanai.cn/api/sensitive-words"
 
 # fallback 词库(admin 不可达时用)
 _FALLBACK_WORDS = [
-    {"word": "大马金刀", "replacement": "端坐", "category": "暴力", "reason": "暗含威压感"},
-    {"word": "怒斥", "replacement": "严肃说", "category": "暴力", "reason": "情绪激烈"},
-    {"word": "暴怒", "replacement": "生气", "category": "暴力", "reason": "极端情绪"},
-    {"word": "离家出走", "replacement": "在外求学", "category": "家庭", "reason": "家庭问题敏感"},
-    {"word": "校服", "replacement": "便装", "category": "未成年", "reason": "未成年服饰"},
-    {"word": "学生", "replacement": "青年", "category": "未成年", "reason": "年龄敏感"},
-    {"word": "少女", "replacement": "年轻女性", "category": "未成年", "reason": "年龄敏感"},
-    {"word": "性感", "replacement": "", "category": "情色", "reason": "情色词禁用"},
-    {"word": "妖娆", "replacement": "", "category": "情色", "reason": "情色词禁用"},
+    {"word": "枪口对准镜头", "replacement": "枪口指向画外", "category": "观众视角威胁", "reason": "直接威胁观众视角"},
+    {"word": "大马金刀坐", "replacement": "端坐", "category": "暴力", "reason": "威压姿态"},
+    {"word": "大马金刀", "replacement": "端然", "category": "暴力", "reason": "威压姿态"},
+    {"word": "血流如注", "replacement": "伤处留下暗红痕迹", "category": "暴力", "reason": "明显血腥画面"},
+    {"word": "离家出走", "replacement": "独自外出", "category": "家庭", "reason": "家庭冲突"},
+    {"word": "怒斥", "replacement": "严肃地说", "category": "暴力", "reason": "激烈冲突"},
+    {"word": "暴怒", "replacement": "明显生气", "category": "暴力", "reason": "极端情绪"},
+    {"word": "强吻", "replacement": "突然靠近", "category": "情色", "reason": "强迫亲密行为"},
+    {"word": "自杀", "replacement": "情绪崩溃", "category": "自伤", "reason": "自伤行为"},
     {"word": "撕心裂肺", "replacement": "悲痛", "category": "极端情绪", "reason": "情绪夸张"},
-    {"word": "歇斯底里", "replacement": "激动", "category": "极端情绪", "reason": "情绪夸张"},
+    {"word": "歇斯底里", "replacement": "情绪激动", "category": "极端情绪", "reason": "情绪夸张"},
     {"word": "真人扮演", "replacement": "", "category": "真人锚", "reason": "易被误解为真人"},
 ]
 
@@ -58,7 +57,10 @@ async def sync_from_admin(timeout: int = 10) -> int:
 
     拉取失败时保留上次缓存不变,返回 0
     """
-    require_cloud("远端敏感词同步")
+    from services.offline_guard import cloud_enabled
+    if not cloud_enabled():
+        logger.info("[sensitive] 离线迁移版跳过生产敏感词同步")
+        return 0
     try:
         async with aiohttp.ClientSession(connector=get_aiohttp_connector(), timeout=aiohttp.ClientTimeout(total=timeout)) as session:
             async with session.get(f"{ADMIN_API_URL}?platform=jimeng") as resp:
@@ -115,8 +117,11 @@ async def get_all_words() -> List[Dict[str, Any]]:
     """返回当前缓存中的所有敏感词"""
     db = await get_db()
     try:
+        # Longer phrases must win before their shorter substrings. For example,
+        # process "枪口对准镜头" before "枪口" so the replacement stays coherent.
         cur = await db.execute(
-            "SELECT word, replacement, category, reason FROM sensitive_words_cache ORDER BY word"
+            "SELECT word, replacement, category, reason FROM sensitive_words_cache "
+            "ORDER BY LENGTH(word) DESC, word"
         )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
@@ -166,20 +171,31 @@ async def scan_text(text: str) -> Dict[str, Any]:
 
     words = await get_all_words()
     hits = []
-    cleaned = text
+    replacements = []
+    occupied = [False] * len(text)
     for w in words:
         word = w["word"]
         if not word or word not in text:
             continue
-        # 找出所有命中位置
+
+        # The DB query returns longer phrases first. Claim non-overlapping spans
+        # on the original text so a phrase such as "大马金刀坐" does not also
+        # report or rewrite its shorter substring "大马金刀".
         positions = []
         start = 0
         while True:
             idx = text.find(word, start)
             if idx < 0:
                 break
-            positions.append([idx, idx + len(word)])
-            start = idx + len(word)
+            end = idx + len(word)
+            if not any(occupied[idx:end]):
+                positions.append([idx, end])
+                occupied[idx:end] = [True] * len(word)
+                replacements.append((idx, end, w["replacement"] or ""))
+            start = end
+
+        if not positions:
+            continue
 
         hits.append({
             "word": word,
@@ -190,8 +206,12 @@ async def scan_text(text: str) -> Dict[str, Any]:
             "count": len(positions),
             "failure_type": _infer_failure_type(w["category"] or ""),
         })
-        # 替换(空 replacement 就删除)
-        cleaned = cleaned.replace(word, w["replacement"] or "")
+
+    # Replace from right to left so original match offsets stay valid and a
+    # replacement can never trigger another sensitive-word replacement.
+    cleaned = text
+    for start, end, replacement in sorted(replacements, key=lambda item: item[0], reverse=True):
+        cleaned = cleaned[:start] + replacement + cleaned[end:]
 
     # 按 failure_type 分组
     hits_by_failure: Dict[str, list] = {}

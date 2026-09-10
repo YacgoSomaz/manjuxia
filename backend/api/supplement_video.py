@@ -57,6 +57,7 @@ class SupplementTaskUpdate(BaseModel):
 class GenerateStoryboardRequest(BaseModel):
     template_id: int
     llm_config_id: int
+    use_scene_reference_image: bool = False
 
 
 class SupplementMaterialsUpdate(BaseModel):
@@ -187,6 +188,7 @@ async def generate_storyboard(task_id: int, payload: GenerateStoryboardRequest):
             task_id,
             template_id=payload.template_id,
             llm_config_id=payload.llm_config_id,
+            use_scene_reference_image=payload.use_scene_reference_image,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

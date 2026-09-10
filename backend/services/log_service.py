@@ -1,9 +1,11 @@
 import asyncio
 import json
+import os
 import re
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
-from database.db import get_db
+import aiosqlite
+from database.db import get_db, DB_PATH
 from fastapi import HTTPException
 from utils.timezone import now_beijing_str, now_beijing
 
@@ -14,6 +16,33 @@ CHECKED_TASK_TYPES = {
     "script_convert": "剧本转换",
     "script_to_novel": "剧本转小说",
 }
+
+
+async def _get_log_read_db(timeout: float = 3.0):
+    """Open a lightweight read connection for the logs page.
+
+    The generic get_db() reapplies WAL/busy_timeout on every connection. That is
+    fine for normal writes, but the logs page is a read-heavy UI and should not
+    wait 60s behind unrelated generation writes.
+    """
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    db = await aiosqlite.connect(DB_PATH, timeout=timeout)
+    db.row_factory = aiosqlite.Row
+    await db.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+    return db
+
+
+async def _get_log_maintenance_db():
+    """Best-effort maintenance connection for log cleanup.
+
+    Log cleanup is cosmetic. If SQLite is busy because generation is writing, we
+    skip quickly instead of blocking the visible log list.
+    """
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    db = await aiosqlite.connect(DB_PATH, timeout=0.2)
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA busy_timeout=200")
+    return db
 
 
 # v3.61.183: 视频提交日志可能含 base64 data URL(xinglian images/audios 数组)
@@ -112,9 +141,11 @@ class LogService:
             # v3.61.67: 防破解 — input_prompt 入库前脱敏,避免拷 sqlite 拿到完整 prompt 模板
             #   策略:长 prompt 只保留前 300 字 + 后 300 字,中间打 [脱敏 N 字]
             #   调试模式(env QIANSHAN_LOG_DEBUG=1 或 settings.data.log_debug_mode)不脱敏
+            #   视频生成例外:用户需要核对实际发给第三方的完整文字参数;base64 已在上方截断
             try:
-                from utils.log_sanitizer import sanitize_for_log
-                input_prompt_str = sanitize_for_log(input_prompt_str, head=300, tail=300, min_len=800)
+                from utils.log_sanitizer import sanitize_for_log, should_preserve_full_input_prompt
+                if not should_preserve_full_input_prompt(task_type):
+                    input_prompt_str = sanitize_for_log(input_prompt_str, head=300, tail=300, min_len=800)
             except Exception:
                 # sanitizer 自己挂了不影响主流程
                 pass
@@ -245,8 +276,19 @@ class LogService:
             await db.close()
 
     @staticmethod
-    async def update_log_error(log_id: int, error_message: str):
-        """更新日志为错误状态"""
+    async def update_log_error(
+        log_id: int,
+        error_message: str,
+        output_content: str = None,
+        input_tokens: int = None,
+        output_tokens: int = None,
+        total_tokens: int = None,
+    ):
+        """更新日志为错误状态。
+
+        解析/业务校验失败时，模型其实可能已经返回了内容。可选字段用于把这类
+        返回一并留在调用日志中，避免用户只看到“失败”却无法判断模板冲突原因。
+        """
         if not log_id or log_id <= 0:
             return
 
@@ -272,10 +314,24 @@ class LogService:
             await db.execute(
                 """
                 UPDATE llm_logs 
-                SET error_message = ?, status = ?, end_time = ?, duration_seconds = ?
+                SET error_message = ?, status = ?, end_time = ?, duration_seconds = ?,
+                    output_content = COALESCE(?, output_content),
+                    input_tokens = COALESCE(?, input_tokens),
+                    output_tokens = COALESCE(?, output_tokens),
+                    total_tokens = COALESCE(?, total_tokens)
                 WHERE id = ?
                 """,
-                (error_message, 'error', end_time, duration_seconds, log_id)
+                (
+                    error_message,
+                    'error',
+                    end_time,
+                    duration_seconds,
+                    output_content,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    log_id,
+                )
             )
             await db.commit()
         except Exception as e:
@@ -287,7 +343,7 @@ class LogService:
     @staticmethod
     async def mark_superseded_image_logs() -> int:
         """????????????????? running ?????? error."""
-        db = await get_db()
+        db = await _get_log_maintenance_db()
         try:
             end_time = now_beijing_str()
             cursor = await db.execute(
@@ -312,7 +368,8 @@ class LogService:
             await db.commit()
             return cursor.rowcount if hasattr(cursor, "rowcount") else 0
         except Exception as e:
-            print(f"[WARN] ????????????????: {e}")
+            # Do not block the logs page for cosmetic cleanup when generation is writing.
+            print(f"[WARN] 跳过旧图片日志清理: {e}")
             return 0
         finally:
             await db.close()
@@ -326,7 +383,7 @@ class LogService:
         novel_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """获取日志列表（分页，可按任务类型/状态/小说ID筛选）"""
-        db = await get_db()
+        db = await _get_log_read_db()
         try:
             # 计算偏移量
             offset = (page - 1) * page_size

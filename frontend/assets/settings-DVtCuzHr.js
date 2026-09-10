@@ -1,0 +1,1 @@
+import{G as e}from"./index-Cga1Ymz8.js";function i(t){return e(`/api/settings/${encodeURIComponent(t)}`,{timeout:1e4})}function r(t,n){return e(`/api/settings/${encodeURIComponent(t)}`,{method:"PUT",body:JSON.stringify({value:n}),timeout:1e4})}export{i as g,r as p};

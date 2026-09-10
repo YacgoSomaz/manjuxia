@@ -1,7 +1,7 @@
 """v3.61.92 / v3.61.99: 其他功能 — 溶图 + 火山方舟素材库加白
 
 设置 → 其他功能 / 信息提取页 的后端接口:
-- POST /api/extra/fuse:多张参考图 base64 + prompt + ratio → 生成融合图
+- POST /api/extra/fuse:参考图(可空) + prompt + ratio → 文生图或多图融合图
 - GET  /api/extra/fusion/history:溶图历史(分页)
 - DELETE /api/extra/fusion/history/{id}:删除某条历史记录
 
@@ -14,29 +14,177 @@
 """
 import json
 import logging
+import re
+import time
+import uuid
+from pathlib import Path
 from typing import List, Optional, Any, Dict
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, File, HTTPException, UploadFile
+from pydantic import BaseModel, Field
 from database.db import get_db
 from services.image_service import ImageService
+from services.image_upscale_service import LocalImageUpscaler
 from services.llm_service import LLMService
+from utils.paths import get_data_dir, media_subdir
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/extra", tags=["extra"])
+
+# 自由生图接口是同步长请求。页面刷新不会取消后端中的当前调用，
+# 因此用进程内集合向历史接口暴露真实活跃状态；后端重启后集合为空，
+# 历史接口会把遗留 pending 收口，避免前端永久轮询。
+_active_fusion_history_ids: set[int] = set()
+
+_LOCAL_UPSCALE_MAX_BYTES = 20 * 1024 * 1024
+_LOCAL_UPSCALE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".jfif", ".webp"}
+
+
+def _safe_image_stem(filename: str) -> str:
+    stem = Path(filename or "image").stem.strip()
+    stem = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", stem).strip("_-")
+    return (stem or "image")[:48]
+
+
+@router.get("/local-upscale/status")
+async def get_local_upscale_status():
+    return {
+        "available": LocalImageUpscaler.is_available(),
+        "target_long_edge": 2048,
+        "max_upload_mb": _LOCAL_UPSCALE_MAX_BYTES // (1024 * 1024),
+    }
+
+
+@router.post("/local-upscale")
+async def upscale_local_image(file: UploadFile = File(...)):
+    """Upload one image and produce a local 2K JPEG with Real-ESRGAN."""
+    original_name = file.filename or "image.png"
+    extension = Path(original_name).suffix.lower()
+    if extension not in _LOCAL_UPSCALE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持 PNG、JPG、JPEG、WebP 图片")
+
+    token = uuid.uuid4().hex[:12]
+    work_dir = Path(get_data_dir()) / "temp" / "local-upscale"
+    output_dir = Path(media_subdir("images")) / "local-upscale"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_path = work_dir / f"upload-{token}{extension}"
+    output_name = f"{_safe_image_stem(original_name)}_{int(time.time())}_{token}_2k.jpg"
+    output_path = output_dir / output_name
+
+    size = 0
+    try:
+        with source_path.open("wb") as target:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > _LOCAL_UPSCALE_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="图片不能超过 20MB")
+                target.write(chunk)
+        if size <= 0:
+            raise HTTPException(status_code=400, detail="上传图片为空")
+
+        result = await LocalImageUpscaler().upscale_to_2k(
+            str(source_path),
+            str(output_path),
+            timeout=300,
+        )
+        if not result.success:
+            status_code = (
+                503
+                if (
+                    "引擎" in result.message
+                    or "模型文件" in result.message
+                    or "显存不足" in result.message
+                )
+                else 500
+            )
+            if result.message.startswith("输入图片"):
+                status_code = 400
+            raise HTTPException(status_code=status_code, detail=result.message or "本地超分失败")
+
+        return {
+            "success": True,
+            "image_url": f"/data/images/local-upscale/{output_name}",
+            "download_name": output_name,
+            "input_width": result.input_size[0] if result.input_size else None,
+            "input_height": result.input_size[1] if result.input_size else None,
+            "output_width": result.output_size[0] if result.output_size else None,
+            "output_height": result.output_size[1] if result.output_size else None,
+            "elapsed_ms": result.elapsed_ms,
+            "message": result.message,
+        }
+    except HTTPException:
+        try:
+            if output_path.exists():
+                output_path.unlink()
+        except OSError:
+            pass
+        raise
+    except Exception as exc:
+        logger.exception("[local-upscale] endpoint failed file=%s: %s", original_name, exc)
+        try:
+            if output_path.exists():
+                output_path.unlink()
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail=f"本地超分失败: {exc}")
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
+        try:
+            if source_path.exists():
+                source_path.unlink()
+        except OSError:
+            pass
+
+
+async def _finish_fusion_history(
+    history_id: Optional[int],
+    *,
+    success: bool,
+    image_url: Optional[str] = None,
+    remote_url: Optional[str] = None,
+    error_message: str = "",
+) -> None:
+    if history_id is None:
+        return
+    try:
+        db = await get_db()
+        try:
+            if success:
+                await db.execute(
+                    "UPDATE fusion_history SET status='success', output_image_url=?, output_remote_url=?, "
+                    "finished_at=datetime('now','+8 hours') WHERE id=?",
+                    (image_url, remote_url, history_id),
+                )
+            else:
+                await db.execute(
+                    "UPDATE fusion_history SET status='failed', output_image_url=NULL, "
+                    "output_remote_url=COALESCE(?, output_remote_url), error_message=?, "
+                    "finished_at=datetime('now','+8 hours') WHERE id=?",
+                    (remote_url, error_message or "自由生图失败", history_id),
+                )
+            await db.commit()
+        finally:
+            await db.close()
+    except Exception as exc:
+        logger.warning("[fusion] 回写 history 失败: %s", exc)
 
 
 class FuseRequest(BaseModel):
     config_id: int
     prompt: str
     ratio: str = "1:1"
-    reference_images: List[str]  # base64 字符串数组(可带或不带 data: 前缀)
+    reference_images: List[str] = Field(default_factory=list)  # base64 字符串数组(可带或不带 data: 前缀);为空时走纯文生图
 
 
 @router.post("/fuse")
 async def fuse_images(req: FuseRequest):
-    """溶图 — 多参考图融合"""
-    if not req.reference_images:
-        raise HTTPException(status_code=400, detail="至少需要 1 张参考图")
+    """自由生图 — 有参考图走多图融合,无参考图走纯文生图"""
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="融合描述不能为空")
 
@@ -65,36 +213,31 @@ async def fuse_images(req: FuseRequest):
     finally:
         await db.close()
 
-    # 调 ImageService.generate_fusion_image
-    result = await ImageService.generate_fusion_image(
-        config_id=req.config_id,
-        prompt=req.prompt,
-        ratio=req.ratio,
-        reference_images_base64=req.reference_images,
-    )
-
-    # 回写 history
     if history_id is not None:
-        try:
-            db = await get_db()
-            try:
-                if result.get("success"):
-                    await db.execute(
-                        "UPDATE fusion_history SET status='success', output_image_url=?, output_remote_url=?, "
-                        "finished_at=datetime('now','+8 hours') WHERE id=?",
-                        (result.get("image_url"), result.get("remote_url"), history_id)
-                    )
-                else:
-                    await db.execute(
-                        "UPDATE fusion_history SET status='failed', error_message=?, "
-                        "finished_at=datetime('now','+8 hours') WHERE id=?",
-                        (result.get("message", ""), history_id)
-                    )
-                await db.commit()
-            finally:
-                await db.close()
-        except Exception as e:
-            logger.warning(f"[fusion] 回写 history 失败: {e}")
+        _active_fusion_history_ids.add(history_id)
+    try:
+        result = await ImageService.generate_fusion_image(
+            config_id=req.config_id,
+            prompt=req.prompt,
+            ratio=req.ratio,
+            reference_images_base64=req.reference_images,
+        )
+        await _finish_fusion_history(
+            history_id,
+            success=bool(result.get("success")),
+            image_url=result.get("image_url"),
+            remote_url=result.get("remote_url"),
+            error_message=result.get("message", ""),
+        )
+    except HTTPException as exc:
+        await _finish_fusion_history(history_id, success=False, error_message=str(exc.detail))
+        raise
+    except Exception as exc:
+        await _finish_fusion_history(history_id, success=False, error_message=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        if history_id is not None:
+            _active_fusion_history_ids.discard(history_id)
 
     if not result.get("success"):
         raise HTTPException(status_code=500, detail=result.get("message", "融合失败"))
@@ -112,6 +255,26 @@ async def list_fusion_history(limit: int = 50, offset: int = 0):
     """溶图历史列表(按 created_at 倒序)"""
     db = await get_db()
     try:
+        # pending 超过短暂入库窗口、且本进程没有对应长请求时，只可能是
+        # 后端重启/异常断连遗留。先收口再返回，防止客户端每 2 秒永久轮询。
+        active_ids = tuple(_active_fusion_history_ids)
+        if active_ids:
+            placeholders = ",".join("?" for _ in active_ids)
+            await db.execute(
+                f"UPDATE fusion_history SET status='failed', error_message='生成任务已中断，请重新生成', "
+                f"finished_at=datetime('now','+8 hours') WHERE status='pending' "
+                f"AND id NOT IN ({placeholders}) "
+                f"AND datetime(created_at) < datetime('now','+8 hours','-30 seconds')",
+                active_ids,
+            )
+        else:
+            await db.execute(
+                "UPDATE fusion_history SET status='failed', error_message='生成任务已中断，请重新生成', "
+                "finished_at=datetime('now','+8 hours') WHERE status='pending' "
+                "AND datetime(created_at) < datetime('now','+8 hours','-30 seconds')"
+            )
+        await db.commit()
+
         cur = await db.execute(
             "SELECT id, config_id, config_name, model_name, prompt, ratio, "
             "       output_image_url, output_remote_url, status, error_message, "
@@ -132,6 +295,7 @@ async def list_fusion_history(limit: int = 50, offset: int = 0):
                 "output_image_url": r["output_image_url"],
                 "output_remote_url": r["output_remote_url"],
                 "status": r["status"],
+                "active": r["id"] in _active_fusion_history_ids,
                 "error_message": r["error_message"],
                 "created_at": r["created_at"],
                 "finished_at": r["finished_at"],
@@ -158,9 +322,9 @@ async def link_fusion_to_element(req: LinkToElementRequest):
     """把溶图历史里的成品图,关联到信息提取里的某个角色/场景/道具元素。
 
     两种模式:
-    - variant_name 为空:覆盖元素本体 finished_image(原逻辑)。
+    - variant_name 为空:覆盖元素本体 finished_image,并用本条历史的 prompt 替换元素 description。
     - variant_name 非空(仅人物):存为该角色马甲的成品图(真复制文件,语义命名 角色_名_马甲名.ext),
-      本体成品图保留不动。马甲不存在则新建。
+      本体成品图保留不动,同时把 prompt 写入该马甲 description。马甲不存在则新建。
     都是 shutil.copy2 真落地本地文件(不存远程引用),保证推云端不漏。
     """
     import os
@@ -173,7 +337,7 @@ async def link_fusion_to_element(req: LinkToElementRequest):
     db = await get_db()
     try:
         cur = await db.execute(
-            "SELECT output_image_url, status FROM fusion_history WHERE id=?",
+            "SELECT output_image_url, status, prompt FROM fusion_history WHERE id=?",
             (req.history_id,)
         )
         h = await cur.fetchone()
@@ -185,6 +349,7 @@ async def link_fusion_to_element(req: LinkToElementRequest):
         raise HTTPException(status_code=400, detail="该自由生图任务未成功,无图可关联")
 
     src_path_rel = h["output_image_url"]
+    source_description = str(h["prompt"] or "").strip()
     src_abs = resolve_db_path(src_path_rel)
     if not src_abs or not os.path.exists(src_abs):
         raise HTTPException(status_code=400, detail=f"源图文件不存在: {src_path_rel}")
@@ -207,7 +372,11 @@ async def link_fusion_to_element(req: LinkToElementRequest):
         variant = await ExtractionService.get_variant_by_name(req.element_id, vname)
         if not variant:
             try:
-                variant = await ExtractionService.create_variant(req.element_id, vname)
+                variant = await ExtractionService.create_variant(
+                    req.element_id,
+                    vname,
+                    source_description,
+                )
             except ValueError as ve:
                 raise HTTPException(status_code=400, detail=str(ve))
         if not variant:
@@ -235,7 +404,16 @@ async def link_fusion_to_element(req: LinkToElementRequest):
                     os.remove(old_abs)
             except Exception as e:
                 logger.warning(f"[fusion-link] 删旧马甲成品图失败(忽略): {e}")
-        await ExtractionService.update_variant(variant_id, finished_image=new_variant_path, image_status="success")
+        variant_updates = {
+            "finished_image": new_variant_path,
+            "image_status": "success",
+        }
+        if source_description:
+            # 历史记录里显示的生成描述就是这张图实际使用的 prompt。
+            # 关联马甲时同步覆盖马甲描述与图片 prompt,避免图已经换了、描述仍是旧造型。
+            variant_updates["description"] = source_description
+            variant_updates["image_prompt"] = source_description
+        await ExtractionService.update_variant(variant_id, **variant_updates)
         return {
             "success": True,
             "element_id": req.element_id,
@@ -244,7 +422,13 @@ async def link_fusion_to_element(req: LinkToElementRequest):
             "variant_id": variant_id,
             "variant_name": vname,
             "finished_image": new_variant_path,
-            "message": f"已存为 「{element.get('name','')}」 的马甲「{vname}」成品图",
+            "description": source_description,
+            "description_replaced": bool(source_description),
+            "message": (
+                f"已替换 「{element.get('name','')}」 的马甲「{vname}」成品图和描述"
+                if source_description
+                else f"已存为 「{element.get('name','')}」 的马甲「{vname}」成品图"
+            ),
         }
 
     # ===== 分支 B:覆盖本体成品图(原逻辑) =====
@@ -268,11 +452,18 @@ async def link_fusion_to_element(req: LinkToElementRequest):
         except Exception as e:
             logger.warning(f"[fusion-link] 删除旧 finished_image 失败(忽略): {e}")
 
-    await ExtractionService.update_element_image(
-        element_id=req.element_id,
-        finished_image=new_finished_path,
-        image_status=None,
-    )
+    image_updates = {
+        "finished_image": new_finished_path,
+        "image_status": None,
+    }
+    if source_description:
+        image_updates["image_prompt"] = source_description
+    await ExtractionService.update_element_image(element_id=req.element_id, **image_updates)
+    if source_description:
+        await ExtractionService.update_element(
+            req.element_id,
+            {"description": source_description},
+        )
 
     return {
         "success": True,
@@ -280,7 +471,13 @@ async def link_fusion_to_element(req: LinkToElementRequest):
         "element_name": element.get("name", ""),
         "element_type": element.get("element_type", ""),
         "finished_image": new_finished_path,
-        "message": f"已关联到 {element.get('element_type', '')} 「{element.get('name', '')}」",
+        "description": source_description,
+        "description_replaced": bool(source_description),
+        "message": (
+            f"已替换 {element.get('element_type', '')} 「{element.get('name', '')}」的成品图和描述"
+            if source_description
+            else f"已关联到 {element.get('element_type', '')} 「{element.get('name', '')}」"
+        ),
     }
 
 
@@ -320,50 +517,81 @@ async def delete_fusion_history(history_id: int):
     return {"success": True}
 
 
-def _image_config_category(item: Dict[str, Any]) -> str:
-    api_style = (item.get("api_style") or item.get("apiStyle") or "").lower()
-    base_url = (item.get("base_url") or item.get("baseUrl") or "").lower()
-    model_name = (item.get("model_name") or item.get("modelName") or "").lower().replace(" ", "")
-    provider_code = (item.get("provider_code") or item.get("providerCode") or "").lower()
-
-    if provider_code in ("volcengine", "doubao") or "volces.com" in base_url or "ark.cn-" in base_url:
-        return "volcengine"
-    if provider_code in ("wuyinkeji", "wuyinkeji_llm") or "wuyinkeji" in base_url or api_style == "wuyinkeji_async":
-        return "wuyinkeji"
-    if provider_code == "geek" or ("geek" in base_url and ("gptimage" in model_name or "gpt-image" in model_name)):
-        return "geek"
-    if provider_code == "cool" or "cool" in api_style or "mjapi" in base_url:
-        return "cool"
-    if provider_code in ("mooko", "kkai", "kkone") or "mooko.ai" in base_url or "kkone" in base_url:
-        return "mooko"
-    if provider_code:
-        return provider_code
-    return "custom"
-
-
-def _public_supported_image_config(item: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "id": item.get("id"),
-        "name": item.get("name", ""),
-        "model_name": item.get("model_name") or item.get("modelName") or "",
-        "category": _image_config_category(item),
-    }
-
-
 @router.get("/fusion/supported-configs")
 async def list_supported_configs():
-    """列出图片配置。
+    """列出当前支持多参考图融合的图片配置(从云端拉,跟其他模块统一)
 
-    万山的图片能力统一使用本地“图片大模型”配置；不要在列表阶段用旧白名单隐藏配置，
-    否则火山方舟等已导入模型会在前端显示 No data。
+    过滤规则:config_type='image' 且 (provider_code ∈ {wuyinkeji, wuyinkeji_llm, mooko, kkai, kkone}
+    或 base_url / model_name 命中 wuyinkeji / geek + gpt-image / cool / mooko.ai / kkone 关键字;
+    Qekor/启科只放 GPT-Image 系列进多参考图融合)
+    v3.61.192:补 KKAI(mooko/kkone)— fusion 后端已支持,但本端点白名单漏了它导致下拉不显示
     """
+    items = []
     try:
-        local_items = await LLMService._get_local_all("image")
-        configs = local_items or await LLMService.get_all("image")
+        # v3.61.92: 改走云端 cloud_llm_sync(本地 llm_configs 表已经不是权威源,见 LLMConfigView 提示)
+        from services import cloud_llm_sync
+        cloud_items = await cloud_llm_sync.list_configs("image")
     except Exception as e:
-        logger.warning(f"[fusion] 获取 image 配置失败: {e}")
-        configs = []
-    return {"items": [_public_supported_image_config(r) for r in configs or []]}
+        logger.warning(f"[fusion] 云端拉 image 配置失败,fallback 到本地表: {e}")
+        cloud_items = None
+
+    if cloud_items:
+        # 云端格式:camelCase(configType / providerCode / baseUrl / modelName)
+        for r in cloud_items:
+            if not r.get("enabled", True):
+                continue
+            api_style = (r.get("apiStyle") or r.get("api_style") or "").lower()
+            base_url = (r.get("baseUrl") or "").lower()
+            model_name = (r.get("modelName") or "").lower().replace(" ", "")
+            provider_code = (r.get("providerCode") or "").lower()
+            is_wuyinkeji = (
+                provider_code in ("wuyinkeji", "wuyinkeji_llm")
+                or "wuyinkeji" in base_url
+                or api_style == "wuyinkeji_async"
+            )
+            is_geek_gpt = "geek" in base_url and ("gptimage" in model_name or "gpt-image" in model_name)
+            is_cool = "cool" in api_style or "mjapi" in base_url
+            is_mooko = (
+                provider_code in ("mooko", "kkai", "kkone")
+                or "mooko.ai" in base_url
+                or "kkone" in base_url
+            )
+            is_qekor = ImageService.is_qekor_gpt_image_config(r)
+            if is_wuyinkeji or is_geek_gpt or is_cool or is_mooko or is_qekor:
+                items.append({
+                    "id": r.get("id"),
+                    "name": r.get("name", ""),
+                    "model_name": r.get("modelName", ""),
+                    "category": "wuyinkeji" if is_wuyinkeji else ("geek" if is_geek_gpt else ("cool" if is_cool else ("mooko" if is_mooko else "qekor"))),
+                })
+    else:
+        # fallback 本地 SQLite
+        db = await get_db()
+        try:
+            cur = await db.execute(
+                "SELECT id, name, model_name, base_url, api_style FROM llm_configs WHERE config_type='image' ORDER BY id DESC"
+            )
+            rows = await cur.fetchall()
+        finally:
+            await db.close()
+        for r in rows:
+            api_style = (r["api_style"] or "").lower()
+            base_url = (r["base_url"] or "").lower()
+            model_name = (r["model_name"] or "").lower().replace(" ", "")
+            is_wuyinkeji = "wuyinkeji" in base_url or api_style == "wuyinkeji_async"
+            is_geek_gpt = "geek" in base_url and ("gptimage" in model_name or "gpt-image" in model_name)
+            is_cool = "cool" in api_style or "mjapi" in base_url
+            # 本地 fallback SQL 未选 provider_code,只能靠 base_url 判断 mooko/kkone/qekor
+            is_mooko = "mooko.ai" in base_url or "kkone" in base_url
+            is_qekor = ImageService.is_qekor_gpt_image_config(dict(r))
+            if is_wuyinkeji or is_geek_gpt or is_cool or is_mooko or is_qekor:
+                items.append({
+                    "id": r["id"],
+                    "name": r["name"],
+                    "model_name": r["model_name"],
+                    "category": "wuyinkeji" if is_wuyinkeji else ("geek" if is_geek_gpt else ("cool" if is_cool else ("mooko" if is_mooko else "qekor"))),
+                })
+    return {"items": items}
 
 
 # ==================== v3.61.99 火山方舟素材库(企业版) ====================

@@ -543,9 +543,10 @@ async def _land_audio_asset(novel_id: int, detail: Dict[str, Any], subdir: str) 
         rel_name = f"{subdir}/音频/音频_{safe_char}{ext if ext.startswith('.') else '.' + ext}"
         audio_rel = await _download_audio(detail.get("audioSignedUrl"), rel_name)
         if audio_rel:
+            from services.voice_service import local_audio_voice_id
             await db.execute(
-                "UPDATE extracted_elements SET audio_file=?, updated_at=? WHERE id=?",
-                (audio_rel, now, element_id),
+                "UPDATE extracted_elements SET audio_file=?, voice_id=?, updated_at=? WHERE id=?",
+                (audio_rel, local_audio_voice_id(audio_rel), now, element_id),
             )
 
         # v3.61.267:马甲音频 → audio 资产的 variants(variantName=马甲名,imageSignedUrl 承载音频)
@@ -735,6 +736,35 @@ async def _land_asset(novel_id: int, detail: Dict[str, Any], novel_name: Optiona
             await db.execute(
                 "UPDATE extracted_elements SET reference_image=?, grid_image=?, panorama_url=? WHERE id=?",
                 (ref_img, grid_img, pano_img, element_id),
+            )
+
+        # v3.61.280:同名同型去重(自愈)——
+        #   团队同步落地后,把本剧同名同型的【其它】元素(通常是历史遗留的个人重复条,
+        #   早于"按名认领"修复时同步产生的)合并进当前团队元素后删除,实现"同名替换",
+        #   避免团队条与个人条并存重复。只动 novel 内同名同型,范围安全。
+        dup_cur = await db.execute(
+            "SELECT id, finished_image, grid_image, reference_image, panorama_url, audio_file "
+            "FROM extracted_elements WHERE novel_id=? AND element_type=? AND name=? AND id<>?",
+            (novel_id, asset_type, name, element_id),
+        )
+        dups = await dup_cur.fetchall()
+        for d in dups:
+            # 团队元素缺的图/音,从重复条补过来(COALESCE 只填团队侧为空的字段,优先保留团队成品)
+            await db.execute(
+                "UPDATE extracted_elements SET "
+                "finished_image=COALESCE(finished_image, ?), grid_image=COALESCE(grid_image, ?), "
+                "reference_image=COALESCE(reference_image, ?), panorama_url=COALESCE(panorama_url, ?), "
+                "audio_file=COALESCE(audio_file, ?) WHERE id=?",
+                (d["finished_image"], d["grid_image"], d["reference_image"],
+                 d["panorama_url"], d["audio_file"], element_id),
+            )
+            # 删重复条(人物连带马甲)
+            if asset_type == "character":
+                await db.execute("DELETE FROM character_variants WHERE element_id=?", (d["id"],))
+            await db.execute("DELETE FROM extracted_elements WHERE id=?", (d["id"],))
+        if dups:
+            logger.info(
+                f"[team-asset] 同名去重:元素「{name}」({asset_type})合并删除 {len(dups)} 个重复条 → 保留 team 元素 {element_id}"
             )
 
         await db.commit()

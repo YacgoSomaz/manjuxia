@@ -740,16 +740,50 @@ class PippitCliProvider(VideoProviderBase):
         params = params or {}
         images = images or []
         audios = audios or []
+        from services.video_model_capabilities import (
+            canonical_video_model_name,
+            get_video_model_capabilities,
+        )
+        requested_model = (
+            params.get("model")
+            or params.get("model_version")
+            or "seedance2.0_fast_direct"
+        )
+        capabilities = get_video_model_capabilities(
+            requested_model,
+            self.provider_type,
+        )
+        if not capabilities["video_generation_available"]:
+            return SubmitResult(
+                success=False,
+                fail_reason=f"小云雀暂不支持 {capabilities['label']} 视频生成",
+                error_code="INVALID_PARAM",
+            )
+        max_images = int(capabilities["max_images"])
+        max_audios = int(capabilities["max_audios"])
 
-        model = params.get("model") or params.get("model_version") or "seedance2.0_fast_direct"
+        model = canonical_video_model_name(requested_model, self.provider_type)
         ratio = params.get("ratio") or "9:16"
         resolution = params.get("resolution") or "720p"
-        duration = int(params.get("duration") or 5)
+        duration = min(
+            int(capabilities["max_duration_seconds"]),
+            max(4, int(params.get("duration") or 5)),
+        )
+        if str(resolution).strip().lower() == "1080p" and str(model) != "seedance2.0_vision":
+            return SubmitResult(
+                success=False,
+                fail_reason="小云雀 1080p 仅支持 seedance2.0_vision 模型",
+                error_code="INVALID_PARAM",
+            )
 
-        resolved_images, image_error = self._resolve_media_paths(images, label="图片", limit=9)
+        resolved_images, image_error = self._resolve_media_paths(
+            images, label="图片", limit=max_images
+        )
         if image_error:
             return SubmitResult(success=False, fail_reason=image_error, error_code="INVALID_PARAM")
-        resolved_audios, audio_error = self._resolve_media_paths(audios, label="音频", limit=3)
+        resolved_audios, audio_error = self._resolve_media_paths(
+            audios, label="音频", limit=max_audios
+        )
         if audio_error:
             return SubmitResult(success=False, fail_reason=audio_error, error_code="INVALID_PARAM")
 

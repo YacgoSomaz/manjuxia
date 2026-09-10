@@ -12,10 +12,21 @@ from models.storyboards import (
     StoryboardResponse,
     StoryboardGroupedResponse
 )
-from services.storyboard_service import StoryboardService, register_generation_task, unregister_generation_task, get_running_task_count, cancel_generation_tasks
+from services.storyboard_service import (
+    StoryboardService,
+    register_generation_task,
+    unregister_generation_task,
+    get_running_task_count,
+    get_running_task_scene_indices,
+    cancel_generation_tasks,
+)
 from services.novel_service import NovelService
+from services.tag_service import TagService
+from services.template_service import get_by_id as get_template_by_id
+from services.log_service import LogService
 from services import sensitive_word_service
 from database.db import get_db
+from utils.timezone import now_beijing_str
 import asyncio
 
 import io
@@ -32,6 +43,207 @@ logger = logging.getLogger(__name__)
 MAX_EXPORT_COUNT = 200  # 单次导出最大数量
 MAX_IMPORT_ROWS = 500   # 单次导入最大行数
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 最大文件大小 50MB
+
+
+class OfficialStoryboardSectionRequest(BaseModel):
+    """官方语言算力由客户端执行；本地只构造提示词并保存返回结果。"""
+    novel_id: int
+    template_id: int
+    script_id: Optional[int] = None
+    scene_content: str
+    scene_title: str
+    section_number: int
+    scene_index: Optional[int] = None
+    storyboard_id: Optional[int] = None
+    style_template_id: Optional[int] = None
+    with_character_state: bool = True
+    mode: str = "generate"
+    content: Optional[str] = None
+
+
+class OfficialStoryboardEndStateRequest(BaseModel):
+    content: Optional[str] = None
+
+
+def _parse_official_end_state(text: str) -> Optional[dict]:
+    """优先解析生产分镜正文内嵌的结尾状态块，再兼容 JSON 返回。"""
+    block = re.search(
+        r'(?:📎|🔗)\s*本节结尾状态[:：]?\s*\n'
+        r'(.*?)'
+        r'(?:(?:📎|🔗)\s*结尾状态结束|\n\s*(?:📏|🎬|📎|🔗)|\Z)',
+        text or "", re.DOTALL,
+    )
+    if block:
+        parsed = {}
+        for line in block.group(1).splitlines():
+            if "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            name, value = name.strip().rstrip(":：").strip(), value.strip()
+            if name and value:
+                parsed[name] = value
+        if parsed:
+            return parsed
+    from services.state_extractor_service import _parse_state_json
+    return _parse_state_json(text or "")
+
+
+def _expand_official_storyboard_prompt(template: dict, request: OfficialStoryboardSectionRequest) -> str:
+    """按原 GitHub 分镜请求原样拼装官方任务的 user prompt。
+
+    官方桥接只负责传输，不再追加 JSON schema、字段补齐或质量修补指令；模板本身
+    是唯一的输出规范。这样官方算力与自配算力收到的正文、占位符替换顺序和无占位
+    符兜底文案都与原版 ``generate_section_storyboards`` 一致。
+    """
+    template_content = (template or {}).get("content") or ""
+    try:
+        variables = json.loads((template or {}).get("variables", "[]"))
+    except Exception:
+        variables = []
+
+    variable_map = {
+        "script_content": request.scene_content or "",
+        "content": request.scene_content or "",
+        "script": request.scene_content or "",
+        "text": request.scene_content or "",
+        "novel_id": str(request.novel_id),
+        "script_id": str(request.script_id) if request.script_id else "all",
+    }
+    prompt = template_content
+    has_replacement = False
+
+    for var_name in variables:
+        placeholder1 = f"{{{var_name}}}"
+        if placeholder1 in prompt:
+            prompt = prompt.replace(placeholder1, variable_map.get(var_name, ""))
+            has_replacement = True
+        placeholder2 = f"{{{{{var_name}}}}}"
+        if placeholder2 in prompt:
+            prompt = prompt.replace(placeholder2, variable_map.get(var_name, ""))
+            has_replacement = True
+
+    if not has_replacement:
+        for var_name, var_value in variable_map.items():
+            placeholder1 = f"{{{var_name}}}"
+            if placeholder1 in prompt:
+                prompt = prompt.replace(placeholder1, var_value)
+                has_replacement = True
+            placeholder2 = f"{{{{{var_name}}}}}"
+            if placeholder2 in prompt:
+                prompt = prompt.replace(placeholder2, var_value)
+                has_replacement = True
+
+    if prompt == template_content or not has_replacement:
+        prompt = f"{template_content}\n\n以下是需要转换为分镜的剧本内容：\n\n{request.scene_content}"
+
+    if not request.with_character_state:
+        prompt += (
+            "\n\n【本次最高优先级·覆盖模板】严禁输出任何人物状态块:不要写「场景起始状态:」、"
+            "「🔗 本节结尾状态:」、以及姿态/情绪/伤势/朝向关系/持有道具等状态行。"
+            "即使上文模板要求生成人物状态,本次也一律省略,只输出场景标头 + 镜号分镜内容。"
+        )
+    return prompt
+
+
+async def _save_official_storyboard_section(request: OfficialStoryboardSectionRequest, content: str) -> dict:
+    sections = await StoryboardService._parse_sections_with_dynamic_rules(content)
+    if not sections:
+        raise HTTPException(status_code=422, detail="官方算力返回内容无法解析为分镜")
+    valid = [item for item in sections if StoryboardService._has_shot_marker(item.get("full_text", ""))]
+    if not valid:
+        raise HTTPException(status_code=422, detail="官方算力返回内容缺少有效镜头")
+    db = await get_db()
+    try:
+        if request.mode == "regenerate":
+            if not request.storyboard_id:
+                raise HTTPException(status_code=400, detail="重新生成缺少分镜编号")
+            section = valid[0]
+            text = section.get("full_text", "")
+            info = section.get("section_info", {}) or {}
+            characters = StoryboardService._normalize_characters(info.get("characters", ""))
+            scene = info.get("scene") or request.scene_title or ""
+            parsed_start_state = _parse_section_start_state_from_text(text) or {}
+            parsed_end_state = section.get("_end_state") or _parse_official_end_state(text) or {}
+            cursor = await db.execute("SELECT id FROM storyboards WHERE id=? AND novel_id=?", (request.storyboard_id, request.novel_id))
+            if not await cursor.fetchone():
+                raise HTTPException(status_code=404, detail="分镜不存在")
+            await db.execute("UPDATE storyboards SET description=?, prompt=?, characters=?, scenes=?, section_info=?, section_start_state=?, end_state=? WHERE id=?", (text, text, json.dumps(characters, ensure_ascii=False), json.dumps([scene], ensure_ascii=False), json.dumps({"scene": scene, "characters": ", ".join(characters)}, ensure_ascii=False), json.dumps(parsed_start_state, ensure_ascii=False), json.dumps(parsed_end_state, ensure_ascii=False) if parsed_end_state else None, request.storyboard_id))
+            await db.commit()
+            return {"success": True, "storyboard": {"id": request.storyboard_id, "description": text, "prompt": text, "characters": characters, "scenes": [scene], "section_info": {"scene": scene, "characters": ", ".join(characters)}, "section_start_state": parsed_start_state, "end_state": parsed_end_state or None}}
+        if request.scene_index is not None:
+            await db.execute("DELETE FROM storyboards WHERE novel_id=? AND script_id IS ? AND scene_index=?", (request.novel_id, request.script_id, request.scene_index))
+        saved = []
+        for index, section in enumerate(valid):
+            text = section.get("full_text", "")
+            info = section.get("section_info", {}) or {}
+            characters = StoryboardService._normalize_characters(info.get("characters", ""))
+            scene = info.get("scene") or request.scene_title or ""
+            parsed_start_state = _parse_section_start_state_from_text(text) or {}
+            parsed_end_state = section.get("_end_state") or _parse_official_end_state(text) or {}
+            cursor = await db.execute("""INSERT INTO storyboards (novel_id, script_id, scene_number, description, prompt, characters, scenes, props, sort_order, section_number, section_info, scene_index, template_id, section_start_state, end_state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (request.novel_id, request.script_id, index + 1, text, text, json.dumps(characters, ensure_ascii=False), json.dumps([scene], ensure_ascii=False), json.dumps([], ensure_ascii=False), index, request.section_number + index, json.dumps({"scene": scene, "characters": ", ".join(characters)}, ensure_ascii=False), request.scene_index, request.template_id, json.dumps(parsed_start_state, ensure_ascii=False), json.dumps(parsed_end_state, ensure_ascii=False) if parsed_end_state else None, now_beijing_str()))
+            saved.append({"id": cursor.lastrowid, "description": text, "prompt": text, "characters": characters, "scenes": [scene], "section_number": request.section_number + index, "section_info": {"scene": scene, "characters": ", ".join(characters)}, "section_start_state": parsed_start_state, "end_state": parsed_end_state or None})
+        await db.commit()
+        return {"success": True, "count": len(saved), "storyboards": saved, "section_number": request.section_number, "scene_title": request.scene_title}
+    finally:
+        await db.close()
+
+
+@router.post("/official-prompt-section")
+async def prepare_official_storyboard_section(request: OfficialStoryboardSectionRequest):
+    if not await NovelService.get_by_id(request.novel_id):
+        raise HTTPException(status_code=404, detail="小说不存在")
+    template = await get_template_by_id(request.template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="分镜模板不存在")
+    return {"success": True, "prompt": _expand_official_storyboard_prompt(template, request)}
+
+
+@router.post("/official-result-section")
+async def save_official_storyboard_section(request: OfficialStoryboardSectionRequest):
+    if not (request.content or "").strip():
+        raise HTTPException(status_code=400, detail="官方算力没有返回分镜内容")
+    result = await _save_official_storyboard_section(request, request.content)
+    if request.mode != "regenerate" and request.script_id is not None and request.scene_index is not None:
+        log_id = await LogService.create_log(
+            task_type="storyboard_generate", model="official:comic_creation", config_name="官方算力",
+            base_url="official", input_prompt="[官方分镜任务]", novel_id=request.novel_id,
+            source_id=request.script_id, source_type="storyboard", source_scene_index=request.scene_index,
+        )
+        await LogService.update_log_success(log_id, request.content)
+    return result
+
+
+@router.post("/{storyboard_id}/official-end-state-prompt")
+async def prepare_official_storyboard_end_state(storyboard_id: int):
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT id, description, prompt FROM storyboards WHERE id=?", (storyboard_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="分镜不存在")
+        text = row["description"] or row["prompt"] or ""
+    finally:
+        await db.close()
+    if not text.strip():
+        raise HTTPException(status_code=422, detail="分镜没有可提取的内容")
+    return {"success": True, "prompt": "你是分镜状态归档员。仅根据以下分镜内容，提取最后一镜中实际在场角色的最终状态。只输出 JSON 对象，不要解释或 Markdown。格式：{\"角色名\":\"姿势·面部状态·持有道具·情绪状态\"}。如果内容包含‘📎 本节结尾状态’或‘🔗 本节结尾状态’，必须逐字照抄该块为 JSON，严禁推断。\n\n【分镜内容】\n" + text}
+
+
+@router.post("/{storyboard_id}/official-end-state-result")
+async def save_official_storyboard_end_state(storyboard_id: int, request: OfficialStoryboardEndStateRequest):
+    end_state = _parse_official_end_state(request.content or "")
+    if end_state is None:
+        raise HTTPException(status_code=422, detail="官方算力返回内容无法解析为角色状态 JSON")
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT id FROM storyboards WHERE id=?", (storyboard_id,))
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="分镜不存在")
+        await db.execute("UPDATE storyboards SET end_state=? WHERE id=?", (json.dumps(end_state, ensure_ascii=False), storyboard_id))
+        await db.commit()
+    finally:
+        await db.close()
+    return {"success": True, "end_state": end_state, "source": "official"}
 
 
 _STATE_TAG_RE = re.compile(r"(姿态|情绪|伤势|朝向关系|持有道具)\[")
@@ -87,12 +299,14 @@ async def generate_storyboards(request: StoryboardGenerateRequest):
     """生成分镜（同步等待结果）"""
     logger.info(f"[storyboard-api] /generate 被调用: novel_id={request.novel_id}, template_id={request.template_id}, llm_config_id={request.llm_config_id}, script_id={request.script_id}")
     try:
+        await TagService.require_conversion_tags(request.novel_id)
         # 直接同步调用分镜生成，与剧本转换保持一致
         result = await StoryboardService.generate_storyboards(
             novel_id=request.novel_id,
             template_id=request.template_id,
             llm_config_id=request.llm_config_id,
-            script_id=request.script_id
+            script_id=request.script_id,
+            use_scene_reference_image=request.use_scene_reference_image,
         )
         
         logger.info(f"[storyboard-api] /generate 服务返回: success={result.get('success')}, count={result.get('count')}, message={result.get('message')}")
@@ -152,6 +366,7 @@ async def generate_section_storyboards(request: GenerateSectionRequest):
     logger.info(f"[storyboard-api] /generate-section 被调用: novel_id={request.novel_id}, "
           f"section_number={request.section_number}, scene_title={request.scene_title}, "
           f"scene_index={request.scene_index}, style_template_id={request.style_template_id}")
+    await TagService.require_conversion_tags(request.novel_id)
     
     # 【关键修复】先同步删除该场景的旧分镜，避免轮询在异步任务执行前读到旧数据
     # 使用 scene_index 精确删除，避免文本匹配不可靠的问题
@@ -197,6 +412,7 @@ async def generate_section_storyboards(request: GenerateSectionRequest):
                 cross_chapter_inherit=request.cross_chapter_inherit,
                 with_character_state=request.with_character_state,
                 avoid_same_shot_size=request.avoid_same_shot_size,
+                use_scene_reference_image=request.use_scene_reference_image,
             )
             logger.info(f"[storyboard-api] 场景 {request.scene_index} 分镜生成完成: success={result.get('success')}, count={result.get('count')}")
             return result
@@ -246,7 +462,7 @@ async def cancel_generation(novel_id: int, script_id: Optional[int] = None):
 
 
 @router.get("/generation-status")
-async def get_generation_status(novel_id: int, script_id: int):
+async def get_generation_status(novel_id: int, script_id: int, template_id: Optional[int] = None):
     """查询分镜生成状态（通过日志来源字段）
     
     增强功能：对于 status='success' 的日志，自动检查并恢复缺失的分镜数据。
@@ -255,7 +471,7 @@ async def get_generation_status(novel_id: int, script_id: int):
     db = await get_db()
     try:
         cursor = await db.execute(
-            """SELECT id, status, source_scene_index, error_message, created_at
+            """SELECT id, status, source_scene_index, error_message, output_content, created_at
                FROM llm_logs 
                WHERE source_type = 'storyboard' 
                  AND source_id = ? 
@@ -267,8 +483,11 @@ async def get_generation_status(novel_id: int, script_id: int):
     finally:
         await db.close()
     
+    running_scene_indices = get_running_task_scene_indices(novel_id, script_id)
+
     # 按 source_scene_index 分组，取每个场景的最新状态
     scene_status = {}
+    log_output_content = {}
     for row in rows:
         idx = row['source_scene_index']
         if idx is not None and idx not in scene_status:
@@ -279,6 +498,22 @@ async def get_generation_status(novel_id: int, script_id: int):
                 "error_message": row['error_message'],
                 "created_at": row['created_at']
             }
+            log_output_content[row['id']] = row['output_content'] or ""
+
+    # 内存任务表是真实后台任务来源。LLM 重试间隔或早期失败时，llm_logs 可能还没出现
+    # 或上一轮日志暂时是 error；只要后台任务仍活着，前端就应继续显示 running。
+    for idx in running_scene_indices:
+        current = scene_status.get(idx)
+        # 活跃任务表才是“此刻是否正在重新生成”的真值。即使数据库里还留着
+        # 上一轮 success，也必须覆盖成 running，避免轮询提前结束。
+        scene_status[idx] = {
+            "log_id": current.get("log_id") if current else None,
+            "status": "running",
+            "scene_index": idx,
+            "error_message": None,
+            "created_at": current.get("created_at") if current else None,
+            "active_task": True,
+        }
 
     # 自动恢复：检查 success 状态的日志是否有对应的分镜数据
     # 安全说明：清空分镜时会同步删除 llm_logs，所以这里只会恢复「生成成功但分镜数据意外丢失」的情况
@@ -305,19 +540,42 @@ async def get_generation_status(novel_id: int, script_id: int):
                         log_id=status_info['log_id'],
                         novel_id=novel_id,
                         script_id=script_id,
-                        scene_index=idx
+                        scene_index=idx,
+                        template_id=template_id
                     )
                     if recovered:
                         status_info['recovered'] = True
                         recovered_scenes.append(idx)
                         logger.info(f"[storyboard-api] 自动恢复成功: 场景 {idx}")
+                    else:
+                        error_message = StoryboardService._build_no_storyboard_error_message(
+                            log_output_content.get(status_info['log_id'], "")
+                        )
+                        status_info['status'] = 'error'
+                        status_info['error_message'] = error_message
+                        await LogService.update_log_error(
+                            log_id=status_info['log_id'],
+                            error_message=error_message,
+                        )
+                        logger.warning(
+                            f"[storyboard-api] 场景 {idx} success 日志无法恢复任何分镜，已纠正为 error"
+                        )
                 except Exception as e:
                     logger.error(f"[storyboard-api] 自动恢复失败: 场景 {idx}, 错误: {e}")
+                    error_message = f"生成日志显示成功，但分镜数据恢复失败：{e}"
+                    status_info['status'] = 'error'
+                    status_info['error_message'] = error_message
+                    await LogService.update_log_error(
+                        log_id=status_info['log_id'],
+                        error_message=error_message,
+                    )
 
     return {
         "novel_id": novel_id,
         "script_id": script_id,
         "scenes": list(scene_status.values()),
+        "running_scene_indices": running_scene_indices,
+        "running_task_count": len(running_scene_indices),
         "recovered_scenes": recovered_scenes
     }
 
@@ -398,7 +656,7 @@ async def export_storyboards_excel(novel_id: int, script_id: int = None, ids: Op
         ws.title = "分镜"
         
         # 添加表头
-        headers = ["分镜ID", "章节", "小节", "场景序号", "画面内容"]
+        headers = ["分镜ID", "章节", "小节", "场景序号", "画面内容", "风格提示词"]
         ws.append(headers)
         
         # 设置表头样式
@@ -415,6 +673,7 @@ async def export_storyboards_excel(novel_id: int, script_id: int = None, ids: Op
                 sb.get("section_number", 1),
                 sb.get("scene_number", 1),
                 sb.get("prompt", "") or sb.get("description", ""),
+                sb.get("style_prompt", "") or "",
             ])
         
         # 设置列宽
@@ -423,6 +682,7 @@ async def export_storyboards_excel(novel_id: int, script_id: int = None, ids: Op
         ws.column_dimensions['C'].width = 8
         ws.column_dimensions['D'].width = 10
         ws.column_dimensions['E'].width = 80
+        ws.column_dimensions['F'].width = 60
         
         # 保存到内存
         output = io.BytesIO()
@@ -507,7 +767,8 @@ async def import_storyboards_excel(novel_id: int, file: UploadFile = File(...)):
         
         # 可选更新列的索引（可能不存在）
         optional_cols = {
-            "画面内容": "prompt"
+            "画面内容": "prompt",
+            "风格提示词": "style_prompt",
         }
         
         col_mapping = {}
@@ -520,7 +781,7 @@ async def import_storyboards_excel(novel_id: int, file: UploadFile = File(...)):
         if not col_mapping:
             raise HTTPException(
                 status_code=400,
-                detail="Excel 文件没有可更新的列（画面内容）"
+                detail="Excel 文件没有可更新的列（画面内容、风格提示词）"
             )
         
         # 解析并更新数据
@@ -856,6 +1117,7 @@ async def regenerate_single_section(request: RegenerateSingleSectionRequest):
           f"storyboard_id={request.storyboard_id}, section_number={request.section_number}, "
           f"scene_title={request.scene_title}, scene_index={request.scene_index}")
     try:
+        await TagService.require_conversion_tags(request.novel_id)
         result = await StoryboardService.regenerate_single_section(
             novel_id=request.novel_id,
             template_id=request.template_id,
@@ -870,6 +1132,7 @@ async def regenerate_single_section(request: RegenerateSingleSectionRequest):
             cross_chapter_inherit=request.cross_chapter_inherit,
             with_character_state=request.with_character_state,
             avoid_same_shot_size=request.avoid_same_shot_size,
+            use_scene_reference_image=request.use_scene_reference_image,
         )
 
         logger.info(f"[storyboard-api] /regenerate-single-section 服务返回: success={result.get('success')}, "

@@ -64,7 +64,7 @@ LLM_MODEL_PRESETS = {
     },
     "deepseek-v4-flash": {
         "display_name": "DeepSeek V4 Flash",
-        "max_tokens": 16384,
+        "max_tokens": 65536,
         "context_window": 131072,
         "default_temperature": 0.7,
     },
@@ -131,6 +131,7 @@ IMAGE_MODEL_PRESETS = {
 # - seedance2.0_vip      (VIP标准版)
 # - seedance2.0fast_vip  (VIP快速版)
 # - seedance2.0fast      (快速版)
+# - seedance2.0mini      (Mini版)
 # - seedance2.0          (标准版)
 VIDEO_MODEL_PRESETS = {
     "seedance-2.0-fast-vip": {
@@ -148,13 +149,13 @@ VIDEO_MODEL_PRESETS = {
         "modes": ["全能参考", "首尾帧", "智能多帧"],
         "default_duration": 10,
     },
-    "seedance-2.0": {
-        "display_name": "Seedance 2.0",
+    "seedance-2.0-mini": {
+        "display_name": "Seedance 2.0 Mini",
         "modes": ["全能参考", "首尾帧", "智能多帧"],
         "default_duration": 10,
     },
-    "seedance-1.5-pro": {
-        "display_name": "Seedance 1.5 Pro",
+    "seedance-2.0": {
+        "display_name": "Seedance 2.0",
         "modes": ["全能参考", "首尾帧", "智能多帧"],
         "default_duration": 10,
     },
@@ -254,16 +255,6 @@ VIDEO_MODEL_PRESETS = {
     },
 }
 
-# 语音模型预置配置
-AUDIO_MODEL_PRESETS = {
-    "tts-1": {
-        "display_name": "OpenAI TTS 1",
-    },
-    "ep-voice-endpoint": {
-        "display_name": "火山方舟语音接入点",
-    },
-}
-
 
 def get_model_presets(config_type: str = "llm"):
     """获取指定类型的预置模型配置"""
@@ -273,8 +264,6 @@ def get_model_presets(config_type: str = "llm"):
         presets = IMAGE_MODEL_PRESETS
     elif config_type == "video":
         presets = VIDEO_MODEL_PRESETS
-    elif config_type == "audio":
-        presets = AUDIO_MODEL_PRESETS
     else:
         presets = LLM_MODEL_PRESETS
     
@@ -293,7 +282,6 @@ def get_all_presets():
         "llm": get_model_presets("llm"),
         "image": get_model_presets("image"),
         "video": get_model_presets("video"),
-        "audio": get_model_presets("audio"),
     }
 
 
@@ -305,8 +293,6 @@ def get_model_preset(model_id: str, config_type: str = "llm"):
         preset = IMAGE_MODEL_PRESETS.get(model_id)
     elif config_type == "video":
         preset = VIDEO_MODEL_PRESETS.get(model_id)
-    elif config_type == "audio":
-        preset = AUDIO_MODEL_PRESETS.get(model_id)
     else:
         preset = None
 
@@ -394,7 +380,7 @@ LOCAL_PROVIDER_PRESETS = [
             {"id": "deepseek-v4-pro", "name": "DeepSeek V4 Pro(推理增强,推荐)", "recommended": True,
              "max_tokens": 32768, "context_window": 131072},
             {"id": "deepseek-v4-flash", "name": "DeepSeek V4 Flash(快速非推理)",
-             "max_tokens": 16384, "context_window": 131072},
+             "max_tokens": 65536, "context_window": 131072},
             {"id": "deepseek-chat", "name": "DeepSeek Chat (旧版,2026-07 弃用)",
              "max_tokens": 8192, "context_window": 65536},
             {"id": "deepseek-reasoner", "name": "DeepSeek Reasoner (旧版,2026-07 弃用)",
@@ -603,6 +589,7 @@ async def sync_preset_llm_configs():
     失败时降级到 LOCAL_PROVIDER_PRESETS(离线 fallback)。
     """
     import asyncio, json as _json, os
+    from services.offline_guard import cloud_enabled
     import aiohttp
     import logging
     from database.db import get_db
@@ -613,7 +600,10 @@ async def sync_preset_llm_configs():
 
     remote_presets = None
     is_from_admin = False  # 标记:数据是否真实来自 admin-server(可信时才允许清理本地过期记录)
-    try:
+    if not cloud_enabled():
+        logger.info("离线迁移版跳过生产厂商预设同步")
+    else:
+      try:
         async with aiohttp.ClientSession(connector=get_aiohttp_connector()) as session:
             async with session.get(
                 f"{ADMIN_SERVER}/api/llm-config-presets",
@@ -625,7 +615,7 @@ async def sync_preset_llm_configs():
                     is_from_admin = True
                 else:
                     logger.warning(f"同步预置配置失败:HTTP {resp.status}")
-    except Exception as e:
+      except Exception as e:
         logger.warning(f"同步预置配置失败,降级到本地 fallback: {e}")
 
     # 降级:admin-server 不可达时用本地 fallback(不会清理本地)

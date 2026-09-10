@@ -8,10 +8,11 @@ Provider 类型:
 - cool: Cool API 中转 (mjapi.cc.cd) — Seedance 2 系列,文件走 multipart 上传 → URL
 - xinglian: 星链云 (vjimeng.vip) — SD2 系列,文件走 base64 data URL 直接进 payload
 - pippit_cli: 小云雀 CLI (pippit-tool-cli),Access Key 由 CLI 自己管理
+- minimax_h3: MiniMax H3 V2 API,多模态参考图/音频走 content 数组
 
 入口:
     from services.video_providers import get_provider
-    provider = get_provider("jimeng" or "volcengine_ark" or "cool" or "xinglian" or "pippit_cli", config_dict)
+    provider = get_provider("jimeng" or "volcengine_ark" or "cool" or "xinglian" or "pippit_cli" or "minimax_h3", config_dict)
     result = await provider.submit(...)
 """
 from .base import VideoProviderBase, ProviderType, SubmitResult, QueryResult
@@ -32,6 +33,16 @@ def get_provider(provider_type: str, config: dict = None):
     name = (cfg.get("name") or "").lower()
 
     # ---------- 强匹配 ----------
+    # New API / OpenAI-compatible relay must precede MiniMax matching: its
+    # configured model name also contains "minimax", but its request protocol
+    # is /v1/video/generations rather than MiniMax native V2.
+    if pt in ("newapi", "new_api", "openai_video", "taihang") or "newapi" in pt or "taihang" in pt:
+        from .newapi import NewApiVideoProvider
+        return NewApiVideoProvider(cfg)
+    # MiniMax H3
+    if pt in ("minimax", "minimax_h3", "hailuo_h3") or "minimax" in pt or "hailuo" in pt:
+        from .minimax_h3 import MiniMaxH3Provider
+        return MiniMaxH3Provider(cfg)
     # Cool
     if pt in ("cool", "mjapi") or "cool" in pt or "mjapi" in pt:
         from .cool import CoolVideoProvider
@@ -50,6 +61,10 @@ def get_provider(provider_type: str, config: dict = None):
         return VolcengineArkProvider(cfg)
 
     # ---------- 弱匹配 ----------
+    if "api.minimaxi.com" in bu or "minimaxi.com" in bu or "minimax" in name or mn == "minimax-h3":
+        from .minimax_h3 import MiniMaxH3Provider
+        return MiniMaxH3Provider(cfg)
+
     # Cool 优先(base_url 决定性,防 model="seedance_2" 误归 ARK)
     if "mjapi.cc.cd" in bu or "mjapi" in bu or "cool" in name:
         from .cool import CoolVideoProvider
@@ -63,6 +78,10 @@ def get_provider(provider_type: str, config: dict = None):
     if "pippit" in bu or "pippit" in name or "小云雀" in name:
         from .pippit import PippitCliProvider
         return PippitCliProvider(cfg)
+
+    if "120.209.70.196" in bu or "newapi" in bu:
+        from .newapi import NewApiVideoProvider
+        return NewApiVideoProvider(cfg)
 
     # ARK — model_name 用全名 "doubao-seedance" 而不是 "seedance"(防误伤 cool 的 seedance_2 / seedance_2_fast)
     if (

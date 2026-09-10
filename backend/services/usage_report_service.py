@@ -28,9 +28,11 @@ _LLM_TASK_TYPES = {
     "novel_outline",
     "extraction",
     "grid_image_prompt",
+    "topview_dispatch_infer",
+    "style_reference_analysis",
 }
 
-_IMAGE_TASK_TYPES = {"image_generation", "fusion_image"}
+_IMAGE_TASK_TYPES = {"image_generation", "fusion_image", "topview_dispatch"}
 
 
 def _safe_json_loads(value: Any) -> Optional[Dict[str, Any]]:

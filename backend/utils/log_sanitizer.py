@@ -19,6 +19,17 @@ from typing import Any
 _LOG_DEBUG_MODE_CACHE: dict = {"checked_at": 0.0, "value": None}
 
 
+def should_preserve_full_input_prompt(task_type: Any) -> bool:
+    """Return whether a task's logged input is user-visible operational data.
+
+    Prompt templates for text and storyboard generation must remain redacted in
+    logs.  Video submission is the deliberate exception: users need to inspect
+    the final parameters actually sent to the selected video provider.  Image
+    data is still removed by ``LogService`` before this decision is applied.
+    """
+    return str(task_type or "").strip().lower() == "video_generation"
+
+
 def _is_log_debug_mode() -> bool:
     """是否开启调试日志模式(开启则 prompt 不脱敏)
 

@@ -4,11 +4,36 @@
 逻辑零变化,确保现有用户无感升级。
 """
 import logging
+import os
 from typing import Optional, List, Dict, Any
 
 from .base import VideoProviderBase, ProviderType, SubmitResult, QueryResult
+from services.jimeng_black_video import (
+    BLACK_VIDEO_DURATION_SECONDS,
+    is_jimeng_black_reference_video,
+    prepare_jimeng_reference_videos,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _probe_local_media_durations(paths: List[str]) -> List[float]:
+    """Probe known local media durations; unknown/remote paths are left to CLI."""
+    from api.extraction import _probe_audio_duration_seconds
+    from utils.paths import resolve_db_path
+
+    durations: List[float] = []
+    for raw_path in paths or []:
+        if is_jimeng_black_reference_video(raw_path):
+            durations.append(BLACK_VIDEO_DURATION_SECONDS)
+            continue
+        path = resolve_db_path(raw_path)
+        if not path or not os.path.exists(path):
+            continue
+        duration = _probe_audio_duration_seconds(path)
+        if duration is not None:
+            durations.append(float(duration))
+    return durations
 
 
 def _ensure_jpg_if_large(path: str, threshold: int = 8 * 1024 * 1024, quality: int = 95) -> str:
@@ -75,25 +100,151 @@ class JimengCliProvider(VideoProviderBase):
         params = params or {}
         # v3.61.200:>8M 的图先只转 jpg(保分辨率),避免 CLI 传大图慢/失败
         images = [_ensure_jpg_if_large(p) for p in (images or [])]
+        raw_videos = params.get("videos") or params.get("reference_videos") or []
+        videos = [raw_videos] if isinstance(raw_videos, str) else list(raw_videos or [])
         audios = audios or []
         vs = VideoService()
 
         duration = int(params.get("duration", 10))
         ratio = params.get("ratio", "16:9")
         resolution = params.get("resolution", "720P")
-        model_version = params.get("model_version", "seedance2.0fast")
+        requested_model = params.get("model_version") or params.get("model") or "seedance2.0fast"
         generation_mode = params.get("generation_mode", "text2video")
+        from services.video_model_capabilities import (
+            canonical_video_model_name,
+            get_video_model_capabilities,
+            reference_audio_duration_error,
+            reference_video_duration_error,
+        )
+        model_version = canonical_video_model_name(requested_model, "jimeng")
+        capabilities = get_video_model_capabilities(model_version, "jimeng")
+        if not capabilities["video_generation_available"]:
+            return SubmitResult(
+                success=False,
+                fail_reason=f"即梦 CLI 暂未开放 {capabilities['label']} 视频生成",
+                error_code="INVALID_PARAM",
+            )
+        max_images = int(capabilities["max_images"])
+        max_videos = int(capabilities["max_videos"])
+        max_audios = int(capabilities["max_audios"])
+        max_total = int(capabilities["max_total_materials"])
+
+        min_duration = int(capabilities.get("min_duration_seconds") or 4)
+        max_duration = int(capabilities["max_duration_seconds"])
+        if duration < min_duration or duration > max_duration:
+            return SubmitResult(
+                success=False,
+                fail_reason=(
+                    f"{capabilities['label']} 生成时长需为 "
+                    f"{min_duration}-{max_duration} 秒，当前 {duration} 秒"
+                ),
+                error_code="INVALID_PARAM",
+            )
+
+        resolution_key = str(resolution or "720p").strip().lower()
+        allowed_resolutions = (
+            ("480p", "720p")
+            if capabilities["family"] == "seedance_2_5"
+            else (("720p", "1080p", "4k") if model_version == "seedance2.0_vip" else ("720p",))
+        )
+        if resolution_key not in allowed_resolutions:
+            return SubmitResult(
+                success=False,
+                fail_reason=(
+                    f"即梦 {model_version} 不支持 {resolution}，"
+                    f"可选: {', '.join(allowed_resolutions)}"
+                ),
+                error_code="INVALID_PARAM",
+            )
+
+        try:
+            videos = await prepare_jimeng_reference_videos(
+                videos,
+                params.get("include_black_video", False),
+                ratio,
+            )
+        except Exception as exc:
+            return SubmitResult(
+                success=False,
+                fail_reason=str(exc),
+                error_code="INVALID_PARAM",
+            )
+
+        material_counts = (len(images), len(videos), len(audios))
+        if material_counts[0] > max_images or material_counts[1] > max_videos or material_counts[2] > max_audios:
+            return SubmitResult(
+                success=False,
+                fail_reason=(
+                    f"{capabilities['label']} 素材超限: 图片 {len(images)}/{max_images}，"
+                    f"视频 {len(videos)}/{max_videos}，音频 {len(audios)}/{max_audios}"
+                ),
+                error_code="INVALID_PARAM",
+            )
+        if sum(material_counts) > max_total:
+            return SubmitResult(
+                success=False,
+                fail_reason=(
+                    f"{capabilities['label']} 所有参考素材合计最多 {max_total} 个，"
+                    f"当前 {sum(material_counts)} 个"
+                ),
+                error_code="INVALID_PARAM",
+            )
+
+        audio_duration_error = reference_audio_duration_error(
+            model_version,
+            _probe_local_media_durations(audios),
+        )
+        if audio_duration_error:
+            return SubmitResult(
+                success=False,
+                fail_reason=audio_duration_error,
+                error_code="INVALID_PARAM",
+            )
+        video_duration_error = reference_video_duration_error(
+            model_version,
+            _probe_local_media_durations(videos),
+        )
+        if video_duration_error:
+            return SubmitResult(
+                success=False,
+                fail_reason=video_duration_error,
+                error_code="INVALID_PARAM",
+            )
+        if audios and not images and not videos and not capabilities.get("audio_only_multimodal"):
+            return SubmitResult(
+                success=False,
+                fail_reason=f"{capabilities['label']} 全能参考至少需要 1 张图片或 1 段视频",
+                error_code="INVALID_PARAM",
+            )
 
         try:
             # 路由到具体接口
-            if generation_mode == "multimodal2video" or (images and len(images) > 1) or audios:
-                # 多模态:多图 + 音频
+            if generation_mode == "frames2video":
+                if len(images) < 2:
+                    return SubmitResult(
+                        success=False,
+                        fail_reason="首尾帧模式需要按顺序提供首帧和尾帧两张图",
+                        error_code="INVALID_PARAM",
+                    )
+                result = await vs.frames2video(
+                    first=images[0],
+                    last=images[1],
+                    prompt=prompt,
+                    duration=duration,
+                    resolution=resolution_key,
+                    model_version=model_version,
+                    poll=0,
+                )
+            elif generation_mode == "multimodal2video" or (images and len(images) > 1) or videos or audios:
+                # 多模态:图片 + 视频 + 音频
                 result = await vs.multimodal2video(
                     prompt=prompt,
-                    images=images[:9],
-                    audios=audios[:3],
+                    images=images,
+                    videos=videos,
+                    audios=audios,
                     duration=duration,
                     ratio=ratio,
+                    resolution=resolution,
                     model_version=model_version,
                     poll=0,
                 )
@@ -103,6 +254,7 @@ class JimengCliProvider(VideoProviderBase):
                     image=images[0],
                     prompt=prompt,
                     duration=duration,
+                    resolution=resolution_key,
                     model_version=model_version,
                     poll=0,
                 )
@@ -119,10 +271,12 @@ class JimengCliProvider(VideoProviderBase):
 
             if not result.get("success"):
                 # 子进程级失败(超时 / 启动失败等)
+                raw_error = str(result.get("error") or result.get("message") or "提交失败")
+                from api.video import _translate_jimeng_fail_reason
                 return SubmitResult(
                     success=False,
-                    fail_reason=str(result.get("error") or result.get("message") or "提交失败"),
-                    error_code="UNKNOWN",
+                    fail_reason=_translate_jimeng_fail_reason(raw_error),
+                    error_code=self._classify_jimeng_error(raw_error),
                     raw=result,
                 )
 
@@ -197,12 +351,19 @@ class JimengCliProvider(VideoProviderBase):
             duration = float(data.get("duration") or 0)
 
             # 即梦不返回 last_frame_url(我们自己 ffmpeg 抽)
+            fail_reason = None
+            if status == "fail":
+                raw_fail_reason = data.get("fail_reason") or data.get("error") or "生成失败"
+                guidance = data.get("guidance", "")
+                from api.video import _translate_jimeng_fail_reason
+                fail_reason = _translate_jimeng_fail_reason(raw_fail_reason, guidance)
+
             return QueryResult(
                 status=status,
                 video_url=video_url,
                 last_frame_url=None,
                 duration=duration,
-                fail_reason=data.get("fail_reason") if status == "fail" else None,
+                fail_reason=fail_reason,
                 raw=data,
             )
         except Exception as e:
@@ -215,21 +376,23 @@ class JimengCliProvider(VideoProviderBase):
         return False
 
     async def list_active(self) -> List[Dict[str, Any]]:
-        """列出 processing 状态的任务"""
+        """列出即梦仍活跃的任务"""
         from services.video_service import VideoService
+        from api.video import _extract_task_list, _is_jimeng_active_task_entry
         vs = VideoService()
         try:
-            res = await vs.list_tasks(status="processing")
+            res = await vs.list_tasks(limit=50)
             if not res.get("success"):
                 return []
-            tasks = (res.get("data") or {}).get("tasks") or []
+            tasks = _extract_task_list(res.get("data"))
             return [
                 {
                     "submit_id": t.get("submit_id") or t.get("id"),
-                    "status": (t.get("status") or "").lower(),
+                    "status": (t.get("gen_status") or t.get("status") or "").lower(),
                     "created_at": t.get("create_time") or t.get("created_at"),
                 }
-                for t in tasks if isinstance(t, dict)
+                for t in tasks
+                if isinstance(t, dict) and _is_jimeng_active_task_entry(t)
             ]
         except Exception as e:
             logger.warning(f"[jimeng-provider] list_active 失败: {e}")
@@ -249,11 +412,15 @@ class JimengCliProvider(VideoProviderBase):
     def _classify_jimeng_error(text: str) -> str:
         t = (text or "").lower()
         raw = text or ""
+        if "dreamina_cli" in t and (
+            "not allowed" in t or "permission denied" in t or "没有权限" in raw
+        ):
+            return "AUTH"
         if "1310" in raw or "exceedconcurrencylimit" in t or "concurrency" in t or "并发" in raw:
             return "CONCURRENCY"
         if "余额" in raw or "insufficient" in t or "balance" in t:
             return "BALANCE"
-        if "审核" in raw or "敏感" in raw or "rejected" in t or "compliance" in t:
+        if "审核" in raw or "敏感" in raw or "rejected" in t or "compliance" in t or "post-tns" in t or "tns check" in t:
             return "REVIEW"
         if "timeout" in t or "超时" in raw:
             return "TIMEOUT"

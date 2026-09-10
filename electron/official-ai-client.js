@@ -19,8 +19,14 @@ function mapError(error) {
   const status = Number(error && error.status) || 0;
   const data = error && error.data && typeof error.data === "object" ? error.data : {};
   const rawCode = String(data.code || data.error || data.reason || error && error.code || "").toLowerCase();
+  // Retain only protocol metadata for the main-process diagnostic path.  The
+  // response body (which can contain provider details) is never exposed to IPC.
+  const withRemoteCode = (mapped) => {
+    mapped.remoteCode = rawCode || undefined;
+    return mapped;
+  };
   if (rawCode === "ai_credits_insufficient") {
-    return makeError("credits_insufficient", "积分不足", status);
+    return withRemoteCode(makeError("credits_insufficient", "积分不足", status));
   }
   if (rawCode === "ai_product_not_entitled") {
     return makeError("membership_required", "未开通漫剧虾会员", status);
@@ -29,7 +35,7 @@ function mapError(error) {
     return makeError("official_not_configured", "官方算力暂未开放", status);
   }
   if (rawCode.startsWith("ai_upstream_") || rawCode.startsWith("ai_image_")) {
-    return makeError("image_generation_failed", "图片生成失败，积分将自动退回", status);
+    return withRemoteCode(makeError("image_generation_failed", "图片生成失败，积分将自动退回", status));
   }
   if (status === 401 || status === 403 || status === 410 || /entitlement|membership|unauthori|forbidden|expired|disabled/.test(rawCode)) {
     return makeError("membership_required", "请先开通漫剧虾会员", status);
@@ -43,7 +49,7 @@ function mapError(error) {
   if (status >= 500 || /upstream|provider|gateway|temporar|unavailable/.test(rawCode)) {
     return makeError("upstream_unavailable", "官方算力暂时不可用，请稍后再试", status);
   }
-  return makeError("official_request_failed", "官方算力请求失败，请稍后重试", status);
+  return withRemoteCode(makeError("official_request_failed", "官方算力请求失败，请稍后重试", status));
 }
 
 function sanitizeValue(value, depth = 0) {
@@ -68,12 +74,16 @@ function extractCatalogItems(data) {
   const candidates = [
     data.catalog,
     data.items,
+    data.tasks,
     data.data && data.data.catalog,
     data.data && data.data.items,
+    data.data && data.data.tasks,
     data.official_ai && data.official_ai.catalog,
     data.official_ai && data.official_ai.items,
+    data.official_ai && data.official_ai.tasks,
     data.data && data.data.official_ai && data.data.official_ai.catalog,
-    data.data && data.data.official_ai && data.data.official_ai.items
+    data.data && data.data.official_ai && data.data.official_ai.items,
+    data.data && data.data.official_ai && data.data.official_ai.tasks
   ];
   return candidates.find(Array.isArray) || [];
 }
@@ -83,8 +93,12 @@ function isEligibleCatalogItem(entry) {
     entry &&
     typeof entry.task_type === "string" &&
     entry.task_type.trim() &&
-    entry.enabled === true &&
-    entry.available === true
+    // Older releases of the self-hosted account service did not include
+    // these two presentation fields in `/ai/catalog`.  Missing means the
+    // server has supplied a catalog entry; only an explicit false disables
+    // it.  Job creation still performs a fresh catalog check server-side.
+    entry.enabled !== false &&
+    entry.available !== false
   );
 }
 
@@ -194,6 +208,57 @@ class OfficialAiClient {
       return sanitizeValue(await this._request(`/api/v1/ai/jobs/${encodeURIComponent(id)}`));
     } catch (error) {
       return { ok: false, code: error.code || "official_request_failed", message: error.message };
+    }
+  }
+
+  // Video has a separate payload because it carries only server-issued,
+  // short-lived asset URLs.  In particular, this API deliberately has no
+  // api_key, base_url, model or provider override fields.
+  async createVideoJob(payload) {
+    const access = await this._access();
+    if (!access.allowed) return { ok: false, code: access.code || "membership_required", message: access.message || "请先开通漫剧虾会员" };
+    const value = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : null;
+    if (!value) return { ok: false, code: "video_request_invalid", message: "官方视频任务参数无效" };
+    try {
+      return sanitizeValue(await this._request("/api/v1/ai/video/jobs", {
+        method: "POST",
+        body: { product_id: OFFICIAL_AI_PRODUCT_ID, ...value }
+      }));
+    } catch (error) {
+      return { ok: false, code: error.code || "official_request_failed", message: error.message };
+    }
+  }
+
+  async getVideoJob(jobId) {
+    const access = await this._access();
+    if (!access.allowed) return { ok: false, code: access.code || "membership_required", message: access.message || "请先开通漫剧虾会员" };
+    const id = String(jobId || "").trim();
+    if (!/^[A-Za-z0-9_-]{1,160}$/.test(id)) return { ok: false, code: "invalid_job_id", message: "任务标识无效" };
+    try {
+      return sanitizeValue(await this._request(`/api/v1/ai/video/jobs/${encodeURIComponent(id)}`));
+    } catch (error) {
+      return { ok: false, code: error.code || "official_request_failed", message: error.message };
+    }
+  }
+
+  async createVideoAssetUploadPolicy(asset) {
+    const value = asset && typeof asset === "object" ? asset : {};
+    const kind = String(value.kind || "").trim().toLowerCase();
+    const mimeType = String(value.mime_type || value.mimeType || "").trim().toLowerCase();
+    const sizeBytes = Number(value.size_bytes ?? value.sizeBytes);
+    if (!['image', 'audio', 'video'].includes(kind)) {
+      return { ok: false, code: "video_input_kind_invalid", message: "素材类型无效" };
+    }
+    if (!mimeType || !Number.isSafeInteger(sizeBytes) || sizeBytes < 1) {
+      return { ok: false, code: "video_input_metadata_invalid", message: "素材格式或大小无效" };
+    }
+    try {
+      return sanitizeValue(await this._request("/api/v1/ai/video-assets/upload-policy", {
+        method: "POST",
+        body: { kind, mime_type: mimeType, size_bytes: sizeBytes }
+      }));
+    } catch (error) {
+      return { ok: false, code: error.code || "video_input_policy_failed", message: error.message };
     }
   }
 }

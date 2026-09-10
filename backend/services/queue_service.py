@@ -181,8 +181,8 @@ async def enqueue_batch(
     db = await get_db()
     try:
         params_json = json.dumps(params) if params else None
-        # Serialize enqueue writes so two fast clicks cannot interleave and leave
-        # duplicate active rows for the same storyboard.
+        # 让同一轮批量入队在 DB 写锁内完成。真正的防重复仍依赖
+        # idx_queue_active_storyboard_unique；这里减少并发请求交叠窗口。
         await db.execute("BEGIN IMMEDIATE")
 
         for sb_id in storyboard_ids:
@@ -204,8 +204,8 @@ async def enqueue_batch(
             now_str = now_beijing_str()
 
             # v3.61.296: 活跃态幂等必须先查 queued/generating,不能只查最新历史行。
-            # 否则“旧一点还有 queued,最新一条是 done/failed”的脏状态会被误复用,
-            # 最终留下同一个 storyboard 两条活跃队列行。
+            # 否则“最新一条是 done/failed,旧一点还有 queued/generating”的脏状态,
+            # 或两个入队请求交叠,都可能让同一 storyboard 留下两条活跃队列行。
             cur = await db.execute(
                 "SELECT id, status, label, provider FROM video_task_queue "
                 "WHERE storyboard_id = ? AND status IN ('queued','generating') "
@@ -216,6 +216,7 @@ async def enqueue_batch(
 
             if active:
                 active_provider = (active["provider"] if "provider" in active.keys() else None) or "jimeng"
+                # 同渠道活跃任务:直接幂等跳过。
                 if active_provider == provider:
                     skipped.append({
                         "storyboard_id": sb_id,
@@ -224,6 +225,7 @@ async def enqueue_batch(
                         "label": active["label"],
                     })
                     continue
+                # 换渠道时,正在 generating 的不抢占；queued 可以原地改渠道。
                 if active["status"] == STATUS_GENERATING:
                     skipped.append({
                         "storyboard_id": sb_id,
@@ -338,6 +340,8 @@ async def enqueue_batch(
                     )
                     qid = cur.lastrowid
             except sqlite3.IntegrityError:
+                # 另一个入队请求刚刚创建/激活了同 storyboard 的 queued/generating 行。
+                # 按幂等处理,不要让前端看到 500,更不要再创建第二条。
                 cur = await db.execute(
                     "SELECT id, status, label FROM video_task_queue "
                     "WHERE storyboard_id = ? AND status IN ('queued','generating') "
@@ -465,8 +469,28 @@ async def get_active_by_storyboard(storyboard_id: int) -> Optional[Dict[str, Any
         cur = await db.execute(
             "SELECT * FROM video_task_queue "
             "WHERE storyboard_id = ? AND status IN ('queued','generating') "
-            "ORDER BY id DESC LIMIT 1",
+            "ORDER BY CASE WHEN status='generating' THEN 0 ELSE 1 END, id DESC LIMIT 1",
             (storyboard_id,),
+        )
+        row = await cur.fetchone()
+        return _row_to_dict(row) if row else None
+    finally:
+        await db.close()
+
+
+async def get_other_active_by_storyboard(storyboard_id: int, item_id: int) -> Optional[Dict[str, Any]]:
+    """查同一 storyboard 是否还有其它活跃队列项。
+
+    正常情况下 idx_queue_active_storyboard_unique 会保证不存在；这里作为
+    worker 提交前的保险,防止历史脏数据或索引创建失败时重复提交到 CLI。
+    """
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "SELECT * FROM video_task_queue "
+            "WHERE storyboard_id = ? AND id != ? AND status IN ('queued','generating') "
+            "ORDER BY CASE WHEN status='generating' THEN 0 ELSE 1 END, id DESC LIMIT 1",
+            (storyboard_id, item_id),
         )
         row = await cur.fetchone()
         return _row_to_dict(row) if row else None
@@ -506,6 +530,99 @@ async def mark_generating(item_id: int, jimeng_task_id: Optional[str] = None) ->
         )
         await db.commit()
         return (cur.rowcount or 0) > 0
+    finally:
+        await db.close()
+
+
+async def claim_storyboard_for_queue_submit(
+    item_id: int,
+    storyboard_id: int,
+    provider: str = "jimeng",
+    video_config_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Atomically claim a storyboard for a queue worker before external submit.
+
+    The queue row idempotency prevents duplicate queue rows, but direct submit
+    paths also operate on storyboards. Claiming the storyboard here closes the
+    gap where a queued item and a direct submit can both reach the upstream.
+    """
+    now_str = now_beijing_str()
+    db = await get_db()
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+
+        cur_q = await db.execute(
+            "SELECT id FROM video_task_queue "
+            "WHERE id = ? AND storyboard_id = ? AND status = 'generating'",
+            (item_id, storyboard_id),
+        )
+        if not await cur_q.fetchone():
+            await db.rollback()
+            return {"claimed": False, "reason": "queue_not_generating"}
+
+        cur_sb = await db.execute(
+            """SELECT video_status, submit_id, video_submit_time, video_provider,
+                   CASE
+                     WHEN video_status = 'generating'
+                      AND video_submit_time IS NOT NULL
+                      AND datetime(replace(video_submit_time, ' ', 'T'))
+                          > datetime(replace(?, ' ', 'T'), '-30 minutes')
+                     THEN 1 ELSE 0
+                   END AS recent_generating
+               FROM storyboards WHERE id = ?""",
+            (now_str, storyboard_id),
+        )
+        row = await cur_sb.fetchone()
+        if not row:
+            await db.rollback()
+            return {"claimed": False, "not_found": True}
+
+        current_status = (row["video_status"] or "").lower()
+        existing_submit_id = (row["submit_id"] or "").strip()
+        if existing_submit_id:
+            await db.rollback()
+            return {
+                "claimed": False,
+                "existing_submit_id": existing_submit_id,
+                "current_status": current_status,
+                "reason": "existing_submit_id",
+            }
+
+        if current_status == "generating" and int(row["recent_generating"] or 0):
+            await db.rollback()
+            return {
+                "claimed": False,
+                "current_status": current_status,
+                "reason": "recent_generating_claim",
+            }
+
+        if current_status in ("done", "download_failed", "failed", "chain_aborted"):
+            await db.rollback()
+            return {
+                "claimed": False,
+                "current_status": current_status,
+                "reason": "terminal_status",
+            }
+
+        await db.execute(
+            """UPDATE storyboards
+               SET video_status = 'generating',
+                   submit_id = '',
+                   video_url = NULL,
+                   last_frame_path = NULL,
+                   last_frame_orig_path = NULL,
+                   video_fail_reason = NULL,
+                   video_submit_time = ?,
+                   video_provider = ?,
+                   video_config_id = ?
+               WHERE id = ?""",
+            (now_str, provider, video_config_id, storyboard_id),
+        )
+        await db.commit()
+        return {"claimed": True}
+    except Exception:
+        await db.rollback()
+        raise
     finally:
         await db.close()
 
@@ -645,7 +762,7 @@ async def mark_failed(
         await db.close()
 
 
-async def mark_aborted(item_id: int, reason: str = "用户中断") -> bool:
+async def mark_aborted(item_id: int, reason: str = "用户中断", reset_storyboard: bool = True) -> bool:
     """queued/generating → aborted
 
     aborted 时也要把 storyboard 的 video_status 回退到 pending(等待中)
@@ -675,12 +792,13 @@ async def mark_aborted(item_id: int, reason: str = "用户中断") -> bool:
             WHERE id = ?""",
             (now_beijing_str(), reason, item_id),
         )
-        # 回写 storyboard:从 queued 来的回 pending,从 generating 来的标 chain_aborted
-        new_sb_status = "pending" if old_status == STATUS_QUEUED else "chain_aborted"
-        await db.execute(
-            "UPDATE storyboards SET video_status = ? WHERE id = ?",
-            (new_sb_status, sb_id),
-        )
+        if reset_storyboard:
+            # 回写 storyboard:从 queued 来的回 pending,从 generating 来的标 chain_aborted
+            new_sb_status = "pending" if old_status == STATUS_QUEUED else "chain_aborted"
+            await db.execute(
+                "UPDATE storyboards SET video_status = ? WHERE id = ?",
+                (new_sb_status, sb_id),
+            )
         await db.commit()
         return True
     finally:
@@ -691,6 +809,21 @@ async def increment_retry(item_id: int) -> int:
     """重试: 把 failed 项重新入队 + retry_count+1"""
     db = await get_db()
     try:
+        cur0 = await db.execute(
+            "SELECT storyboard_id FROM video_task_queue WHERE id = ?",
+            (item_id,),
+        )
+        row0 = await cur0.fetchone()
+        if not row0:
+            return -1
+        cur_active = await db.execute(
+            "SELECT id FROM video_task_queue "
+            "WHERE storyboard_id = ? AND id != ? AND status IN ('queued','generating') "
+            "ORDER BY CASE WHEN status='generating' THEN 0 ELSE 1 END, id DESC LIMIT 1",
+            (row0["storyboard_id"], item_id),
+        )
+        if await cur_active.fetchone():
+            return -2
         cur = await db.execute(
             """UPDATE video_task_queue
             SET status = 'queued',
@@ -709,6 +842,9 @@ async def increment_retry(item_id: int) -> int:
         if not row:
             return -1
         return int(row["retry_count"])
+    except sqlite3.IntegrityError:
+        await db.rollback()
+        return -2
     finally:
         await db.close()
 

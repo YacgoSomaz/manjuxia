@@ -43,7 +43,14 @@ async def get_rules(rule_name: str) -> Optional[List[Dict[str, Any]]]:
 
     # 从 admin 拉取
     try:
-        content = await _fetch_content_from_admin(rule_name, 'parser_rule')
+        fetched = await _fetch_content_from_admin(rule_name, 'parser_rule')
+        # template_service returns (admin_template_id, content). Keep a small
+        # compatibility branch for tests or older implementations that return
+        # content directly.
+        if isinstance(fetched, tuple):
+            _template_id, content = fetched
+        else:
+            content = fetched
     except Exception as e:
         logger.warning(f"[parser_rule] 拉取 {rule_name} 失败: {e}")
         # 写入缓存防止频繁重试
@@ -66,7 +73,14 @@ async def get_rules(rule_name: str) -> Optional[List[Dict[str, Any]]]:
 
         # 过滤 enabled=True, 按 priority 升序
         rules = [r for r in raw_rules if isinstance(r, dict) and r.get('enabled', True)]
-        rules.sort(key=lambda r: r.get('priority', 100))
+
+        def _priority(rule: Dict[str, Any]) -> int:
+            try:
+                return int(rule.get('priority', 100))
+            except (TypeError, ValueError):
+                return 100
+
+        rules.sort(key=_priority)
 
         logger.info(
             f"[parser_rule] 已拉取 {rule_name}: {len(rules)} 条规则 "
@@ -74,7 +88,7 @@ async def get_rules(rule_name: str) -> Optional[List[Dict[str, Any]]]:
         )
         _CACHE[rule_name] = (time.time(), rules)
         return rules
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
         logger.warning(f"[parser_rule] {rule_name} JSON 解析失败: {e}")
         _CACHE[rule_name] = (time.time(), None)
         return None

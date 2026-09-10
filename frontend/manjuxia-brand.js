@@ -286,10 +286,26 @@
       event.preventDefault();
       event.stopImmediatePropagation();
       if (!window.confirm("确认退出当前手机号账号吗？下次使用时需重新获取验证码登录。")) return;
-      const account = window.electronAPI && window.electronAPI.account;
-      if (account && typeof account.logout === "function") await account.logout();
-      else if (window.electronAPI && window.electronAPI.license && typeof window.electronAPI.license.logout === "function") await window.electronAPI.license.logout();
-      location.hash = "#/activation";
+      const originalText = target.textContent;
+      target.disabled = true;
+      target.textContent = "正在退出...";
+      try {
+        const account = window.electronAPI && window.electronAPI.account;
+        let result = null;
+        if (account && typeof account.logout === "function") result = await account.logout();
+        else if (window.electronAPI && window.electronAPI.license && typeof window.electronAPI.license.logout === "function") result = await window.electronAPI.license.logout();
+        else throw new Error("退出登录接口未启用");
+        if (result && result.success === false) throw new Error(result.message || "退出登录失败");
+        window.__manjuxiaAccountInfo = null;
+        const footer = document.querySelector(".manjuxia-account-footer");
+        if (footer) footer.remove();
+        location.hash = "#/activation";
+        setTimeout(() => location.reload(), 120);
+      } catch (error) {
+        target.disabled = false;
+        target.textContent = originalText;
+        window.alert(error instanceof Error ? error.message : "退出登录失败，请重试");
+      }
     }, true);
   }
 
@@ -697,10 +713,13 @@
     void syncFooterVersion();
     ensureAccountFooter();
     installAccountLogoutGuard();
-    installMemberButtonGate();
-    patchLegacyLogoutDialog();
-    renderAccountLoginPanel();
-    suppressStartupLoadFailureToasts();
+    // The bundled app signs requests with the session secret it read during
+    // its initial boot.  The backend rotates that secret on every restart;
+    // install the repair layer after the bundle has initialized so a stale
+    // renderer can transparently re-read the current secret and retry once.
+    installSessionFetchRepair();
+    // This is the GitHub sidebar/brand component only.  Authentication and
+    // official-compute behavior stay owned by the development environment.
   }
 
   function openLocalModelConfig() {
@@ -817,6 +836,11 @@
     return /bad session token|missing session token|invalid timestamp|timestamp_skew|nonce_reused/i.test(bodyText || "");
   }
 
+  function isAccountContextFailure(response, bodyText) {
+    if (!response || response.status !== 401) return false;
+    return /account_required|account_signature_expired/i.test(bodyText || "");
+  }
+
   async function waitForSessionSecret(electronAPI, timeoutMs = 10000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -831,6 +855,17 @@
       await new Promise((resolve) => setTimeout(resolve, 160));
     }
     return "";
+  }
+
+  async function resolveLocalRequestTarget(input, electronAPI) {
+    const raw = typeof input === "string" ? input : (input && typeof input.url === "string" ? input.url : String(input || ""));
+    if (!raw.startsWith("/api/")) return input;
+    try {
+      const backend = await electronAPI.getBackendUrl();
+      return new URL(raw, String(backend || "")).toString();
+    } catch (_) {
+      return input;
+    }
   }
 
   function isMembershipFailure(response, bodyText) {
@@ -978,21 +1013,43 @@
         // starting. The UI can retry normally instead of caching an empty list.
         throw new Error("本地创作引擎正在启动，请稍后重试");
       }
+      const target = await resolveLocalRequestTarget(input, electronAPI);
       const firstInit = { ...(init || {}), headers: await signedHeaders(input, init || {}, secret.toLowerCase()) };
-      const first = await nativeFetch(input, firstInit);
+      const first = await nativeFetch(target, firstInit);
       const firstText = await cloneErrorText(first);
+      // The backend keeps the verified account envelope in memory. If the
+      // Electron process refreshed the account while this renderer was open,
+      // repair that context once and replay the idempotent request instead of
+      // surfacing a misleading account_required error.
+      if (isAccountContextFailure(first, firstText) && electronAPI.account && typeof electronAPI.account.me === "function") {
+        try {
+          const refreshed = await electronAPI.account.me();
+          if (refreshed && refreshed.ok) {
+            // The local signature middleware rejects nonce reuse. Build a
+            // completely new signed request after refreshing the account
+            // context instead of replaying the original headers verbatim.
+            const retrySecret = await waitForSessionSecret(electronAPI, 3000) || secret;
+            const retryInit = { ...(init || {}), headers: await signedHeaders(input, init || {}, String(retrySecret).toLowerCase()) };
+            const retry = await nativeFetch(target, retryInit);
+            if (!isAccountContextFailure(retry, await cloneErrorText(retry))) return retry;
+          }
+        } catch (_) {}
+      }
       if (!isSessionFailure(first, firstText)) return first;
 
       const fresh = await waitForSessionSecret(electronAPI, 3000) || secret;
       const secondInit = { ...(init || {}), headers: await signedHeaders(input, init || {}, String(fresh).toLowerCase()) };
       console.warn("[manjuxia-session] 本地 session token 已刷新并重试:", pathForSignature(input));
-      const second = await nativeFetch(input, secondInit);
+      const second = await nativeFetch(target, secondInit);
       const secondText = await cloneErrorText(second);
       return second;
     };
   }
 
-  installSessionFetchRepair();
+  // Later-loaded adapters (multipart/official/local-model) finish installing
+  // their fetch hooks asynchronously.  Expose an idempotent hook so index.html
+  // can put the session repair layer outermost once the final adapter is ready.
+  window.manjuxiaInstallSessionFetchRepair = installSessionFetchRepair;
 
   window.addEventListener("DOMContentLoaded", () => {
     let scheduled = false;
@@ -1005,7 +1062,6 @@
       });
     };
     run();
-    installSessionFetchRepair();
     const observer = new MutationObserver(schedule);
     observer.observe(document.body, { childList: true, subtree: true });
   });

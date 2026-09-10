@@ -3,31 +3,62 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" href="./assets/manjuxia-app-icon.png" />
-    <meta name="theme-color" content="#ffffff" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- 千山 AI 品牌字体:Noto Serif SC(加载失败自动 fallback 本地 Source Han Serif / Songti) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@500;600;700&display=swap" rel="stylesheet" />
     <title>漫剧虾</title>
     <script>
       window.__manjuxiaNativeFetch = window.fetch.bind(window);
     </script>
-    <script src="./multipart-fetch-bridge.js"></script>
+    <script type="module" crossorigin src="./assets/index-Cga1Ymz8.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-B-9RxFvC.css">
+    <link rel="stylesheet" href="./manjuxia-light.css" disabled>
     <script src="./manjuxia-brand.js"></script>
-    <script src="./update-notice.js"></script>
-    <script src="./wanshan-route.js"></script>
-    <script defer src="./wanshan-history.js"></script>
-    <script type="module" crossorigin src="./assets/index-CHppf6so.js"></script>
-    <script src="./multipart-fetch-finalizer.js"></script>
-    <script defer src="./wanshan-local-config.js"></script>
-    <script defer src="./official-ai.js"></script>
-    <script defer src="./wanshan-novel-tags.js"></script>
-    <script defer src="./wanshan-extraction-batch.js"></script>
-    <script defer src="./wanshan-topview.js"></script>
-    <script defer src="./wanshan-voice.js"></script>
-    <script defer src="./wanshan-pippit.js"></script>
-    <script defer src="./wanshan-supplement-video.js"></script>
-    <script defer src="./wanshan-recovery-tools.js"></script>
-    <script defer src="./wanshan-image-generation-runtime.js"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index-DcZCm4BG.css">
-    <link rel="stylesheet" href="./manjuxia-light.css">
+    <style>
+      .wanshan-login-page{min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at 15% 15%,#1a4270 0,transparent 35%),radial-gradient(circle at 80% 70%,#12394c 0,transparent 33%),#070d22;color:#ecf8ff;font-family:"Microsoft YaHei",sans-serif}.wanshan-login-card{width:min(420px,calc(100vw - 40px));box-sizing:border-box;border:1px solid #2c89c8;border-radius:14px;padding:34px;background:linear-gradient(145deg,rgba(20,39,81,.96),rgba(9,19,51,.97));box-shadow:0 18px 60px rgba(0,0,0,.4)}.wanshan-login-mark{font-weight:800;color:#4ce5ef;font-size:22px;letter-spacing:2px}.wanshan-login-card h1{margin:10px 0;font-size:28px}.wanshan-login-card p{color:#aabbd3;line-height:1.65;font-size:14px}.wanshan-login-card label{display:block;margin:18px 0 0;color:#c9def5;font-size:14px}.wanshan-login-card input{width:100%;box-sizing:border-box;margin-top:8px;padding:12px;border:1px solid #3977b1;border-radius:8px;background:#0b193c;color:#fff;font-size:15px;outline:none}.wanshan-login-card input:focus{border-color:#22d9e5;box-shadow:0 0 0 3px rgba(34,217,229,.12)}.wanshan-code-row{display:flex;gap:8px}.wanshan-code-row input{min-width:0}.wanshan-login-card button{border:1px solid #429dcf;border-radius:8px;background:#173864;color:#ecf8ff;padding:10px 13px;white-space:nowrap;cursor:pointer}.wanshan-login-card button:disabled{opacity:.6;cursor:default}.wanshan-login-submit{width:100%;margin-top:18px;background:linear-gradient(90deg,#38b6f1,#18c6b7)!important;border:0!important;font-weight:700;font-size:16px}.wanshan-login-card [role=status]{min-height:20px;margin-top:12px;color:#ff9da4;font-size:13px}.wanshan-login-card [role=status][data-type=success]{color:#72e6b0}
+      /* 俯视人物调度图仍保留在后端；模型适配完成前暂不在界面开放入口。 */
+      .topview-trigger-button,.topview-batch-trigger,.topview-regenerate-trigger,
+      button[title^="按当前勾选分镜的小节顺序串行生成俯视人物调度图"],
+      .topview-dispatch-actions .el-button:first-child{display:none!important}
+    </style>
+    <script>
+      window.addEventListener("load", () => {
+        // The production bundle completes its asynchronous local-fetch setup
+        // after load.  Adapt multipart signing first, then layer official AI.
+        // Install the adapters as soon as the production bundle finishes
+        // mounting. A long delayed loader left a short window where the
+        // official selector was visible but /api/scripts/convert-single was
+        // sent to the gated loopback backend instead of the account bridge.
+        setTimeout(() => {
+          const multipart = document.createElement("script");
+          multipart.src = "./multipart-fetch-finalizer.js";
+          multipart.onload = () => {
+            // Complete every legacy/local fetch wrapper first.  Official AI
+            // must be installed last, otherwise a later repair wrapper can
+            // bypass its video interception and submit an empty prompt.
+            const localModels = document.createElement("script");
+            localModels.src = "./local-model-config-ui.js";
+            localModels.onload = () => {
+              if (typeof window.manjuxiaInstallSessionFetchRepair === "function") {
+                window.manjuxiaInstallSessionFetchRepair();
+              }
+              const official = document.createElement("script");
+              // Keep Electron's Chromium cache from retaining an older official
+              // compute interceptor after a desktop update.
+              official.src = "./official-ai.js?v=20260910-video-status-header";
+              document.head.appendChild(official);
+            };
+            document.head.appendChild(localModels);
+          };
+          document.head.appendChild(multipart);
+        }, 0);
+        const accountLogin = document.createElement("script");
+        accountLogin.src = "./account-login.js";
+        document.head.appendChild(accountLogin);
+      }, { once: true });
+    </script>
   </head>
   <body>
     <div id="app"></div>

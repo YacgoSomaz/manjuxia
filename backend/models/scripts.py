@@ -39,6 +39,8 @@ class ScriptListItem(BaseModel):
     content: str
     created_at: datetime
     chapter_title: Optional[str] = None
+    # v3.61.279:团队同步把该集剧本覆盖更新(内容变了)→ 置 1,前端据此显示"未转换",
+    #            用户重新「开始转换」后清 0。
     sync_outdated: int = 0
 
 
@@ -55,11 +57,18 @@ class ScriptUpdateRequest(BaseModel):
 
 
 class OfficialScriptResultRequest(BaseModel):
-    """由客户端官方算力任务完成后落库的剧本正文。"""
+    """剧本官方算力完成后，由本地客户端提交落库的正文。"""
     novel_id: int
     chapter_id: int
     content: str
     template_id: Optional[int] = None
+
+
+class OfficialScriptPromptRequest(BaseModel):
+    """生成官方语言算力所需、与本地转换完全一致的提示词。"""
+    novel_id: int
+    chapter_id: int
+    template_id: int
 
 
 class ScriptConvertResult(BaseModel):

@@ -8,143 +8,17 @@ from utils.ssl_helper import get_aiohttp_connector
 from database.db import get_db
 from models.templates import TemplateCreate, TemplateUpdate
 from utils.timezone import now_beijing_str
-from services.offline_guard import require_cloud
 
 logger = logging.getLogger(__name__)
 ADMIN_SERVER = "https://xiaoshuo.qianshanai.cn"
 
-# 受保护模板类别:这些预置模板的 content 是核心 IP,绝不落本地库 / 绝不下发客户端,
-# 生成时走 admin 服务端 assemble。目前只保护分镜生成模板(风格提示词暂不保护)。
-_PROTECTED_CATEGORIES = {"storyboard_generation"}
-
-_STORYBOARD_ORDER_HINTS = [
-    "慢节奏通用版",
-    "快节奏通用版",
-    "古偶权谋",
-    "古偶重生复仇",
-    "犯罪悬疑/冷峻现实主义",
-    "仙侠修仙/东方玄幻",
-    "机甲科幻/巨兽战争",
-    "江湖武林",
-    "都市逆袭",
-    "现代言情",
-    "2D日漫",
-    "2D国漫",
-    "民国少帅",
-    "乡村红色",
-    "海外",
-    "港式无厘头喜剧",
-    "古代悬疑",
-    "民国悬疑",
-    "现代刑侦",
-    "AIGC视频提示词",
-    "动漫视频分镜式剧本描述词模板",
-    "西方玄幻",
-]
-
-_STYLE_ORDER_HINTS = [
-    "2D仙侠/玄幻/古风修仙动漫风格",
-    "3D国漫仙侠/玄幻/古风风格",
-    "3D真人风格【海外】",
-    "3D真人风格【国内】",
-    "3D国漫现代都市/校园风格",
-    "2D国漫通用风格",
-    "3D国漫通用风格",
-]
-
-_EXTRACTION_ORDER_HINTS = [
-    "角色提取模板【千人千面】【3D真人】",
-    "搭配火山5.0生图模型",
-    "适配gtp-image2",
-    "角色提取模板【千人千面】【3D国漫】",
-    "角色提取模板【千人千面】【2D国漫】",
-]
-
-_STORYBOARD_LEGACY_MARKERS = (
-    "旧版勿用",
-    "旧版备份差异版",
-    "测试勿使用",
-    "差异版-",
-)
-
-# 本地漫剧虾发行版使用清洗后的千山模板正文。这个顺序标识只负责
-# 复刻千山选择器的 ID 顺序，不把 admin_id 当成本地模板的远端授权 ID。
-_LOCAL_STORYBOARD_ORDER = {
-    23: 0, 24: 1, 25: 2, 26: 3, 27: 4, 28: 5, 29: 6, 30: 7,
-    31: 8, 32: 9, 33: 10, 34: 11, 35: 12, 36: 13, 37: 14, 38: 15,
-    39: 16, 40: 17, 41: 18, 42: 19, 43: 20, 44: 21, 45: 22,
-    46: 23, 47: 24, 48: 25, 49: 26, 50: 27, 51: 28, 62: 29,
-}
+# 迁移版全部使用项目内的本地模板种子；不得再为受保护模板向生产
+# admin 服务取正文。生产版的保护/远端 assemble 机制在这里显式关闭。
+_PROTECTED_CATEGORIES = set()
 
 
 def _is_protected_template(category: Optional[str], is_preset) -> bool:
     return (category in _PROTECTED_CATEGORIES) and (str(is_preset) == "1" or is_preset == 1)
-
-
-def _order_index(name: str, hints: List[str]) -> int:
-    for idx, hint in enumerate(hints):
-        if hint in name:
-            return idx
-    return len(hints) + 100
-
-
-def _storyboard_order_index(name: str) -> int:
-    if "横屏" in name or "16:9" in name or "横屏版" in name:
-        return 40 + _order_index(name, _STORYBOARD_ORDER_HINTS)
-    if "海外" in name or "出海" in name:
-        if "西方玄幻" in name:
-            return 60
-        return 14
-    return _order_index(name, _STORYBOARD_ORDER_HINTS)
-
-
-def _is_storyboard_legacy_row(row: Dict[str, Any]) -> bool:
-    if row.get("qianshan_id") is not None:
-        return False
-    name = row.get("name") or ""
-    if any(marker in name for marker in _STORYBOARD_LEGACY_MARKERS):
-        return True
-    # 老本地兜底模板和抓包差异模板保留在库里，但不放进正式产品选择器。
-    # 如果只剩旧模板，后面的排序函数会自动回退返回原列表，避免空列表。
-    if not row.get("admin_id") and (row.get("id") or 0) < 51:
-        return True
-    return not row.get("admin_id") and not name.startswith("即梦2.0")
-
-
-def _sort_product_templates(rows: List[Dict[str, Any]], category: Optional[str]) -> List[Dict[str, Any]]:
-    if category == "storyboard_generation":
-        visible = [row for row in rows if not _is_storyboard_legacy_row(row)]
-        if visible:
-            rows = visible
-        return sorted(
-            rows,
-            key=lambda row: (
-                _LOCAL_STORYBOARD_ORDER.get(int(row["qianshan_id"]), 10_000)
-                if row.get("qianshan_id") is not None else 9_000,
-                _storyboard_order_index(row.get("name") or ""),
-                row.get("admin_id") or 10_000,
-                row.get("id") or 10_000,
-            ),
-        )
-    if category == "style_prompt":
-        return sorted(
-            rows,
-            key=lambda row: (
-                _order_index(row.get("name") or "", _STYLE_ORDER_HINTS),
-                row.get("admin_id") or 10_000,
-                row.get("id") or 10_000,
-            ),
-        )
-    if category == "character_extraction":
-        return sorted(
-            rows,
-            key=lambda row: (
-                _order_index(row.get("name") or "", _EXTRACTION_ORDER_HINTS),
-                row.get("admin_id") or 10_000,
-                row.get("id") or 10_000,
-            ),
-        )
-    return rows
 
 
 def _extract_timestamp_skew_offset(body: str) -> Optional[int]:
@@ -180,6 +54,51 @@ def _extract_description(content: str, max_len: int = 80) -> str:
             return line[:max_len] + '...'
         return line
     return ""
+
+
+def _json_list_text(value: Any) -> str:
+    """Normalize a JSON/list-ish value to a JSON array string."""
+    if value is None:
+        return "[]"
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return "[]"
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return json.dumps([str(x).strip() for x in parsed if str(x).strip()], ensure_ascii=False)
+        except Exception:
+            pass
+        parts = [p.strip() for p in s.replace("、", ",").replace(";", ",").replace("；", ",").split(",")]
+        return json.dumps([p for p in parts if p], ensure_ascii=False)
+    if isinstance(value, list):
+        return json.dumps([str(x).strip() for x in value if str(x).strip()], ensure_ascii=False)
+    return "[]"
+
+
+def _normalize_screen_mode(value: Any, category: str = "") -> str:
+    if category != "storyboard_generation":
+        return ""
+    raw = str(value or "").strip().lower()
+    if raw in ("landscape", "horizontal", "横屏", "横版", "16:9"):
+        return "landscape"
+    return "portrait"
+
+
+STORYBOARD_MODEL_FAMILIES = {"seedance_2_0", "seedance_2_5"}
+
+
+def _normalize_model_family(value: Any, category: str = "") -> str:
+    """Storyboard templates are tied to one video-model family.
+
+    Non-storyboard templates do not participate in model routing.  Historical
+    storyboard templates are Seedance 2.0 unless explicitly marked otherwise.
+    """
+    if category != "storyboard_generation":
+        return ""
+    raw = str(value or "").strip().lower()
+    return raw if raw in STORYBOARD_MODEL_FAMILIES else "seedance_2_0"
 
 # 本地预置模板（当无法从 admin-server 同步时使用）
 LOCAL_PRESET_TEMPLATES = [
@@ -355,7 +274,10 @@ async def purge_protected_template_content() -> int:
 
 async def sync_preset_templates():
     """从 admin-server 同步预置模板"""
-    require_cloud("远端预置模板同步")
+    from services.offline_guard import cloud_enabled
+    if not cloud_enabled():
+        logger.info("[template_service] 离线迁移版跳过生产模板同步")
+        return 0
     # 护模板:每次同步前先清掉本地受保护模板的历史缓存 content
     await purge_protected_template_content()
     try:
@@ -393,69 +315,82 @@ async def sync_preset_templates():
             return False
 
         remote_templates = data.get("templates", [])
-        
+
         if not remote_templates:
             logger.info("远程无预置模板")
             return True
-        
+
         db = await get_db()
         try:
             # 获取本地所有预置模板
             async with db.execute(
-                "SELECT id, name, category, content FROM prompt_templates WHERE is_preset = 1"
+                "SELECT id, name, category, content, admin_id FROM prompt_templates WHERE is_preset = 1"
             ) as cursor:
                 local_rows = await cursor.fetchall()
-            
-            # 构建本地模板索引：(name, category) -> (id, name, category, content)
-            local_index = {}
+
+            # v3.61.345: 远程预置模板允许同名同分类但横竖屏不同,主匹配键必须是 admin_id。
+            # 仅对历史无 admin_id 的本地行使用 (name, category) 兜底认领。
+            local_by_admin_id = {}
+            local_unclaimed_by_key = {}
             for row in local_rows:
-                key = (row["name"], row["category"])
-                local_index[key] = dict(row)
-            
-            # 远程模板名称+分类集合
+                local = dict(row)
+                admin_id = local.get("admin_id")
+                if admin_id is not None:
+                    try:
+                        local_by_admin_id[int(admin_id)] = local
+                        continue
+                    except (TypeError, ValueError):
+                        pass
+                key = (local["name"], local["category"])
+                local_unclaimed_by_key.setdefault(key, local)
+
+            # 远程模板 admin_id / 名称+分类集合
+            remote_admin_ids = set()
             remote_keys = set()
-            
+
             # 处理远程模板：更新或新增
             for remote in remote_templates:
+                remote_admin_id = remote.get("id")
+                try:
+                    remote_admin_id = int(remote_admin_id) if remote_admin_id is not None else None
+                except (TypeError, ValueError):
+                    remote_admin_id = None
                 key = (remote["name"], remote["category"])
                 remote_keys.add(key)
+                if remote_admin_id is not None:
+                    remote_admin_ids.add(remote_admin_id)
 
-                # 远程 genres 序列化(admin 返回的是数组,本地存 JSON 字符串)
-                remote_genres_raw = remote.get("genres") or []
-                if isinstance(remote_genres_raw, str):
-                    remote_genres_json = remote_genres_raw
-                else:
-                    remote_genres_json = json.dumps(remote_genres_raw, ensure_ascii=False)
+                # 远程 genres/tags 序列化(admin 返回的是数组,本地存 JSON 字符串)。
+                # genres 只做题材推荐; tags 只做流程分流,不能混用。
+                remote_genres_json = _json_list_text(remote.get("genres") or [])
+                remote_tags_json = _json_list_text(remote.get("tags") or [])
+                remote_screen_mode = _normalize_screen_mode(remote.get("screen_mode"), remote.get("category"))
+                remote_model_family = _normalize_model_family(remote.get("model_family"), remote.get("category"))
 
                 # ★ 护模板:受保护分镜模板(storyboard_generation)content 绝不落本地库,
                 #   只存元数据(admin_id/variables/description/genres);生成时走 admin assemble。
                 _content_to_store = "" if _is_protected_template(remote.get("category"), 1) \
                     else (remote.get("content") or "")
 
-                if key in local_index:
+                local_match = None
+                if remote_admin_id is not None:
+                    local_match = local_by_admin_id.get(remote_admin_id)
+                if local_match is None and remote_admin_id is None:
+                    local_match = local_unclaimed_by_key.pop(key, None)
+                elif local_match is None:
+                    # 只认领历史无 admin_id 的老行,避免同名横/竖屏互相覆盖。
+                    local_match = local_unclaimed_by_key.pop(key, None)
+
+                if local_match:
                     # 更新现有模板(同时回填 admin_id,这样后续使用计数能精确锁定)
-                    local_content_len = len(local_index[key].get("content", "") or "")
+                    local_content_len = len(local_match.get("content", "") or "")
                     remote_content_len = len(remote.get("content", ""))
-                    logger.info(f"更新预置模板 [{remote['category']}] {remote['name']}: {local_content_len} -> {remote_content_len} 字符 admin_id={remote.get('id')}")
+                    logger.info(f"更新预置模板 [{remote['category']}] {remote['name']}: {local_content_len} -> {remote_content_len} 字符 admin_id={remote_admin_id}")
 
                     await db.execute("""
                         UPDATE prompt_templates
-                        SET content = ?, variables = ?, description = ?, genres = ?, admin_id = ?, updated_at = (datetime('now', '+8 hours'))
+                        SET name = ?, category = ?, content = ?, variables = ?, description = ?, genres = ?, tags = ?, screen_mode = ?, model_family = ?, admin_id = ?, updated_at = (datetime('now', '+8 hours'))
                         WHERE id = ?
-                    """, (
-                        _content_to_store,
-                        json.dumps(remote.get("variables", [])),
-                        remote.get("description", ""),
-                        remote_genres_json,
-                        remote.get("id"),
-                        local_index[key]["id"]
-                    ))
-                else:
-                    # 新增模板(直接带 admin_id)
-                    logger.info(f"新增预置模板 [{remote['category']}] {remote['name']}: {len(remote.get('content', ''))} 字符 admin_id={remote.get('id')}")
-                    await db.execute("""
-                        INSERT INTO prompt_templates (name, category, content, variables, description, genres, admin_id, is_preset, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                     """, (
                         remote["name"],
                         remote["category"],
@@ -463,11 +398,33 @@ async def sync_preset_templates():
                         json.dumps(remote.get("variables", [])),
                         remote.get("description", ""),
                         remote_genres_json,
-                        remote.get("id"),
+                        remote_tags_json,
+                        remote_screen_mode,
+                        remote_model_family,
+                        remote_admin_id,
+                        local_match["id"]
+                    ))
+                else:
+                    # 新增模板(直接带 admin_id)
+                    logger.info(f"新增预置模板 [{remote['category']}] {remote['name']}: {len(remote.get('content', ''))} 字符 admin_id={remote_admin_id}")
+                    await db.execute("""
+                        INSERT INTO prompt_templates (name, category, content, variables, description, genres, tags, screen_mode, model_family, admin_id, is_preset, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    """, (
+                        remote["name"],
+                        remote["category"],
+                        _content_to_store,
+                        json.dumps(remote.get("variables", [])),
+                        remote.get("description", ""),
+                        remote_genres_json,
+                        remote_tags_json,
+                        remote_screen_mode,
+                        remote_model_family,
+                        remote_admin_id,
                         now_beijing_str(),
                         now_beijing_str()
                     ))
-            
+
             # 删除本地有但远程没有的预置模板（排除 LOCAL_PRESET_TEMPLATES 中的）
             # 删除前做引用迁移:admin 改名场景下,把引用旧 id 的 novels/storyboards
             # 迁移到新 id(同 category 下 name 前缀/包含关系匹配)
@@ -498,8 +455,23 @@ async def sync_preset_templates():
                     row = await cur.fetchone()
                     return row["id"] if row else None
 
-            for key, local_data in local_index.items():
-                if key not in remote_keys and key not in local_preset_keys:
+            for row in local_rows:
+                local_data = dict(row)
+                key = (local_data["name"], local_data["category"])
+                raw_admin_id = local_data.get("admin_id")
+                try:
+                    local_admin_id = int(raw_admin_id) if raw_admin_id is not None else None
+                except (TypeError, ValueError):
+                    local_admin_id = None
+
+                if key in local_preset_keys:
+                    continue
+                if local_admin_id is not None:
+                    should_delete = local_admin_id not in remote_admin_ids
+                else:
+                    should_delete = key not in remote_keys
+
+                if should_delete:
                     old_id = local_data["id"]
                     old_name = local_data["name"]
                     old_cat = local_data["category"]
@@ -549,40 +521,48 @@ async def sync_preset_templates():
                     )
                     if cur.rowcount > 0:
                         logger.info(f"清理 legacy 残留模板: {legacy_name} ({cur.rowcount} 条)")
-            
+
             # 同步本地预置模板（补充远程没有的）
             for preset in LOCAL_PRESET_TEMPLATES:
                 key = (preset["name"], preset["category"])
                 if key not in remote_keys:
-                    if key in local_index:
+                    preset_model_family = _normalize_model_family(
+                        preset.get("model_family"), preset.get("category")
+                    )
+                    local_match = local_unclaimed_by_key.get(key)
+                    if local_match:
                         # 更新现有本地模板
                         await db.execute("""
-                            UPDATE prompt_templates 
-                            SET content = ?, variables = ?, description = ?, updated_at = (datetime('now', '+8 hours'))
+                            UPDATE prompt_templates
+                            SET content = ?, variables = ?, description = ?, tags = ?, model_family = ?, updated_at = (datetime('now', '+8 hours'))
                             WHERE id = ?
                         """, (
                             preset["content"],
                             json.dumps(preset.get("variables", [])),
                             preset.get("description", ""),
-                            local_index[key]["id"]
+                            _json_list_text(preset.get("tags") or []),
+                            preset_model_family,
+                            local_match["id"]
                         ))
                         logger.info(f"更新本地预置模板 [{preset['category']}] {preset['name']}")
                     else:
                         # 新增本地模板
                         await db.execute("""
-                            INSERT INTO prompt_templates (name, category, content, variables, description, is_preset, created_at, updated_at)
-                            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                            INSERT INTO prompt_templates (name, category, content, variables, description, tags, model_family, is_preset, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                         """, (
                             preset["name"],
                             preset["category"],
                             preset["content"],
                             json.dumps(preset.get("variables", [])),
                             preset.get("description", ""),
+                            _json_list_text(preset.get("tags") or []),
+                            preset_model_family,
                             now_beijing_str(),
                             now_beijing_str()
                         ))
                         logger.info(f"新增本地预置模板 [{preset['category']}] {preset['name']}")
-            
+
             await db.commit()
             logger.info(f"同步预置模板成功：{len(remote_templates)} 个远程模板 + {len(LOCAL_PRESET_TEMPLATES)} 个本地模板")
             return True
@@ -607,46 +587,56 @@ async def _sync_local_preset_templates():
             "SELECT id, name, category, content FROM prompt_templates WHERE is_preset = 1"
         ) as cursor:
             local_rows = await cursor.fetchall()
-        
+
         # 构建本地模板索引
         local_index = {}
         for row in local_rows:
             key = (row["name"], row["category"])
             local_index[key] = dict(row)
-        
+
         # 处理本地预置模板
         for preset in LOCAL_PRESET_TEMPLATES:
             key = (preset["name"], preset["category"])
-            
+            preset_screen_mode = _normalize_screen_mode(preset.get("screen_mode"), preset.get("category"))
+            preset_model_family = _normalize_model_family(
+                preset.get("model_family"), preset.get("category")
+            )
+
             if key in local_index:
                 # 更新现有模板
                 await db.execute("""
-                    UPDATE prompt_templates 
-                    SET content = ?, variables = ?, description = ?, updated_at = (datetime('now', '+8 hours'))
+                    UPDATE prompt_templates
+                    SET content = ?, variables = ?, description = ?, tags = ?, screen_mode = ?, model_family = ?, updated_at = (datetime('now', '+8 hours'))
                     WHERE id = ?
                 """, (
                     preset["content"],
                     json.dumps(preset.get("variables", [])),
                     preset.get("description", ""),
+                    _json_list_text(preset.get("tags") or []),
+                    preset_screen_mode,
+                    preset_model_family,
                     local_index[key]["id"]
                 ))
                 logger.info(f"更新本地预置模板 [{preset['category']}] {preset['name']}")
             else:
                 # 新增模板
                 await db.execute("""
-                    INSERT INTO prompt_templates (name, category, content, variables, description, is_preset, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                    INSERT INTO prompt_templates (name, category, content, variables, description, tags, screen_mode, model_family, is_preset, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """, (
                     preset["name"],
                     preset["category"],
                     preset["content"],
                     json.dumps(preset.get("variables", [])),
                     preset.get("description", ""),
+                    _json_list_text(preset.get("tags") or []),
+                    preset_screen_mode,
+                    preset_model_family,
                     now_beijing_str(),
                     now_beijing_str()
                 ))
                 logger.info(f"新增本地预置模板 [{preset['category']}] {preset['name']}")
-        
+
         await db.commit()
         logger.info(f"本地预置模板同步完成：{len(LOCAL_PRESET_TEMPLATES)} 个")
     finally:
@@ -679,7 +669,7 @@ async def get_all(category_filter: Optional[str] = None):
             if d.get("is_preset") == 1 and d.get("category") != "style_prompt":
                 d["content"] = ""
             result.append(d)
-        return _sort_product_templates(result, category_filter)
+        return result
     finally:
         await db.close()
 
@@ -701,12 +691,9 @@ async def get_by_id(template_id: int, meta_only: bool = False):
     if not row:
         return None
     tpl = dict(row)
-    # ★ 云端受保护模板的 content 绝不返回(防历史缓存残留)。
-    # 万山离线发行版会把没有 admin_id 的本地预置模板随应用打包,这类模板必须保留
-    # 本地内容,否则离线分镜既不能服务端 assemble 也不能走 legacy 本地拼装。
-    is_protected = _is_protected_template(tpl.get("category"), tpl.get("is_preset"))
-    is_local_bundled = is_protected and not tpl.get("admin_id") and bool((tpl.get("content") or "").strip())
-    if is_protected and not is_local_bundled:
+    # ★ 护模板:受保护分镜模板的 content 绝不返回(防历史缓存残留)。
+    #   无论 meta_only 与否,只要是受保护模板,content 一律清空 → 客户端拿不到模板明文。
+    if _is_protected_template(tpl.get("category"), tpl.get("is_preset")):
         tpl["content"] = ""
         return tpl
     if meta_only:
@@ -715,12 +702,18 @@ async def get_by_id(template_id: int, meta_only: bool = False):
     # C 方案:预置模板的 content 不存本地,只在运行时按需从 admin 拉取
     if (tpl.get("is_preset") == 1) and not (tpl.get("content") or "").strip():
         try:
-            # admin 和本地 id 可能不同(因为独立自增),必须按 name+category 匹配
-            fetched_id, fetched_content = await _fetch_content_from_admin(tpl.get("name"), tpl.get("category"))
+            # 本地 id 与 admin id 独立；有 admin_id 时优先按稳定远端 ID 拉取。
+            # 模板在后台改名后，本地旧名称可能尚未来得及同步，若只按 name+category
+            # 会得到 404 并把空模板交给 LLM。
+            fetched_id, fetched_content = await _fetch_content_from_admin(
+                tpl.get("name") or "",
+                tpl.get("category") or "",
+                tpl.get("admin_id"),
+            )
             if fetched_content:
                 tpl["content"] = fetched_content
-            # 顺手回填 admin_id (老库可能没存)
-            if fetched_id and not tpl.get("admin_id"):
+            # 顺手回填/纠正 admin_id（远端模板删除重建时 ID 可能变化）。
+            if fetched_id and str(fetched_id) != str(tpl.get("admin_id") or ""):
                 tpl["admin_id"] = fetched_id
                 try:
                     db2 = await get_db()
@@ -779,7 +772,8 @@ async def report_usage(template: Dict[str, Any]) -> None:
     template 是 get_by_id 返回的字典,要求至少有 admin_id 或 (name + category)。
     只对 is_preset=1 的预置模板上报,自建模板不上报。
     """
-    if not template:
+    from services.offline_guard import cloud_enabled
+    if not cloud_enabled() or not template:
         return
     if int(template.get("is_preset") or 0) != 1:
         return  # 用户自建模板不计数
@@ -790,28 +784,50 @@ async def report_usage(template: Dict[str, Any]) -> None:
     )
 
 
-async def _fetch_content_from_admin(name: str, category: str) -> tuple[Optional[int], Optional[str]]:
-    """按 name+category 向 admin 请求模板 content(C 方案)。
-    404 时做一次 fuzzy 匹配:去掉括号后缀再查(admin 可能把 name 改成 xxx（新品）)。
+async def _fetch_content_from_admin(
+    name: str,
+    category: str,
+    admin_id: Optional[int] = None,
+) -> tuple[Optional[int], Optional[str]]:
+    """向 admin 请求模板 content(C 方案)。
+
+    有 admin_id 时优先按稳定远端 ID 获取，避免后台改名后本地旧名称 404；
+    ID 失效时再回退 name+category，最后做 fuzzy 匹配。
     返回 (admin_template_id, content),失败返回 (None, None)。
     """
-    require_cloud("远端模板内容拉取")
+    from services.offline_guard import cloud_enabled
+    if not cloud_enabled():
+        logger.warning("[template_service] 离线迁移版拒绝从生产 admin 拉模板正文")
+        return (None, None)
     from services import license_context as _lc
     ctx = _lc.get_context()
     license_key = ctx.get("license_key")
     machine_id = ctx.get("machine_id")
+    product_code = ctx.get("product_code") or "comic"
     if not license_key:
         logger.warning("[template_service] 本地无 license 凭证,无法向 admin 拉取模板 content")
         return (None, None)
 
-    async def _do_fetch(n: str, c: str, time_offset_sec: int = 0) -> tuple[int, Optional[int], Optional[str]]:
+    async def _do_fetch(
+        n: str = "",
+        c: str = "",
+        template_id: Optional[int] = None,
+        time_offset_sec: int = 0,
+    ) -> tuple[int, Optional[int], Optional[str]]:
         # v3.61.68: 加客户端签名 — 防 AI 工具 / curl / postman 拿 license 直接调
         from utils.client_signature import sign_request
         import json as _json
-        body_bytes = _json.dumps(
-            {"name": n, "category": c, "license_key": license_key, "machine_id": machine_id},
-            ensure_ascii=False
-        ).encode("utf-8")
+        payload: Dict[str, Any] = {
+            "license_key": license_key,
+            "machine_id": machine_id,
+            "product_code": product_code,
+        }
+        if template_id:
+            payload["template_id"] = int(template_id)
+        else:
+            payload["name"] = n
+            payload["category"] = c
+        body_bytes = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
         sig_headers = sign_request(license_key, machine_id or "", body_bytes, time_offset_sec=time_offset_sec)
         sig_headers["Content-Type"] = "application/json"
         try:
@@ -830,17 +846,57 @@ async def _fetch_content_from_admin(name: str, category: str) -> tuple[Optional[
         except Exception as e:
             return -1, None, str(e)
 
-    # 1) 精确 name 匹配
-    status, admin_id, body = await _do_fetch(name, category)
-    if status == 403 and isinstance(body, str):
-        skew = _extract_timestamp_skew_offset(body)
-        if skew is not None:
-            logger.warning(f"[template_service] 模板内容拉取签名时间偏移 {skew}s,按云端 diff 重签重试 name={name}")
-            status, admin_id, body = await _do_fetch(name, category, skew)
-    if status == 200:
-        return (admin_id, body)
+    async def _do_fetch_with_skew(
+        n: str = "",
+        c: str = "",
+        template_id: Optional[int] = None,
+    ) -> tuple[int, Optional[int], Optional[str]]:
+        status, fetched_id, body = await _do_fetch(n, c, template_id=template_id)
+        if status == 403 and isinstance(body, str):
+            skew = _extract_timestamp_skew_offset(body)
+            if skew is not None:
+                logger.warning(
+                    f"[template_service] 模板内容拉取签名时间偏移 {skew}s,按云端 diff 重签重试 "
+                    f"admin_id={template_id or '-'} name={n}"
+                )
+                status, fetched_id, body = await _do_fetch(
+                    n,
+                    c,
+                    template_id=template_id,
+                    time_offset_sec=skew,
+                )
+        return status, fetched_id, body
 
-    # 2) 404: 尝试 fuzzy 匹配 - 通过 /api/templates/preset 列表找前缀匹配的 name
+    # 1) 稳定 admin_id 精确匹配。后台模板改名不影响此路径。
+    normalized_admin_id: Optional[int] = None
+    try:
+        normalized_admin_id = int(admin_id) if admin_id is not None else None
+    except (TypeError, ValueError):
+        normalized_admin_id = None
+    if normalized_admin_id:
+        status, fetched_id, body = await _do_fetch_with_skew(template_id=normalized_admin_id)
+        if status == 200:
+            return (fetched_id, body)
+        if status != 404:
+            logger.warning(
+                f"[template_service] fetch content by admin_id={normalized_admin_id} HTTP {status}: "
+                f"{body if isinstance(body, str) else ''}"
+            )
+            return (None, None)
+        logger.info(
+            f"[template_service] admin_id={normalized_admin_id} 已失效,回退 name+category: {name}"
+        )
+
+    # 2) 精确 name+category 匹配（兼容历史无 admin_id 的本地模板）。
+    status, fetched_id, body = await _do_fetch_with_skew(name, category)
+    if status == 403 and isinstance(body, str):
+        # _do_fetch_with_skew 已处理可纠正的时间偏移；仍为 403 时直接失败。
+        logger.warning(f"[template_service] fetch content HTTP 403: {body}")
+        return (None, None)
+    if status == 200:
+        return (fetched_id, body)
+
+    # 3) 404: 尝试 fuzzy 匹配 - 通过 /api/templates/preset 列表找前缀匹配的 name
     if status == 404:
         try:
             # v3.61.68: 同样加客户端签名
@@ -879,12 +935,7 @@ async def _fetch_content_from_admin(name: str, category: str) -> tuple[Optional[
                 if candidates:
                     best = min(candidates, key=lambda x: abs(len(x) - len(name)))
                     logger.info(f"[template_service] fuzzy 匹配: 本地 '{name}' -> admin '{best}'")
-                    status2, admin_id2, body2 = await _do_fetch(best, category)
-                    if status2 == 403 and isinstance(body2, str):
-                        skew2 = _extract_timestamp_skew_offset(body2)
-                        if skew2 is not None:
-                            logger.warning(f"[template_service] fuzzy content 签名时间偏移 {skew2}s,按云端 diff 重签重试")
-                            status2, admin_id2, body2 = await _do_fetch(best, category, skew2)
+                    status2, admin_id2, body2 = await _do_fetch_with_skew(best, category)
                     if status2 == 200:
                         return (admin_id2, body2)
         except Exception as e:
@@ -899,13 +950,27 @@ async def create(template: TemplateCreate):
     db = await get_db()
     try:
         variables_json = json.dumps(template.variables or [])
+        tags_json = _json_list_text(template.tags or [])
+        screen_mode = _normalize_screen_mode(template.screen_mode, template.category)
+        model_family = _normalize_model_family(template.model_family, template.category)
         now = now_beijing_str()
         async with db.execute(
             """
-            INSERT INTO prompt_templates (name, category, content, variables, description, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO prompt_templates (name, category, content, variables, description, tags, screen_mode, model_family, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (template.name, template.category, template.content, variables_json, template.description or '', now, now)
+            (
+                template.name,
+                template.category,
+                template.content,
+                variables_json,
+                template.description or '',
+                tags_json,
+                screen_mode,
+                model_family,
+                now,
+                now,
+            )
         ) as cursor:
             await db.commit()
             template_id = cursor.lastrowid
@@ -922,7 +987,7 @@ async def update(template_id: int, template: TemplateUpdate):
         existing = await get_by_id(template_id)
         if not existing:
             return None
-        
+
         # 预置模板不允许编辑
         if existing.get("is_preset") == 1:
             return None
@@ -930,7 +995,7 @@ async def update(template_id: int, template: TemplateUpdate):
         # 构建更新字段
         updates = []
         params = []
-        
+
         if template.name is not None:
             updates.append("name = ?")
             params.append(template.name)
@@ -946,14 +1011,25 @@ async def update(template_id: int, template: TemplateUpdate):
         if template.description is not None:
             updates.append("description = ?")
             params.append(template.description)
-        
+        if template.tags is not None:
+            updates.append("tags = ?")
+            params.append(_json_list_text(template.tags))
+        if template.screen_mode is not None:
+            category_for_mode = template.category if template.category is not None else existing.get("category")
+            updates.append("screen_mode = ?")
+            params.append(_normalize_screen_mode(template.screen_mode, category_for_mode))
+        if template.model_family is not None:
+            category_for_model = template.category if template.category is not None else existing.get("category")
+            updates.append("model_family = ?")
+            params.append(_normalize_model_family(template.model_family, category_for_model))
+
         updates.append("updated_at = (datetime('now', '+8 hours'))")
-        
+
         if not updates:
             return existing
-        
+
         params.append(template_id)
-        
+
         await db.execute(
             f"UPDATE prompt_templates SET {', '.join(updates)} WHERE id = ?",
             params
@@ -971,11 +1047,11 @@ async def delete(template_id: int):
         existing = await get_by_id(template_id)
         if not existing:
             return False
-        
+
         # 预置模板不允许删除
         if existing.get("is_preset") == 1:
             return False
-        
+
         await db.execute(
             "DELETE FROM prompt_templates WHERE id = ?",
             (template_id,)

@@ -1,5 +1,7 @@
+import asyncio
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -9,6 +11,7 @@ from pydantic import BaseModel
 from database.db import get_db
 from services import cloud_token_service as cloud_token
 from services.novel_service import NovelService
+from services.tag_service import TagService
 from utils.timezone import now_beijing_str
 
 logger = logging.getLogger(__name__)
@@ -51,6 +54,20 @@ async def _cloud_get(path: str, timeout: float = 30.0) -> Any:
     return body.get("data") if isinstance(body, dict) and "data" in body else body
 
 
+async def _analyze_tags_best_effort(novel_id: int, name: str, content: str, mode: str) -> None:
+    try:
+        await TagService.analyze_and_save(
+            novel_id=novel_id,
+            name=name,
+            content=content,
+            selected_visual=[],
+            selected_screen_mode=["竖屏"],
+            mode=mode,
+        )
+    except Exception as exc:
+        logger.warning("[short-drama-sync] 标签分析失败 novel_id=%s: %s", novel_id, exc)
+
+
 async def _ensure_sync_columns(db) -> None:
     columns = {
         "novels": [
@@ -85,6 +102,162 @@ def _as_list(value: Any) -> List[dict]:
             if isinstance(value.get(key), list):
                 return [x for x in value[key] if isinstance(x, dict)]
     return []
+
+
+def _alias_values(value: Any) -> List[str]:
+    """把云端/本地的别名字段统一展开成字符串列表。"""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, (list, tuple, set)):
+            result: List[str] = []
+            for item in parsed:
+                result.extend(_alias_values(item))
+            return result
+        if isinstance(parsed, str) and parsed != text:
+            return _alias_values(parsed)
+        return [
+            part.strip()
+            for part in re.split(r"[,，、;；/／|]+", text)
+            if part.strip()
+        ]
+    if isinstance(value, (list, tuple, set)):
+        result: List[str] = []
+        for item in value:
+            result.extend(_alias_values(item))
+        return result
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _short_drama_item_aliases(item: Dict[str, Any], canonical_name: str) -> List[str]:
+    """提取短剧工坊人物卡的称呼字段。
+
+    云端 ``comic-export`` 当前明确返回 ``nickname``，后续接口若增加
+    aliases/otherNames 也一并兼容。角色正式名不重复写进 aliases。
+    """
+    raw_values: List[str] = []
+    for key in (
+        "aliases",
+        "alias",
+        "nickname",
+        "nickName",
+        "nicknames",
+        "otherNames",
+        "other_names",
+    ):
+        raw_values.extend(_alias_values(item.get(key)))
+
+    canonical_key = str(canonical_name or "").strip().casefold()
+    aliases: List[str] = []
+    seen = {canonical_key} if canonical_key else set()
+    for raw_alias in raw_values:
+        alias = str(raw_alias or "").strip()
+        key = alias.casefold()
+        if alias and key not in seen:
+            seen.add(key)
+            aliases.append(alias)
+    return aliases
+
+
+def _merge_alias_values(existing: Any, incoming: List[str], canonical_name: str) -> List[str]:
+    """保留用户已有别名，并追加云端 nickname 等称呼。"""
+    canonical_key = str(canonical_name or "").strip().casefold()
+    merged: List[str] = []
+    seen = {canonical_key} if canonical_key else set()
+    for raw_alias in [*_alias_values(existing), *(incoming or [])]:
+        alias = str(raw_alias or "").strip()
+        key = alias.casefold()
+        if alias and key not in seen:
+            seen.add(key)
+            merged.append(alias)
+    return merged
+
+
+def _build_existing_element_indexes(rows: List[Any]) -> tuple:
+    """构建类型隔离的远端元素索引，防止三张云端表的同号 ID 串联。"""
+    by_remote: Dict[tuple, Dict[str, Any]] = {}
+    by_type_name_without_remote: Dict[tuple, Dict[str, Any]] = {}
+    for raw_row in rows or []:
+        row = dict(raw_row) if hasattr(raw_row, "keys") else dict(raw_row or {})
+        element_type = row.get("element_type")
+        remote_id = row.get("remote_id")
+        row_info = {
+            "id": row.get("id"),
+            "name": row.get("name"),
+            "aliases": row.get("aliases"),
+        }
+        if element_type and remote_id not in (None, ""):
+            by_remote[(element_type, str(remote_id))] = row_info
+            continue
+        name_key = str(row.get("name") or "").strip().casefold()
+        if element_type and name_key:
+            by_type_name_without_remote[(element_type, name_key)] = row_info
+    return by_remote, by_type_name_without_remote
+
+
+async def repair_short_drama_character_aliases() -> Dict[str, int]:
+    """把历史同步人物卡 attributes.nickname 回填到 extracted_elements.aliases。
+
+    旧版同步虽然把完整云端人物卡保存在 attributes，却把 aliases 固定写成 []。
+    因此云端剧本若使用昵称，分镜文字能看到人名，素材关联却无法映射到正式角色。
+    """
+    stats = {"scanned": 0, "repaired": 0}
+    db = await get_db()
+    try:
+        await _ensure_sync_columns(db)
+        cursor = await db.execute(
+            "SELECT id, name, aliases, attributes FROM extracted_elements "
+            "WHERE remote_source = 'short_drama' AND element_type = 'character'"
+        )
+        rows = await cursor.fetchall()
+        stats["scanned"] = len(rows)
+        for row in rows:
+            try:
+                attributes = json.loads(row["attributes"] or "{}")
+            except (json.JSONDecodeError, TypeError, ValueError):
+                attributes = {}
+            if not isinstance(attributes, dict):
+                attributes = {}
+
+            canonical_name = str(row["name"] or "").strip()
+            current_aliases = _merge_alias_values([], _alias_values(row["aliases"]), canonical_name)
+            merged_aliases = _merge_alias_values(
+                current_aliases,
+                _short_drama_item_aliases(attributes, canonical_name),
+                canonical_name,
+            )
+            if merged_aliases == current_aliases:
+                continue
+            await db.execute(
+                "UPDATE extracted_elements SET aliases = ?, updated_at = ? WHERE id = ?",
+                (
+                    json.dumps(merged_aliases, ensure_ascii=False),
+                    now_beijing_str(),
+                    row["id"],
+                ),
+            )
+            stats["repaired"] += 1
+
+        # _ensure_sync_columns 可能刚为历史数据库补列，因此即使没有别名变更也提交。
+        await db.commit()
+    except Exception as exc:
+        logger.error("[short-drama-sync] 历史人物别名回填失败: %s", exc)
+    finally:
+        await db.close()
+
+    logger.info(
+        "[short-drama-sync] 历史人物别名回填完成: 扫描 %s, 修复 %s",
+        stats["scanned"],
+        stats["repaired"],
+    )
+    return stats
 
 
 def _project_name(project: Dict[str, Any]) -> str:
@@ -179,6 +352,7 @@ async def import_short_drama_project(req: ImportShortDramaRequest):
             logger.warning("[short-drama-sync] comic-export skipped: %s", exc.detail)
 
     now = now_beijing_str()
+    raw_content = _build_raw_content(chapters)
     outline = {
         "source": "short_drama_studio",
         "remoteProjectId": req.project_id,
@@ -223,7 +397,7 @@ async def import_short_drama_project(req: ImportShortDramaRequest):
                 """,
                 (
                     novel_name,
-                    _build_raw_content(chapters),
+                    raw_content,
                     json.dumps(outline, ensure_ascii=False),
                     now,
                     now,
@@ -243,7 +417,7 @@ async def import_short_drama_project(req: ImportShortDramaRequest):
                 """,
                 (
                     novel_name,
-                    _build_raw_content(chapters),
+                    raw_content,
                     "short_drama_sync",
                     json.dumps(outline, ensure_ascii=False),
                     "short_drama",
@@ -404,20 +578,16 @@ async def import_short_drama_project(req: ImportShortDramaRequest):
         # v3.61.142 fallback: 主键 remote_id;**fallback 池只收纳本地 remote_id 为空的元素**
         # 语义:fallback 只用于"远端没给 id"的 corner case,**不允许**远端新 id 把同名同类型旧元素合并
         cur = await db.execute(
-            "SELECT id, element_type, name, remote_id FROM extracted_elements WHERE novel_id=? AND remote_source=?",
+            "SELECT id, element_type, name, remote_id, aliases "
+            "FROM extracted_elements WHERE novel_id=? AND remote_source=?",
             (novel_id, "short_drama"),
         )
-        existing_element_map: Dict[str, int] = {}
-        existing_element_by_typename_unmatched: Dict[tuple, int] = {}  # 只放 remote_id 为空的元素
-        for row in await cur.fetchall():
-            rid = row["remote_id"]
-            if rid:
-                existing_element_map[str(rid)] = row["id"]
-            else:
-                etype = row["element_type"]
-                nm = (row["name"] or "").strip().lower()
-                if etype and nm:
-                    existing_element_by_typename_unmatched[(etype, nm)] = row["id"]
+        # characters/scenes/props 来自三张云端表，ID 各自自增，同一个数字会跨类型重复。
+        # 因此增量主键必须是 (element_type, remote_id)，不能只用 remote_id。
+        (
+            existing_element_map,
+            existing_element_by_typename_unmatched,
+        ) = _build_existing_element_indexes(await cur.fetchall())
 
         element_new = 0
         element_update = 0
@@ -442,23 +612,47 @@ async def import_short_drama_project(req: ImportShortDramaRequest):
                         pass
 
                 remote_id_str = str(item.get("id") or "")
+                remote_aliases = _short_drama_item_aliases(item, name)
                 # v3.61.142:匹配规则收紧
                 #   远端有 id 且本地有该 id → UPDATE 已有
                 #   远端有 id 但本地没该 id → 视为新元素(不 fallback,避免同名同类型旧元素被合并)
                 #   远端无 id → fallback 到本地"remote_id 为空"的同 (element_type, name) 元素
                 matched_element_id: Optional[int] = None
+                existing_aliases: Any = []
+                existing_name = ""
                 if remote_id_str:
-                    if remote_id_str in existing_element_map:
-                        matched_element_id = existing_element_map[remote_id_str]
+                    matched_info = existing_element_map.get((element_type, remote_id_str))
+                    if matched_info:
+                        matched_element_id = matched_info["id"]
+                        existing_aliases = matched_info.get("aliases")
+                        existing_name = str(matched_info.get("name") or "").strip()
                     # else: 远端新 id,走下面新增分支
                 else:
-                    fb_key = (element_type, name.strip().lower())
+                    fb_key = (element_type, name.strip().casefold())
                     if fb_key in existing_element_by_typename_unmatched:
-                        matched_element_id = existing_element_by_typename_unmatched[fb_key]
+                        matched_info = existing_element_by_typename_unmatched[fb_key]
+                        matched_element_id = matched_info["id"]
+                        existing_aliases = matched_info.get("aliases")
+                        existing_name = str(matched_info.get("name") or "").strip()
                         logger.info(
                             f"[short-drama-sync] novel={novel_id} 元素按 (type={element_type}, name={name!r}) "
                             f"fallback 匹配 (远端无 id,本地该名 remote_id 为空)"
                         )
+                aliases_json = json.dumps(
+                    _merge_alias_values(
+                        existing_aliases,
+                        [
+                            *remote_aliases,
+                            *(
+                                [existing_name]
+                                if existing_name and existing_name.casefold() != name.casefold()
+                                else []
+                            ),
+                        ],
+                        name,
+                    ),
+                    ensure_ascii=False,
+                )
                 if matched_element_id is not None:
                     # 已有 → UPDATE;若本来缺 remote_id,顺手补上
                     update_remote_id_clause = ""
@@ -467,6 +661,7 @@ async def import_short_drama_project(req: ImportShortDramaRequest):
                         desc,
                         json.dumps(item, ensure_ascii=False),
                         json.dumps(chapter_ids_list),
+                        aliases_json,
                         now,
                         matched_element_id,
                     )
@@ -477,6 +672,7 @@ async def import_short_drama_project(req: ImportShortDramaRequest):
                             desc,
                             json.dumps(item, ensure_ascii=False),
                             json.dumps(chapter_ids_list),
+                            aliases_json,
                             now,
                             remote_id_str,
                             matched_element_id,
@@ -484,7 +680,8 @@ async def import_short_drama_project(req: ImportShortDramaRequest):
                     await db.execute(
                         f"""
                         UPDATE extracted_elements
-                        SET name=?, description=?, attributes=?, chapter_ids=?, updated_at=?{update_remote_id_clause}
+                        SET name=?, description=?, attributes=?, chapter_ids=?, aliases=?,
+                            updated_at=?{update_remote_id_clause}
                         WHERE id=?
                         """,
                         update_params,
@@ -497,7 +694,7 @@ async def import_short_drama_project(req: ImportShortDramaRequest):
                         INSERT INTO extracted_elements
                             (novel_id, element_type, name, description, attributes, chapter_ids,
                              aliases, remote_source, remote_id, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             novel_id,
@@ -506,6 +703,7 @@ async def import_short_drama_project(req: ImportShortDramaRequest):
                             desc,
                             json.dumps(item, ensure_ascii=False),
                             json.dumps(chapter_ids_list),
+                            aliases_json,
                             "short_drama",
                             remote_id_str,
                             now,
@@ -515,6 +713,7 @@ async def import_short_drama_project(req: ImportShortDramaRequest):
                     element_new += 1
 
         await db.commit()
+        asyncio.create_task(_analyze_tags_best_effort(novel_id, novel_name, raw_content, "short_drama_sync"))
         return {
             "success": True,
             "novel_id": novel_id,

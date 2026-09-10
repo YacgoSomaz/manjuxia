@@ -109,7 +109,13 @@ async def enqueue(req: EnqueueRequest):
                     "UPDATE storyboards SET "
                     "video_status = 'queued', video_provider = ?, video_config_id = ?, "
                     "submit_id = NULL, video_submit_time = NULL, video_fail_reason = NULL "
-                    "WHERE id = ?",
+                    "WHERE id = ? "
+                    "AND NOT ("
+                    "  video_status = 'generating' "
+                    "  AND video_submit_time IS NOT NULL "
+                    "  AND datetime(replace(video_submit_time, ' ', 'T')) "
+                    "      > datetime('now', '+8 hours', '-30 minutes')"
+                    ")",
                     (
                         r["provider"] or req.provider or "jimeng",
                         r["video_config_id"],

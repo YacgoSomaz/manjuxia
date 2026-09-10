@@ -15,6 +15,12 @@ def is_business_api_path(path: str) -> bool:
 
 async def require_local_business_access(request: Request) -> None:
     """Require per-request local HMAC plus an active account entitlement."""
+    # A file:// Electron renderer triggers a CORS OPTIONS preflight before
+    # signed JSON requests.  OPTIONS has no business payload and cannot carry
+    # the per-request HMAC; the actual POST/PUT/DELETE still passes through
+    # the signature and entitlement checks below.
+    if request.method.upper() == "OPTIONS":
+        return
     if not is_business_api_path(request.url.path):
         return
     if request.url.path.startswith(BRIDGE_PATH_PREFIX):

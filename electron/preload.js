@@ -40,6 +40,7 @@ const electronAPI = {
     sendCode: (phone) => ipcRenderer.invoke("account:send-code", phone),
     login: (phone, code) => ipcRenderer.invoke("account:login", phone, code),
     me: () => ipcRenderer.invoke("account:me"),
+    openDiagnostics: () => ipcRenderer.invoke("account:open-diagnostics"),
     onStateChange: (listener) => {
       if (typeof listener !== "function") return () => {};
       const handler = (_event, state) => listener(state);
@@ -55,6 +56,10 @@ const electronAPI = {
     catalog: () => ipcRenderer.invoke("official-ai:catalog"),
     createJob: (inputText, idempotencyKey, taskType) => ipcRenderer.invoke("official-ai:create-job", inputText, idempotencyKey, taskType),
     getJob: (jobId) => ipcRenderer.invoke("official-ai:get-job", jobId),
+    createVideoJob: (payload) => ipcRenderer.invoke("official-ai:create-video-job", payload),
+    getVideoJob: (jobId) => ipcRenderer.invoke("official-ai:get-video-job", jobId),
+    getStoryboardPrompt: (storyboardId) => ipcRenderer.invoke("official-ai:get-storyboard-prompt", storyboardId),
+    uploadVideoAsset: (asset) => ipcRenderer.invoke("official-ai:upload-video-asset", asset),
     saveAsset: (url, suggestedName) => ipcRenderer.invoke("official-ai:save-asset", url, suggestedName)
   },
   onLicenseInvalid: () => {},

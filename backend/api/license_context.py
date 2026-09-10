@@ -32,9 +32,14 @@ class SetContextRequest(BaseModel):
 async def set_license_context(req: SetContextRequest):
     try:
         claims = verify_account_license(req.account_license)
-    except AccountLicenseError:
+    except AccountLicenseError as exc:
+        logger.warning(
+            "[account-context] rejected account license: reason=%s local_unix_time=%s",
+            str(exc),
+            __import__("time").time(),
+        )
         # Do not expose parsing or signature details to a local caller.
-        raise HTTPException(status_code=403, detail="account_license_invalid")
+        raise HTTPException(status_code=403, detail=f"account_license_invalid:{exc}")
     _lc.set_verified_context(claims, req.machine_id)
     return {"success": True}
 
@@ -88,6 +93,14 @@ class SetCloudTokenRequest(BaseModel):
 
 @router.post("/set-cloud-token")
 async def set_cloud_token(req: SetCloudTokenRequest):
+    from services.offline_guard import cloud_enabled
+    if not cloud_enabled():
+        _cts.on_logout()
+        return {
+            "success": False,
+            "code": "production_cloud_disabled",
+            "message": "开发迁移版已切断生产云模型令牌链路",
+        }
     if not req.accessToken:
         return {"success": False, "message": "accessToken 必填"}
     _cts.on_verify_success({

@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from database.db import get_db
 from services.image_service import ImageService
 from services.llm_service import LLMService
+from services.storyboard_service import _extract_explicit_visible_character_names
 from utils.paths import resolve_db_path
 
 logger = logging.getLogger(__name__)
@@ -144,6 +145,61 @@ def _parse_json_list(raw: Any) -> List[str]:
     except Exception:
         pass
     return []
+
+
+def _resolve_topview_character_names(
+    *,
+    base_character_names: List[str],
+    prompt: str,
+    description: str,
+    character_elements: List[Dict[str, Any]],
+    manual_image_characters_raw: Any = None,
+) -> Tuple[List[str], str, str]:
+    """按视频页同一口径解析俯视图需要的人物。
+
+    历史实现只读 ``storyboards.characters`` 和 ``description``。新模板或旧脏数据
+    可能没有把人物回写到 characters，但视频页仍能从最新 prompt + 人物素材库识别
+    出 ``jimeng_characters``，于是界面明明有人物卡，俯视图却报“关联人物(空)”。
+
+    返回 ``(人物名单, 实际分镜文本, 来源)``，便于日志定位远端数据问题。
+    """
+    storyboard_text = str(prompt or "").strip() or str(description or "").strip()
+
+    # 复用即梦视频页的“画面首次出镜 / 手工人物图开关”解析口径，避免两套名单。
+    # 放在函数内导入，延续本模块 _match_element 的做法并避开路由模块初始化环。
+    from api.video import (
+        _optional_json_name_list,
+        _resolve_jimeng_character_references,
+    )
+
+    manual_image_characters = _optional_json_name_list(manual_image_characters_raw)
+    refs = _resolve_jimeng_character_references(
+        base_character_names,
+        storyboard_text,
+        character_elements,
+        manual_image_characters,
+        None,
+        None,
+    )
+    char_names = list(refs.get("image_names") or [])
+    source = (
+        "jimeng_manual_images"
+        if refs.get("image_selection_mode") == "manual"
+        else "jimeng_auto_visual"
+    )
+
+    # 俯视图表示本节结尾 B 点。模板显式给出最后一镜可见白名单时仍以它为最高优先级，
+    # 避免把已退场/画外发声人物重新放回结尾调度图。
+    ending_visible_names = _extract_explicit_visible_character_names(
+        storyboard_text,
+        character_elements,
+        ending_only=True,
+    )
+    if ending_visible_names is not None:
+        char_names = ending_visible_names
+        source = "ending_visible_whitelist"
+
+    return char_names, storyboard_text, source
 
 
 def _pick_element_image(elem: Dict[str, Any], priority: tuple) -> Optional[str]:
@@ -522,6 +578,128 @@ def _identity_fuzzy_score(target: Dict[str, Any], char_key: str) -> int:
     return best
 
 
+def _filter_dispatch_to_visible_characters(
+    data: Dict[str, Any],
+    allowed_names: List[str],
+    known_character_names: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """把俯视推演结果硬裁到结尾可见人物白名单。
+
+    LLM 即使从台词、OS、门外状态或关系说明里读到其他姓名，也不能让这些人
+    进入人物尾态、空间布局或生图提示词。发现污染时重建概述/布局，避免只删
+    characters 数组却仍由 summary 把画外人物画回去。
+    """
+    result = dict(data or {})
+    allowed = [str(name or "").strip() for name in allowed_names if str(name or "").strip()]
+    allowed_by_key = {_identity_name_key(name): name for name in allowed}
+
+    def _canonical_allowed(raw_name: Any) -> str:
+        key = _identity_name_key(raw_name)
+        if not key:
+            return ""
+        if key in allowed_by_key:
+            return allowed_by_key[key]
+        matches = [
+            (len(allowed_key), canonical)
+            for allowed_key, canonical in allowed_by_key.items()
+            if min(len(allowed_key), len(key)) >= 2
+            and (allowed_key in key or key in allowed_key)
+        ]
+        if not matches:
+            return ""
+        matches.sort(reverse=True)
+        if len(matches) > 1 and matches[0][0] == matches[1][0]:
+            return ""
+        return matches[0][1]
+
+    raw_characters = result.get("characters") or result.get("人物") or []
+    if isinstance(raw_characters, dict):
+        raw_characters = [
+            {"name": key, **(value if isinstance(value, dict) else {"state": value})}
+            for key, value in raw_characters.items()
+        ]
+    if not isinstance(raw_characters, list):
+        raw_characters = []
+
+    filtered: List[Dict[str, Any]] = []
+    seen = set()
+    rejected_names: List[str] = []
+    for item in raw_characters:
+        if not isinstance(item, dict):
+            continue
+        raw_name = str(item.get("name") or item.get("角色") or item.get("名称") or "").strip()
+        canonical = _canonical_allowed(raw_name)
+        if not canonical:
+            if raw_name:
+                rejected_names.append(raw_name)
+            continue
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        clean_item = dict(item)
+        clean_item["name"] = canonical
+        filtered.append(clean_item)
+
+    # 目标人物不能因为模型漏项而消失；补空记录交给后续调度约束兜底。
+    for name in allowed:
+        if name not in seen:
+            filtered.append({"name": name, "state": "按当前小节结尾可见状态呈现"})
+            seen.add(name)
+    result["characters"] = filtered
+    result.pop("人物", None)
+
+    known = [
+        str(name or "").strip()
+        for name in (known_character_names or [])
+        if str(name or "").strip()
+    ]
+    forbidden = [name for name in known if not _canonical_allowed(name)]
+    summary = str(result.get("summary") or result.get("结尾概述") or "")
+    layout = str(
+        result.get("spatial_layout")
+        or result.get("layout")
+        or result.get("空间布局")
+        or ""
+    )
+    polluted = bool(rejected_names) or any(
+        name and (name in summary or name in layout)
+        for name in forbidden
+    )
+    if polluted:
+        summary_parts: List[str] = []
+        layout_parts: List[str] = []
+        for item in filtered:
+            name = str(item.get("name") or "").strip()
+            position = str(item.get("position") or item.get("位置") or "").strip()
+            posture = str(item.get("posture") or item.get("姿态") or item.get("action") or item.get("动作") or "").strip()
+            holding = str(item.get("holding") or item.get("持有") or "").strip()
+            visible_bits = [bit for bit in (position, posture, holding) if bit]
+            summary_parts.append(f"{name}{'：' + '，'.join(visible_bits) if visible_bits else ''}")
+            layout_parts.append(f"{name}位于{position or '正文结尾可见位置'}")
+        result["summary"] = "；".join(summary_parts) or "按当前小节结尾可见人物呈现"
+        result["spatial_layout"] = "；".join(layout_parts)
+        result.pop("结尾概述", None)
+        result.pop("layout", None)
+        result.pop("空间布局", None)
+
+    # 防止模型把白名单外人物塞进 props/objects 逃过人物过滤。
+    raw_props = result.get("props") or result.get("objects") or result.get("道具") or []
+    if isinstance(raw_props, list) and forbidden:
+        result["props"] = [
+            item for item in raw_props
+            if not (
+                isinstance(item, dict)
+                and any(
+                    name in str(item.get("name") or item.get("名称") or "")
+                    for name in forbidden
+                )
+            )
+        ]
+        result.pop("objects", None)
+        result.pop("道具", None)
+    return result
+
+
 def _format_identity_binding_text(data: Dict[str, Any], target_names: List[Any]) -> str:
     """从 LLM 调度结构里抽一行给视频模型用的身份绑定。
 
@@ -658,11 +836,13 @@ def _build_dispatch_infer_messages(description: str, scene_names: List[str], cha
         "你是影视分镜调度师。任务是只根据当前小节正文,推演本节结束最后一刻的俯视调度状态。"
         "不要引用或依赖任何「场景起始状态」「本节结尾状态」模板块;输入里若出现状态块也视为无效。"
         "若提供上一小节结尾俯视调度,它就是本节开始时刻A点;你要推演本节正文结束后的B点。"
+        "结尾可见人物硬白名单拥有最高优先级:不在白名单中的姓名即使出现在台词、OS、关系说明、"
+        "门外/画外状态或上一小节里,也一律视为本图不可见,不得写入任何输出字段。"
         "输出必须是严格 JSON,不要 Markdown。"
     )
     user = (
         f"场景:{'、'.join(scene_names) or '未知'}\n"
-        f"人物:{'、'.join(char_names) or '未知'}\n"
+        f"结尾可见人物硬白名单:{'、'.join(char_names) or '无'}\n"
         f"道具:{'、'.join(prop_names) or '无'}\n\n"
         f"{prev_text}"
         f"{reference_text}"
@@ -677,7 +857,10 @@ def _build_dispatch_infer_messages(description: str, scene_names: List[str], cha
         '  "props": [{"name": "关键道具", "position": "最后所在位置", "state": "可见状态"}]\n'
         "}\n"
         "只写正文能推出的内容;不确定的持有物写空字符串。\n"
-        "characters 里的 marker_color 必须沿用上方分配的颜色框颜色,不要自行换色;每个目标人物都必须保留一条记录。\n"
+        "characters 只能逐一输出结尾可见人物硬白名单中的人物,每人恰好一条,严禁增加白名单外姓名;"
+        "marker_color 必须沿用上方分配的颜色框颜色,不要自行换色。\n"
+        "正文里仅被谈及、处于门外/画外、已经退场或只在上一小节出现的人物,不得写进 summary、"
+        "spatial_layout、characters、props,也不得降级成背景路人。\n"
         "不要输出 appearance/外观/服饰颜色字段,也不要根据小说文字概括人物衣服颜色;人物外观只由后续生图阶段的人物参考图决定。\n"
         "位置描述规则(重要):你看不到实际俯视地图,所以 position 和 spatial_layout 里"
         "严禁使用「画面左1/3」「两侧后景」「中轴线」等画面坐标,也不要断言街道朝向(东西向/南北向)。"
@@ -692,6 +875,7 @@ async def _infer_end_dispatch(storyboard_id: int, novel_id: int, description: st
                               prop_names: List[str],
                               prev_context: Optional[Dict[str, Any]] = None,
                               character_refs: Optional[List[Dict[str, Any]]] = None,
+                              known_character_names: Optional[List[str]] = None,
                               llm_config_id: Optional[int] = None) -> Dict[str, Any]:
     configs = await LLMService.get_all(config_type="llm")
     if llm_config_id:
@@ -726,6 +910,11 @@ async def _infer_end_dispatch(storyboard_id: int, novel_id: int, description: st
             "characters": [{"name": name, "state": "按正文最后一刻呈现"} for name in char_names[:2]],
             "props": [{"name": name, "state": "按正文最后一刻呈现"} for name in prop_names[:4]],
         }
+    parsed = _filter_dispatch_to_visible_characters(
+        parsed,
+        char_names,
+        known_character_names=known_character_names,
+    )
     return {
         "raw": raw or "",
         "data": parsed,
@@ -805,7 +994,8 @@ async def fuse_topview_demo(storyboard_id: int, request: Optional[TopviewFuseReq
     db = await get_db()
     try:
         cur = await db.execute(
-            "SELECT id, novel_id, description, characters, scenes, props FROM storyboards WHERE id = ?",
+            "SELECT id, novel_id, description, prompt, characters, scenes, props, "
+            "jimeng_image_characters FROM storyboards WHERE id = ?",
             (storyboard_id,),
         )
         sb = await cur.fetchone()
@@ -827,10 +1017,26 @@ async def fuse_topview_demo(storyboard_id: int, request: Optional[TopviewFuseReq
     char_pool = [e for e in elements if e["element_type"] == "character"]
 
     scene_names = _parse_json_list(sb["scenes"])
-    # v3(codex 审核 P3):不预截 [:2] — 遍历全部人物,收满 2 个唯一人物即停,
-    # 防前两个名字匹配到同一元素时,第三个有效人物没机会补位。
-    char_names = _parse_json_list(sb["characters"])
+    base_char_names = _parse_json_list(sb["characters"])
     prop_names = _parse_json_list(sb["props"])
+
+    # 与视频页统一：先按 prompt + 当前人物图开关解析出镜人物，再用最后一镜
+    # 可见白名单收口到结尾 B 点。兼容 characters 为空但页面人物卡正常的旧/新模板数据。
+    char_names, storyboard_text, character_source = _resolve_topview_character_names(
+        base_character_names=base_char_names,
+        prompt=sb["prompt"] or "",
+        description=sb["description"] or "",
+        character_elements=char_pool,
+        manual_image_characters_raw=sb["jimeng_image_characters"],
+    )
+    known_character_names = [str(e.get("name") or "").strip() for e in char_pool if e.get("name")]
+    logger.info(
+        "[topview-demo] sb=%s 人物来源=%s DB人物=%s 当前俯视人物=%s",
+        storyboard_id,
+        character_source,
+        base_char_names,
+        char_names,
+    )
 
     scene_elem = _match_element(scene_names[0], scene_pool, "scene") if scene_names else None
     if not scene_elem:
@@ -902,7 +1108,12 @@ async def fuse_topview_demo(storyboard_id: int, request: Optional[TopviewFuseReq
         missing_names = [n for n in char_names if n not in _matched_input_names]
         logger.warning("[topview-demo] sb=%s 部分人物没有可用参考图: %s", storyboard_id, missing_names)
     if not chars:
-        raise HTTPException(status_code=400, detail=f"分镜关联人物({char_names or '空'})都没有可用立绘")
+        if not char_names:
+            raise HTTPException(
+                status_code=400,
+                detail="当前分镜未识别到结尾可见人物（基础关联、人物图名单和提示词白名单均为空）",
+            )
+        raise HTTPException(status_code=400, detail=f"分镜关联人物({char_names})都没有可用立绘")
 
     config_id = (request.config_id if request else None) or await _default_image_config_id()
     if not config_id:
@@ -925,12 +1136,13 @@ async def fuse_topview_demo(storyboard_id: int, request: Optional[TopviewFuseReq
     dispatch = await _infer_end_dispatch(
         storyboard_id=storyboard_id,
         novel_id=novel_id,
-        description=sb["description"] or "",
+        description=storyboard_text,
         scene_names=scene_names,
         char_names=char_names,
         prop_names=prop_names,
         prev_context=prev_topview,
         character_refs=chars,
+        known_character_names=known_character_names,
         llm_config_id=request.llm_config_id if request else None,
     )
     dispatch_text = dispatch["dispatch_text"]
@@ -1008,6 +1220,7 @@ async def fuse_topview_demo(storyboard_id: int, request: Optional[TopviewFuseReq
             "只允许把人物/关键道具从参考图1的开始时刻A点,按照本节正文和尾态推演移动到本节结尾B点;"
             "人物、马车、车辆、道具只能移动到道路、院落、室内地面等可行走/可承载区域,不得移动到屋顶、墙体、树冠或建筑阴影上;"
             "旧人物站位需要被新的结尾站位替换,不要残留重复人物,也不得因为底板已有旧人物而省略本节目标人物;"
+            "参考图1中任何不属于本节目标人物名单的旧人物、无框人物、画外人物都必须移除,不得沿用到结尾B图;"
             "参考图1里已有的旧颜色框只代表上一节起点,必须随人物移动并按本节人物颜色框规则更新,不要在旧位置残留。"
         )
     base_text = (
@@ -1031,7 +1244,8 @@ async def fuse_topview_demo(storyboard_id: int, request: Optional[TopviewFuseReq
         "矩形框应贴近对应人物,不得框住其他人物或背景物。"
         "背景路人、围观群众、随从等非目标人物一律不得带颜色框。"
         "严禁少人、合并人物、用背影/遮挡代替目标人物,每位目标人物最终只出现一次。"
-        "除上述目标人物和分镜/尾态推演明确要求的背景人群外,不要主动新增路人、随从或围观者;"
+        "除上述目标人物和尾态推演明确要求的无名背景人群外,不要主动新增路人、随从或围观者;"
+        "任何有姓名但不在上述目标人物名单中的角色,即使正文提到其在门外、画外、回忆中或台词中,也绝不允许出现在图里;"
         "若尾态推演提到围观群众/权贵夫人小姐/路人,只能作为弱化背景小人影,不得替代或吞掉目标人物。"
         "所有人物、车马、家具与建筑必须保持真实世界比例:成年人身高约等于普通门高,"
         "马车、桌椅等物件不得明显大于真实尺度,人物在俯视全景中应显著小于建筑。"

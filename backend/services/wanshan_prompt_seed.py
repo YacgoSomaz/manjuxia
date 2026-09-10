@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import json
+import re
 
 from database.db import get_db
 from utils.paths import get_data_dir
@@ -154,6 +155,90 @@ def _seed_file_path() -> str:
     return os.path.join(backend_dir, "data", "wanshan_prompt_seed.json")
 
 
+# Keep the runtime IDs and labels that the frontend already uses, while using
+# the complete, source-controlled storyboard prompts exported from GitHub.
+# This avoids a silent fallback to the old abbreviated prompt bodies when a
+# user has previously selected a template by ID.
+GITHUB_STORYBOARD_OVERRIDES = {
+    # The selector's initial/default template is qianshan ID 23 (DB id 7).
+    # It previously retained the abbreviated local body, which is why the
+    # generated result contained empty `镜号N:` fields.  Pin every general
+    # template to the complete GitHub body as well, not only the later IDs.
+    23: "014_storyboard_generation_通用语速版·无状态版.md",
+    24: "014_storyboard_generation_通用语速版·无状态版.md",
+    25: "014_storyboard_generation_通用语速版·无状态版.md",
+    26: "014_storyboard_generation_通用语速版·无状态版.md",
+    47: "014_storyboard_generation_通用语速版·无状态版.md",
+    27: "010_storyboard_generation_古偶权谋赵小丁式-最新规则版130.md",
+    28: "008_storyboard_generation_即梦2.0分镜模版-古偶重生复仇 _ 宅斗权谋 _ 恶女高光风【新款】.md",
+    29: "013_storyboard_generation_罗杰狄金斯式冷峻现实主义-最新规则版.md",
+    30: "004_storyboard_generation_仙侠修仙·东方玄幻史诗-最新规则版.md",
+    49: "004_storyboard_generation_仙侠修仙·东方玄幻史诗-最新规则版.md",
+    31: "012_storyboard_generation_机甲科幻·巨兽战争-最新规则版.md",
+    50: "012_storyboard_generation_机甲科幻·巨兽战争-最新规则版.md",
+    32: "009_storyboard_generation_即梦2.0分镜模版-江湖武林 _ 传统武侠 _ 刀剑恩怨【新款】.md",
+    33: "014_storyboard_generation_通用语速版·无状态版.md",
+    34: "014_storyboard_generation_通用语速版·无状态版.md",
+    35: "014_storyboard_generation_通用语速版·无状态版.md",
+    36: "014_storyboard_generation_通用语速版·无状态版.md",
+    37: "008_storyboard_generation_即梦2.0分镜模版-古偶重生复仇 _ 宅斗权谋 _ 恶女高光风【新款】.md",
+    38: "013_storyboard_generation_罗杰狄金斯式冷峻现实主义-最新规则版.md",
+    39: "014_storyboard_generation_通用语速版·无状态版.md",
+    40: "014_storyboard_generation_通用语速版·无状态版.md",
+    41: "010_storyboard_generation_古偶权谋赵小丁式-最新规则版130.md",
+    42: "013_storyboard_generation_罗杰狄金斯式冷峻现实主义-最新规则版.md",
+    43: "013_storyboard_generation_罗杰狄金斯式冷峻现实主义-最新规则版.md",
+    44: "014_storyboard_generation_通用语速版·无状态版.md",
+    45: "008_storyboard_generation_即梦2.0分镜模版-古偶重生复仇 _ 宅斗权谋 _ 恶女高光风【新款】.md",
+    46: "014_storyboard_generation_通用语速版·无状态版.md",
+    48: "014_storyboard_generation_通用语速版·无状态版.md",
+    51: "014_storyboard_generation_通用语速版·无状态版.md",
+    62: "014_storyboard_generation_通用语速版·无状态版.md",
+}
+
+
+def _github_storyboard_dir() -> str:
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(backend_dir, "data", "github_storyboard_templates")
+
+
+def _read_github_storyboard_body(filename: str) -> str:
+    """Read the Markdown body after its front matter, without requiring PyYAML."""
+    path = os.path.join(_github_storyboard_dir(), filename)
+    if not os.path.exists(path):
+        logger.warning("[wanshan_prompt_seed] GitHub storyboard file missing: %s", path)
+        return ""
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = handle.read()
+    parts = re.split(r"^---\s*$", raw, maxsplit=2, flags=re.MULTILINE)
+    return parts[2].lstrip("\r\n") if len(parts) == 3 else raw
+
+
+def _apply_github_storyboard_overrides(templates):
+    for template in templates:
+        if (template.get("category") or "").strip() != "storyboard_generation":
+            continue
+        # Exact production request traces are authoritative.  Do not replace a
+        # recovered genre-specific prompt with one of the older generic GitHub
+        # fallbacks during application startup.
+        if (template.get("source") or "").startswith("deepseek_trace:"):
+            continue
+        try:
+            template_id = int(template.get("qianshan_id"))
+        except (TypeError, ValueError):
+            continue
+        filename = GITHUB_STORYBOARD_OVERRIDES.get(template_id)
+        if not filename:
+            continue
+        content = _read_github_storyboard_body(filename)
+        if not content:
+            continue
+        template["content"] = content
+        template["source"] = f"github:qianshan/prompts/templates/{filename}"
+        template["description"] = "GitHub 完整高质量分镜提示词（按当前模板 ID 保持兼容）"
+    return templates
+
+
 async def seed_prompt_templates() -> int:
     """Seed bundled prompt templates into the local SQLite database.
 
@@ -170,7 +255,7 @@ async def seed_prompt_templates() -> int:
             with open(path, "r", encoding="utf-8") as f:
                 templates = _normalize_template_payload(json.load(f)) or []
 
-    templates = list(templates)
+    templates = _apply_github_storyboard_overrides(list(templates))
 
     categories_with_content = {
         (tpl.get("category") or "uncategorized").strip()

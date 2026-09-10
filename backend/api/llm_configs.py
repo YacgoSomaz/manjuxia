@@ -6,6 +6,7 @@ from services.llm_service import LLMService
 from services.model_presets import get_model_presets, get_all_presets, get_provider_presets
 from services.trusted_providers import require_trusted_model_url
 from utils.local_signature import require_local_signature
+from utils.timezone import now_beijing_str
 import httpx
 
 router = APIRouter(
@@ -13,6 +14,49 @@ router = APIRouter(
     tags=["llm-configs"],
     dependencies=[Depends(require_local_signature)],
 )
+
+
+def _official_capability_config(config_type: str) -> Optional[Dict[str, Any]]:
+    """Return a local display-only official-compute capability row.
+
+    It deliberately contains no provider endpoint or key.  Electron resolves
+    the account session and the service-side task configuration only when a
+    user actually starts an official task.
+    """
+    if config_type == "llm":
+        config_id, model_name = -900001, "comic_creation"
+    elif config_type == "image":
+        config_id, model_name = -900002, "comic_image"
+    elif config_type == "video":
+        # Video page renders both rows in the existing configuration selector.
+        # They are capability markers only: no endpoint/key is ever present.
+        # Keep this model identifier user-visible as well: the bundled video
+        # view uses it to classify the option as an Ark/Seedance provider.
+        config_id, model_name = -900004, "Seedance2"
+    else:
+        return None
+    now = now_beijing_str()
+    return {
+        "id": config_id,
+        "name": "官方算力",
+        "base_url": "",
+        "api_key": "",
+        "model_name": model_name,
+        "temperature": 0.7,
+        "max_tokens": 65536,
+        "context_window": 131072,
+        "extra_params": "{}",
+        "config_type": config_type,
+        "image_ratio": "16:9",
+        "request_timeout": 120,
+        "download_timeout": 120,
+        "retry_count": 0,
+        "generation_mode": "",
+        "duration": 15,
+        "browser_path": "",
+        "created_at": now,
+        "updated_at": now,
+    }
 
 
 # ==================== 列表 & 创建 ====================
@@ -39,6 +83,58 @@ async def get_llm_configs(
         if "登录已失效" in msg or "登录已" in msg:
             raise HTTPException(status_code=401, detail="登录已失效,请退出后重新打开千山漫剧重新登录")
         raise HTTPException(status_code=500, detail=msg)
+    # Stable local capability markers prevent a transient account/catalog
+    # request from making the existing production selector render "No data".
+    # Video is deliberately included for local_only requests too: the video
+    # screen uses that query when it fills its per-provider selectors. These
+    # two rows are display-only markers and never contain a URL or API key.
+    include_official = config_type in {"llm", "image"} and not local_only
+    include_official = include_official or config_type == "video"
+    if include_official:
+        official = _official_capability_config(config_type)
+        if official and not any(item.get("id") == official["id"] for item in configs):
+            configs.append(official)
+        if config_type == "video" and not any(item.get("id") == -900005 for item in configs):
+            minimax = dict(official)
+            # The existing NewAPI selector recognizes this model family by
+            # name. It still only sends the negative ID to Electron, never a
+            # provider base URL or credential.
+            minimax.update({
+                "id": -900005,
+                "name": "官方 NewAPI · MiniMax H3",
+                "model_name": "minimax-H3-1080p-IR",
+            })
+            configs.append(minimax)
+        if config_type == "video":
+            official["name"] = "官方 Seedance2"
+        if config_type == "llm" and not any(item.get("id") == -900006 for item in configs):
+            deepseek = dict(official)
+            deepseek.update({"id": -900006, "name": "官方 DeepSeek V4.1", "model_name": "deepseek-v4-pro"})
+            configs.append(deepseek)
+    # Older development databases may contain an earlier version of the
+    # display-only official rows.  Normalize them on every read so a legacy
+    # base URL/key can never look like a user-editable official credential.
+    official_video_rows = {
+        -900004: ("官方 Seedance2", "Seedance2"),
+        -900005: ("官方 NewAPI · MiniMax H3", "minimax-H3-1080p-IR"),
+    }
+    for item in configs:
+        if not isinstance(item, dict):
+            continue
+        try:
+            marker = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if marker not in official_video_rows:
+            continue
+        name, model_name = official_video_rows[marker]
+        item.update({
+            "name": name,
+            "model_name": model_name,
+            "base_url": "",
+            "api_key": "",
+            "official_ai": True,
+        })
     return configs
 
 

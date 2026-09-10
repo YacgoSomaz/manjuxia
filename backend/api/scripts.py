@@ -10,11 +10,15 @@ from models.scripts import (
     ScriptConvertResponse,
     SingleScriptConvertRequest,
     ScriptConvertResult,
-    OfficialScriptResultRequest
+    OfficialScriptResultRequest,
+    OfficialScriptPromptRequest,
 )
 from services.script_service import ScriptService
 from services.log_service import check_novel_running
+from services.tag_service import TagService
+from services.template_service import get_by_id as get_template_by_id
 import io
+import json
 from openpyxl import Workbook, load_workbook
 from urllib.parse import quote
 from utils.timezone import now_beijing_str
@@ -30,6 +34,8 @@ async def convert_scripts(request: ScriptConvertRequest):
     - 如果指定了 chapter_ids，则只转换这些章节
     - 否则转换小说的所有章节
     """
+    await TagService.require_conversion_tags(request.novel_id)
+
     # 冲突检查
     db = await get_db()
     try:
@@ -56,6 +62,8 @@ async def convert_single_script(request: SingleScriptConvertRequest):
     
     用于前端逐章节转换，实时显示进度
     """
+    await TagService.require_conversion_tags(request.novel_id)
+
     # 冲突检查
     db = await get_db()
     try:
@@ -119,6 +127,99 @@ async def save_official_script_result(request: OfficialScriptResultRequest):
     if not result:
         raise HTTPException(status_code=500, detail="剧本保存后读取失败")
     return result
+
+
+@router.post("/official-prompt")
+async def prepare_official_script_prompt(request: OfficialScriptPromptRequest):
+    """Build the same prompt and output guard as the production local LLM path."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT id, title, content FROM chapters WHERE id=? AND novel_id=?",
+            (request.chapter_id, request.novel_id),
+        )
+        chapter = await cursor.fetchone()
+    finally:
+        await db.close()
+    if not chapter:
+        raise HTTPException(status_code=404, detail="章节不存在或不属于当前小说")
+
+    template = await get_template_by_id(request.template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="剧本转换模板不存在")
+
+    chapter_title = chapter["title"] or "未命名章节"
+    chapter_content = chapter["content"] or ""
+    template_content = template.get("content") or ""
+    try:
+        variables = json.loads(template.get("variables") or "[]")
+    except Exception:
+        variables = []
+    if not isinstance(variables, list):
+        variables = []
+    variable_map = {
+        "novel_content": chapter_content,
+        "chapter_content": chapter_content,
+        "content": chapter_content,
+        "chapter": chapter_content,
+        "text": chapter_content,
+        "chapter_title": chapter_title,
+        "title": chapter_title,
+        "chapter_id": str(request.chapter_id),
+    }
+    prompt = template_content
+    has_replacement = False
+    for variable in variables:
+        placeholder1 = f"{{{variable}}}"
+        if placeholder1 in prompt:
+            prompt = prompt.replace(placeholder1, variable_map.get(variable, ""))
+            has_replacement = True
+        placeholder2 = f"{{{{{variable}}}}}"
+        if placeholder2 in prompt:
+            prompt = prompt.replace(placeholder2, variable_map.get(variable, ""))
+            has_replacement = True
+    if not has_replacement:
+        for variable, value in variable_map.items():
+            placeholder1 = f"{{{variable}}}"
+            if placeholder1 in prompt:
+                prompt = prompt.replace(placeholder1, value)
+                has_replacement = True
+            placeholder2 = f"{{{{{variable}}}}}"
+            if placeholder2 in prompt:
+                prompt = prompt.replace(placeholder2, value)
+                has_replacement = True
+    if prompt == template_content or not has_replacement:
+        prompt = f"{template_content}\n\n以下是需要转换的小说章节内容：\n\n章节标题：{chapter_title}\n\n{chapter_content}"
+
+    try:
+        previous = await ScriptService._get_prev_chapter_last_scene(request.novel_id, request.chapter_id)
+        if previous:
+            prev_scene_title = previous.get("scene_title") or ""
+            prev_tail = (previous.get("scene_content") or "")[-600:]
+            prompt += (
+                "\n\n---\n\n"
+                "【上一章剧本结尾场景·重要衔接参考】\n"
+                f"上一章最后一个场景标头: {prev_scene_title}\n"
+                f"上一章最后一个场景结尾内容:\n{prev_tail}\n\n"
+                "【衔接规则】\n"
+                "1. 若当前章节开头的小说文本没有明确切换场景,请延续上一章最后场景(保留地点/时间/人物位置连续)\n"
+                "2. 若当前文本显式切换场景(有『次日』『换到 xxx』『另一边』等),按新场景拆分\n"
+                "3. 人物状态(姿势/伤势/情绪/所持道具)默认延续,除非文本里明确写了变化\n"
+            )
+    except Exception:
+        pass
+
+    guard = (
+        "你是一位专业的剧本编写助手，请将内容转换为视频剧本格式。"
+        "\n\n【输出硬约束(最高优先级,必须遵守)】"
+        "\n1. 只输出剧本正文本身。第一个字符必须是剧本场景标头(如 【外 xxx 日】/【内 xxx 夜】/【黑屏字卡:xxx】),不允许任何前言。"
+        "\n2. 直接输出中文剧本内容,严禁输出任何英文思考过程(如 **Refining Novel to Script**、I'm processing... 等)。"
+        "\n3. 严禁在剧本前加任何元描述(如 'Here is the script:' / '以下是剧本:' / '我来转换:')。"
+        "\n4. 严禁输出以下任何内容:导演意图、关键事件、节奏位、剧情梗概/简介、字数或时长预估(如「1046 字 · 约 1 分 24 秒」)、"
+        "秒数节拍标(如「(0-10秒 · 钩子)」「(11-30秒)」)、分隔线(———/---)。"
+        "\n5. 严禁任何解释、总结、思考链、markdown 代码块包裹。场景之间最多一个空行。"
+    )
+    return {"success": True, "prompt": f"{guard}\n\n{prompt}", "chapter_title": chapter_title}
 
 
 # 注意：精确路径路由（/export, /import, /all）必须放在通配路由 /novel/{novel_id} 之前
@@ -392,7 +493,7 @@ async def import_scripts_excel(novel_id: int, file: UploadFile = File(...)):
                 # v3.61.142:批量导入也算"本地编辑",打 dirty 标记防被短剧同步覆盖
                 if content is not None:
                     await db.execute(
-                        "UPDATE scripts SET content = ?, remote_version = -1 WHERE id = ?",
+                        "UPDATE scripts SET content = ?, remote_version = -1, sync_outdated = 0 WHERE id = ?",
                         (content, script_id)
                     )
                     updated_count += 1

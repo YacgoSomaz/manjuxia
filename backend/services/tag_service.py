@@ -1,4 +1,5 @@
 import json
+import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
@@ -186,26 +187,6 @@ def _unique_tag_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 class TagService:
     @staticmethod
-    def select_analysis_config(configs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """Pick the most suitable text model for lightweight tag analysis."""
-        llm_configs = [c for c in configs if str(c.get("config_type") or "llm") == "llm"]
-        if not llm_configs:
-            return None
-
-        def score(config: Dict[str, Any]) -> int:
-            text = " ".join(str(config.get(k) or "").lower() for k in ("name", "base_url", "model_name", "provider_code"))
-            value = 0
-            if "deepseek" in text:
-                value += 100
-            if "标签" in text or "tag" in text:
-                value += 40
-            if "flash" in text or "chat" in text:
-                value += 10
-            return value
-
-        return sorted(llm_configs, key=lambda c: (score(c), int(c.get("id") or 0)), reverse=True)[0]
-
-    @staticmethod
     async def seed_definitions(db=None) -> None:
         own_db = db is None
         if own_db:
@@ -370,7 +351,7 @@ class TagService:
             from services.llm_service import LLMService
 
             configs = await LLMService.get_all("llm")
-            config = TagService.select_analysis_config(configs)
+            config = configs[0] if configs else None
             config_id = config.get("id") if isinstance(config, dict) else None
             if config_id:
                 raw = await LLMService.call_llm(

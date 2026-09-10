@@ -9,79 +9,6 @@ from services.template_service import get_by_id as get_template_by_id
 logger = logging.getLogger(__name__)
 
 
-def _repair_unbalanced_delimiters(text: str) -> Optional[str]:
-    """Repair only missing JSON object/array closers; leave other syntax untouched."""
-    pairs = {"{": "}", "[": "]"}
-    stack = []
-    output = []
-    in_string = False
-    escaped = False
-
-    for index, char in enumerate(text):
-        if in_string:
-            if char == "”" and re.match(r"\s*[,}\]]", text[index + 1:]):
-                output.append('"')
-                in_string = False
-                continue
-            if char == "\n":
-                output.append("\\n")
-                continue
-            if char == "\r":
-                output.append("\\n")
-                continue
-            if char == "\t":
-                output.append("\\t")
-                continue
-            output.append(char)
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-
-        if char == '"':
-            in_string = True
-            output.append(char)
-            continue
-        if char in pairs:
-            stack.append(char)
-            output.append(char)
-            continue
-        if char in ("}", "]"):
-            opener = "{" if char == "}" else "["
-            if not stack or opener not in stack:
-                return None
-            while stack and pairs[stack[-1]] != char:
-                output.append(pairs[stack.pop()])
-            stack.pop()
-            output.append(char)
-            continue
-        output.append(char)
-
-    if in_string:
-        return None
-    while stack:
-        output.append(pairs[stack.pop()])
-    return "".join(output)
-
-
-def _loads_json_with_repair(candidate: str) -> Optional[dict]:
-    try:
-        value = json.loads(candidate)
-        return value if isinstance(value, dict) else None
-    except json.JSONDecodeError:
-        repaired = _repair_unbalanced_delimiters(candidate)
-        if not repaired or repaired == candidate:
-            return None
-        try:
-            value = json.loads(repaired)
-            return value if isinstance(value, dict) else None
-        except json.JSONDecodeError:
-            return None
-
-
 def _extract_json(text: str) -> Optional[dict]:
     """从 LLM 返回的文本中提取 JSON，容错处理"""
     if not text:
@@ -90,28 +17,30 @@ def _extract_json(text: str) -> Optional[dict]:
     match = re.search(r'```json\s*([\s\S]*?)```', text)
     if match:
         json_str = match.group(1).strip()
-        parsed = _loads_json_with_repair(json_str)
-        if parsed is not None:
-            return parsed
-        else:
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
             logger.warning("从代码块提取的 JSON 解析失败")
     # 2. 尝试提取 ``` ... ``` 代码块
     match = re.search(r'```\s*([\s\S]*?)```', text)
     if match:
         json_str = match.group(1).strip()
-        parsed = _loads_json_with_repair(json_str)
-        if parsed is not None:
-            return parsed
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
     # 3. 尝试直接解析整个文本
-    parsed = _loads_json_with_repair(text.strip())
-    if parsed is not None:
-        return parsed
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        pass
     # 4. 尝试提取第一个 { ... } 块
     match = re.search(r'\{[\s\S]*\}', text)
     if match:
-        parsed = _loads_json_with_repair(match.group())
-        if parsed is not None:
-            return parsed
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
     logger.error("无法从 LLM 返回中解析 JSON")
     return None
 

@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import List, Optional, Dict, Any
 from database.db import get_db
 
@@ -10,6 +11,28 @@ from utils.timezone import now_beijing_str
 
 
 class ScriptService:
+    @staticmethod
+    def _normalize_scene_heading_prefixes(script_content: str) -> str:
+        """Remove model-invented scene labels before real bracket headings.
+
+        Some LLMs output lines such as "场1 【内 清幽院内室 日】" despite the
+        prompt requiring the first character to be the scene heading. Downstream
+        scene splitters treat that "场1 " as prefix text, which can pollute scene
+        titles and continuity. Keep the real bracket heading and drop only the
+        mechanical scene label.
+        """
+        if not script_content:
+            return script_content
+        scene_head = (
+            r"(?:外|内|外/内|内/外)\s+[^】\]]+"
+            r"|黑屏字卡[:：][^】\]]+"
+            r"|黑屏[^】\]]*|序幕[^】\]]*|片头[^】\]]*|片尾[^】\]]*"
+        )
+        pattern = re.compile(
+            rf"(?m)^(\s*)(?:场景?\s*\d+|第\s*\d+\s*场)\s*[：:、.．-]?\s*([【\[](?:{scene_head})[】\]])"
+        )
+        return pattern.sub(r"\1\2", script_content)
+
     @staticmethod
     async def convert_chapter(
         novel_id: int,
@@ -181,6 +204,8 @@ class ScriptService:
                         "chapter_title": chapter_title
                     }
 
+                script_content = ScriptService._normalize_scene_heading_prefixes(script_content)
+
                 # v3.61.89: 剥离 reasoning 模型(Gemini-3.1-pro / Claude)输出的思考链
                 # 现象(2026-05-15 起):Gemini 3.1 Pro 服务端把 thinking 默认从隐藏改成附带输出,
                 #       LLM 把"思考过程"也写进 content,前半段是 **Refining Novel to Script** /
@@ -265,7 +290,7 @@ class ScriptService:
                 # 更新现有剧本(同时更新 template_id 为本次用的)
                 # v3.61.142:LLM 重新生成也算"本地版本",打 dirty 标记防被短剧同步覆盖
                 await db.execute(
-                    "UPDATE scripts SET content = ?, template_id = ?, remote_version = -1 WHERE id = ?",
+                    "UPDATE scripts SET content = ?, template_id = ?, remote_version = -1, sync_outdated = 0 WHERE id = ?",
                     (script_content, template_id, existing["id"])
                 )
                 await db.commit()
@@ -450,7 +475,8 @@ class ScriptService:
                     "chapter_id": row["chapter_id"],
                     "content": row["content"],
                     "created_at": row["created_at"],
-                    "chapter_title": row["chapter_title"]
+                    "chapter_title": row["chapter_title"],
+                    "sync_outdated": (row["sync_outdated"] if "sync_outdated" in row.keys() else 0) or 0,
                 })
             
             return {
@@ -540,7 +566,7 @@ class ScriptService:
                 return None
 
             await db.execute(
-                "UPDATE scripts SET content = ?, remote_version = -1 WHERE id = ?",
+                "UPDATE scripts SET content = ?, remote_version = -1, sync_outdated = 0 WHERE id = ?",
                 (content, script_id)
             )
             await db.commit()

@@ -15,6 +15,7 @@ import aiohttp
 from database.db import get_db
 from services.extraction_service import ExtractionService
 from services.llm_service import LLMService
+from services.scene_reference_service import prepare_scene_reference, dispose_scene_references
 from services.storyboard_service import (
     StoryboardService,
     _build_storyboard_assemble_payload,
@@ -192,6 +193,45 @@ async def _anchor_material_names(storyboard_id: Optional[int]) -> Dict[str, List
         "scenes": scenes,
         "props": _names_from_json(anchor.get("props_json")),
     }
+
+
+def _one_scene_name(values: Any) -> str:
+    if not isinstance(values, list):
+        return ""
+    cleaned = list(dict.fromkeys(str(item or "").strip() for item in values if str(item or "").strip()))
+    return cleaned[0] if len(cleaned) == 1 else ""
+
+
+def _supplement_scene_title(
+    task: Dict[str, Any],
+    anchor: Optional[Dict[str, Any]],
+    script_text: str,
+) -> str:
+    """Pick one authoritative scene only; never guess between multiple assets."""
+    selected = _one_scene_name(task.get("scenes"))
+    if selected:
+        return selected
+
+    if anchor:
+        selected = _one_scene_name(_names_from_json(anchor.get("scenes_json")))
+        if selected:
+            return selected
+        info = _json_loads(anchor.get("section_info"), {})
+        if isinstance(info, dict) and str(info.get("scene") or "").strip():
+            return str(info.get("scene") or "").strip()
+
+    materials = task.get("materials") or {}
+    if isinstance(materials, dict):
+        selected = _one_scene_name([
+            item.get("name")
+            for item in (materials.get("scenes") or [])
+            if isinstance(item, dict)
+        ])
+        if selected:
+            return selected
+
+    header = re.search(r"[【\[]([^】\]]+)[】\]]", script_text or "")
+    return header.group(0).strip() if header else ""
 
 
 async def _match_supplement_elements(novel_id: int, text: str, task: Optional[Dict[str, Any]] = None) -> Dict[str, List[str]]:
@@ -433,6 +473,84 @@ def _missing_assets(materials: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str
     return missing
 
 
+async def _persist_material_asset_snapshot(
+    task_id: int,
+    materials: Dict[str, List[Dict[str, Any]]],
+    missing_assets: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Persist resolved assets without treating the task itself as user-edited."""
+    db = await get_db()
+    try:
+        await db.execute(
+            """
+            UPDATE supplement_video_tasks
+               SET materials_json=?, missing_assets_json=?
+             WHERE id=?
+            """,
+            (
+                _json_dumps(materials),
+                _json_dumps(missing_assets),
+                task_id,
+            ),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+    return await _get_task(task_id)
+
+
+async def _refresh_material_asset_snapshots(
+    task: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Re-resolve already-associated names against the latest extraction assets.
+
+    Supplement tasks keep names as the stable association. Image/audio fields are
+    only snapshots and may become stale when an extracted element is replaced
+    while keeping the same name/path.
+    """
+    if not task or not task.get("id") or not task.get("novel_id"):
+        return task
+
+    names: Dict[str, List[str]] = {"characters": [], "scenes": [], "props": []}
+    existing_materials = task.get("materials") or {}
+    for key in names:
+        source_names = task.get(key) or [
+            item.get("name")
+            for item in existing_materials.get(key) or []
+            if item.get("name")
+        ]
+        seen = set()
+        for name in source_names:
+            clean = str(name or "").strip()
+            normalized = clean.lower()
+            if clean and normalized not in seen:
+                names[key].append(clean)
+                seen.add(normalized)
+
+    if not any(names.values()):
+        return task
+
+    materials = await _load_elements_by_name(int(task["novel_id"]), names)
+    missing_assets = _missing_assets(materials)
+    if materials == existing_materials and missing_assets == (task.get("missing_assets") or []):
+        return task
+
+    refreshed = await _persist_material_asset_snapshot(
+        int(task["id"]),
+        materials,
+        missing_assets,
+    )
+    if refreshed:
+        return refreshed
+
+    # The row may have disappeared concurrently; keep the caller's data coherent.
+    merged = dict(task)
+    merged["materials"] = materials
+    merged["missing_assets"] = missing_assets
+    return merged
+
+
 async def _refresh_materials(task: Dict[str, Any], text: str) -> Dict[str, Any]:
     novel_id = task.get("novel_id")
     if not novel_id:
@@ -457,37 +575,155 @@ async def _refresh_materials(task: Dict[str, Any], text: str) -> Dict[str, Any]:
     return materials
 
 
-def _build_messages(template: Dict[str, Any], script_text: str, anchor_text: str) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
+def _build_supplement_anchor_reference(anchor_text: str) -> str:
+    text = (anchor_text or "").strip()
+    if not text:
+        return ""
+    return (
+        "【相邻正式分镜参考｜只读连续性资料】\n"
+        "以下内容只用于继承既有人物、场景、道具和首尾状态；"
+        "它不是本次要生成的剧情，不得续写、复述或照搬其中的镜号、时间轴、动作、台词与剧情落点。\n"
+        f"{text}"
+    )
+
+
+def _build_supplement_priority_block(generation_input: str, anchor_text: str) -> str:
+    blocks: List[str] = []
+    anchor_reference = _build_supplement_anchor_reference(anchor_text)
+    if anchor_reference:
+        blocks.append(anchor_reference)
+    blocks.append(
+        "【本次补镜描述｜唯一剧情来源｜最高优先级】\n"
+        f"{(generation_input or '').strip()}\n\n"
+        "【补镜生成硬约束】\n"
+        "1. 本次分镜的剧情动作、台词、信息点和先后顺序只能来自上方“本次补镜描述”。\n"
+        "2. 相邻正式分镜只允许提供连续性，不得把参考分镜原有的镜号、时间轴、动作、台词或剧情当成本次输出。\n"
+        "3. 两者存在差异或冲突时，一律以本次补镜描述为准；输出前必须核对人物、动作与台词均属于本次补镜。"
+    )
+    # 目标内容必须位于整个 prompt 的最后，避免更长、更具体的正式分镜参考抢占模型注意力。
+    return "\n\n".join(blocks)
+
+
+_NON_DIALOGUE_LABELS = {
+    "场景",
+    "时间",
+    "地点",
+    "人物",
+    "角色",
+    "动作",
+    "镜头",
+    "要求",
+    "备注",
+    "风格",
+    "画面",
+    "环境",
+    "道具",
+    "音效",
+}
+
+
+def _extract_supplement_dialogues(script_text: str) -> List[str]:
+    dialogues: List[str] = []
+    for raw_line in (script_text or "").splitlines():
+        match = re.match(r"^\s*([^：:\n]{1,20})[：:]\s*(.+?)\s*$", raw_line)
+        if not match:
+            continue
+        speaker = match.group(1).strip().strip("【】[]")
+        dialogue = match.group(2).strip().strip("“”\"'")
+        if not speaker or not dialogue:
+            continue
+        if speaker in _NON_DIALOGUE_LABELS or speaker.startswith(("镜头", "镜号", "本镜", "本节", "场景")):
+            continue
+        if len(re.sub(r"[\W_]+", "", dialogue, flags=re.UNICODE)) < 3:
+            continue
+        dialogues.append(dialogue)
+    return dialogues
+
+
+def _dialogue_present(dialogue: str, output_text: str) -> bool:
+    normalized_dialogue = re.sub(r"[\W_]+", "", dialogue or "", flags=re.UNICODE)
+    normalized_output = re.sub(r"[\W_]+", "", output_text or "", flags=re.UNICODE)
+    if not normalized_dialogue or not normalized_output:
+        return False
+    if normalized_dialogue in normalized_output:
+        return True
+    if len(normalized_dialogue) <= 8:
+        return normalized_dialogue in normalized_output
+    # 允许模型在长台词中插入口型/表演标注，但开头或结尾的关键语义必须能对上。
+    signature_len = min(10, max(6, len(normalized_dialogue) // 3))
+    return (
+        normalized_dialogue[:signature_len] in normalized_output
+        or normalized_dialogue[-signature_len:] in normalized_output
+    )
+
+
+def _supplement_output_follows_target(script_text: str, anchor_text: str, output_text: str) -> bool:
+    # 没有正式分镜参考时不存在“参考抢占目标”的串镜风险，不额外限制模型。
+    if not (anchor_text or "").strip():
+        return True
+    dialogues = _extract_supplement_dialogues(script_text)
+    if not dialogues:
+        return True
+    matched = sum(1 for dialogue in dialogues if _dialogue_present(dialogue, output_text))
+    required = 1 if len(dialogues) <= 2 else (len(dialogues) + 1) // 2
+    return matched >= required
+
+
+def _build_supplement_retry_instruction(script_text: str) -> str:
+    dialogues = _extract_supplement_dialogues(script_text)
+    locked_dialogues = "\n".join(f"- {line}" for line in dialogues)
+    suffix = f"\n必须保留的本次补镜台词：\n{locked_dialogues}" if locked_dialogues else ""
+    return (
+        "【上次结果作废｜纠偏重生成】\n"
+        "上次输出误用了相邻正式分镜内容。请完全丢弃上次结果，"
+        "只根据“本次补镜描述”重新生成；不得出现仅属于参考分镜的镜号、时间轴、动作或台词。"
+        f"{suffix}"
+    )
+
+
+def _build_messages(
+    template: Dict[str, Any],
+    script_text: str,
+    anchor_text: str,
+    style_prompt: str = "",
+) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
     template_content = template.get("content") or ""
+    style_text = (style_prompt or "").strip()
+    generation_input = script_text
+    if style_text:
+        generation_input = f"【风格提示词】\n{style_text}\n\n【补镜描述】\n{script_text}"
+    anchor_reference = _build_supplement_anchor_reference(anchor_text)
     var_values = {
-        "scene_content": script_text,
-        "script_content": script_text,
-        "content": script_text,
-        "storyboard_context": anchor_text,
-        "anchor_storyboard": anchor_text,
-        "requirement": script_text,
+        "scene_content": generation_input,
+        "script_content": generation_input,
+        "content": generation_input,
+        "storyboard_context": anchor_reference,
+        "anchor_storyboard": anchor_reference,
+        "requirement": generation_input,
     }
     prompt = template_content
-    replaced = False
     try:
         variables = json.loads(template.get("variables") or "[]")
     except Exception:
         variables = []
     for var in variables:
-        value = var_values.get(str(var), script_text)
+        value = var_values.get(str(var), generation_input)
         for ph in (f"{{{var}}}", f"{{{{{var}}}}}"):
             if ph in prompt:
                 prompt = prompt.replace(ph, value)
-                replaced = True
-    if not replaced:
-        prompt = (
-            f"{template_content}\n\n"
-            "以下是需要补生成的一镜内容，请只输出一个可直接用于视频生成的临时分镜小节：\n\n"
-            f"{script_text}\n\n"
-            f"参考上下文：\n{anchor_text}"
-        )
+    # 无论模板是否命中变量，都在末尾追加一次权威补镜输入。旧逻辑只要任一
+    # 上下文变量命中便不再追加补镜描述，且把长参考放在最后，模型会偶发续写正式分镜。
+    priority_block = _build_supplement_priority_block(generation_input, anchor_text)
+    prompt = f"{prompt}\n\n{priority_block}" if prompt.strip() else priority_block
     messages = [
-        {"role": "system", "content": "你是专业短剧/短片分镜导演。只输出补镜分镜正文，不要解释、不要输出思考过程。"},
+        {
+            "role": "system",
+            "content": (
+                "你是专业短剧/短片补镜导演。本次补镜描述是唯一剧情来源；"
+                "相邻正式分镜仅供连续性参考，禁止续写或复述参考分镜。"
+                "只输出补镜分镜正文，不要解释、不要输出思考过程。"
+            ),
+        },
         {"role": "user", "content": prompt},
     ]
     return messages, var_values
@@ -585,19 +821,126 @@ def _archive_safe_name(name: str, fallback: str) -> str:
     return clean or fallback
 
 
-async def _extract_output_last_frame(task_id: int, video_rel_path: str) -> Optional[str]:
+def _create_jpeg_display_copy(source_path: str, display_path: str) -> None:
+    """Validate an image and create a disposable JPEG display/chain copy."""
+    from PIL import Image, ImageOps
+
+    os.makedirs(os.path.dirname(display_path), exist_ok=True)
+    with Image.open(source_path) as image:
+        image.load()
+        normalized = ImageOps.exif_transpose(image).convert("RGB")
+        normalized.save(display_path, format="JPEG", quality=95, subsampling=0)
+
+
+async def _maybe_upscale_supplement_frame(
+    task_id: int,
+    frame_label: str,
+    display_path: str,
+) -> bool:
+    """Apply the shared local 2x setting to a disposable supplement frame copy."""
+    try:
+        from services.settings_service import (
+            KEY_LASTFRAME_UPSCALE_ENABLED,
+            SettingsService,
+        )
+
+        enabled = await SettingsService.get_bool(
+            KEY_LASTFRAME_UPSCALE_ENABLED,
+            default=False,
+        )
+        if not enabled:
+            return False
+
+        from services.image_upscale_service import LocalImageUpscaler
+
+        result = await LocalImageUpscaler().upscale_2x(
+            display_path,
+            display_path,
+            timeout=180,
+        )
+        if result.success:
+            logger.info(
+                "[supplement-upscale] task=%s frame=%s %s -> %s elapsed=%sms",
+                task_id,
+                frame_label,
+                result.input_size,
+                result.output_size,
+                result.elapsed_ms,
+            )
+            return True
+        logger.warning(
+            "[supplement-upscale] task=%s frame=%s failed, keep original size: %s",
+            task_id,
+            frame_label,
+            result.message,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[supplement-upscale] task=%s frame=%s error, keep original size: %s",
+            task_id,
+            frame_label,
+            exc,
+        )
+    return False
+
+
+async def _prepare_supplement_frame_copy(
+    task_id: int,
+    frame_label: str,
+    original_path: str,
+    display_path: str,
+) -> bool:
+    await asyncio.to_thread(_create_jpeg_display_copy, original_path, display_path)
+    return await _maybe_upscale_supplement_frame(task_id, frame_label, display_path)
+
+
+async def _extract_output_last_frame(
+    task_id: int,
+    video_rel_path: str,
+) -> Tuple[Optional[str], Optional[str], bool]:
     if not video_rel_path:
-        return None
+        return None, None, False
     abs_video = resolve_db_path(video_rel_path) or video_rel_path
     if not os.path.exists(abs_video):
-        return None
+        return None, None, False
     frames_dir = os.path.join(get_data_dir(), "frames", "supplement")
     os.makedirs(frames_dir, exist_ok=True)
-    output_path = os.path.join(frames_dir, f"supplement_{task_id}_output_last.jpg")
-    ok = await VideoService().extract_last_frame(abs_video, output_path, sseof_seconds=0.5, timeout=30)
+    token = uuid.uuid4().hex[:10]
+    original_name = f"supplement_{task_id}_output_last_{token}_orig.jpg"
+    display_name = f"supplement_{task_id}_output_last_{token}.jpg"
+    original_path = os.path.join(frames_dir, original_name)
+    display_path = os.path.join(frames_dir, display_name)
+    ok = await VideoService().extract_last_frame(
+        abs_video,
+        original_path,
+        sseof_seconds=0.5,
+        timeout=30,
+    )
     if not ok:
-        return None
-    return f"/data/frames/supplement/{os.path.basename(output_path)}"
+        return None, None, False
+    try:
+        upscaled = await _prepare_supplement_frame_copy(
+            task_id,
+            "output_last",
+            original_path,
+            display_path,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[supplement-frame] task=%s output tail copy failed: %s",
+            task_id,
+            exc,
+        )
+        return (
+            f"/data/frames/supplement/{original_name}",
+            f"/data/frames/supplement/{original_name}",
+            False,
+        )
+    return (
+        f"/data/frames/supplement/{display_name}",
+        f"/data/frames/supplement/{original_name}",
+        upscaled,
+    )
 
 
 def _collect_downloadable_materials(task: Dict[str, Any]) -> List[Tuple[str, str]]:
@@ -692,11 +1035,48 @@ def _build_supplement_final_prompt(
     refs = _build_supplement_file_refs(image_items, audio_items, ref_at=ref_at)
     clean_prompt = (prompt or "").strip()
     style = (style_prompt or "").strip()
+    parts: List[str] = []
     if style:
-        clean_prompt = f"风格提示词：{style}\n\n{clean_prompt}" if clean_prompt else f"风格提示词：{style}"
-    if not refs:
-        return clean_prompt
-    return ";".join(refs) + "\n\n" + clean_prompt
+        parts.append(f"【风格提示词】\n{style}")
+    if refs:
+        parts.append(";".join(refs))
+    if clean_prompt:
+        parts.append(clean_prompt)
+    return "\n\n".join(parts)
+
+
+def _extract_supplement_duration(storyboard_text: str) -> Optional[int]:
+    """Extract a generated section duration and round up to a supported whole second."""
+    text = storyboard_text or ""
+    candidates: List[float] = []
+    explicit_patterns = (
+        r"(?:📏\s*)?(?:本小节|本节)(?:分镜)?总时长\s*[:：]?\s*(\d+(?:\.\d+)?)\s*秒",
+        r"【[^\n】]*?[·|]\s*(\d+(?:\.\d+)?)\s*秒(?:\s*[·|】])",
+    )
+    for pattern in explicit_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            try:
+                candidates.append(float(match.group(1)))
+                break
+            except (TypeError, ValueError):
+                pass
+    if not candidates:
+        timeline = re.compile(
+            r"\b\d{1,2}:(\d{2}(?:\.\d+)?)\s*[-—–~至]\s*\d{1,2}:(\d{2}(?:\.\d+)?)"
+        )
+        for match in timeline.finditer(text):
+            try:
+                candidates.append(float(match.group(2)))
+            except (TypeError, ValueError):
+                continue
+    if not candidates:
+        return None
+    value = max(candidates)
+    if value <= 0:
+        return None
+    whole_seconds = int(value) if value.is_integer() else int(value) + 1
+    return max(1, min(15, whole_seconds))
 
 
 async def _extract_first_frame(video_path: str, output_path: str, timeout: int = 30) -> bool:
@@ -731,32 +1111,12 @@ async def _extract_first_frame(video_path: str, output_path: str, timeout: int =
 
 
 async def _extract_frame_at(video_path: str, output_path: str, seconds: float, timeout: int = 30) -> bool:
-    try:
-        sec = max(0.0, float(seconds or 0.0))
-    except Exception:
-        sec = 0.0
-    ffmpeg = VideoService()._get_ffmpeg_path()
-    args = ["-y", "-ss", f"{sec:.3f}", "-i", video_path, "-frames:v", "1", "-q:v", "2", output_path]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            ffmpeg,
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            return False
-        if proc.returncode == 0 and os.path.exists(output_path):
-            return True
-        logger.warning("[supplement-frame] extract frame at %.3fs failed: %s", sec, (stderr or b"")[-500:])
-        return False
-    except Exception as exc:
-        logger.warning("[supplement-frame] extract frame at %.3fs exception: %s", sec, exc)
-        return False
+    return await VideoService().extract_frame_at(
+        video_path,
+        output_path,
+        seconds,
+        timeout=timeout,
+    )
 
 
 def _summarize_logged_assets(items: Optional[List[str]]) -> List[Dict[str, Any]]:
@@ -1013,7 +1373,7 @@ class SupplementVideoService:
 
     @staticmethod
     async def get_task(task_id: int) -> Optional[Dict[str, Any]]:
-        return await _get_task(task_id)
+        return await _refresh_material_asset_snapshots(await _get_task(task_id))
 
     @staticmethod
     async def create_task(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1067,6 +1427,10 @@ class SupplementVideoService:
         for key in allowed:
             if key in payload:
                 fields[key] = payload[key]
+        if "first_frame_path" in payload and payload.get("first_frame_path") is None:
+            fields["first_frame_orig_path"] = None
+        if "last_frame_path" in payload and payload.get("last_frame_path") is None:
+            fields["last_frame_orig_path"] = None
         if "status" in payload and payload["status"] in SUPPLEMENT_STATUSES:
             fields["status"] = payload["status"]
         if "params" in payload:
@@ -1120,21 +1484,48 @@ class SupplementVideoService:
     async def save_frame(task_id: int, frame_type: str, filename: str, content: bytes) -> Dict[str, Any]:
         if frame_type not in ("first", "last"):
             raise ValueError("frame_type must be first or last")
-        ext = os.path.splitext(filename or "frame.png")[1] or ".png"
+        ext = os.path.splitext(filename or "frame.png")[1].lower() or ".img"
+        if ext not in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
+            ext = ".img"
         images_dir = os.path.join(media_subdir("images"), "supplement")
         os.makedirs(images_dir, exist_ok=True)
-        safe_name = f"supplement_{task_id}_{frame_type}_{uuid.uuid4().hex[:8]}{ext}"
-        abs_path = os.path.join(images_dir, safe_name)
-        async with aiofiles.open(abs_path, "wb") as f:
+        token = uuid.uuid4().hex[:10]
+        original_name = f"supplement_{task_id}_{frame_type}_{token}_orig{ext}"
+        display_name = f"supplement_{task_id}_{frame_type}_{token}.jpg"
+        original_path = os.path.join(images_dir, original_name)
+        display_path = os.path.join(images_dir, display_name)
+        async with aiofiles.open(original_path, "wb") as f:
             await f.write(content)
-        rel = f"/data/images/supplement/{safe_name}"
+        try:
+            await _prepare_supplement_frame_copy(
+                task_id,
+                frame_type,
+                original_path,
+                display_path,
+            )
+        except Exception as exc:
+            for path in (original_path, display_path):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+            raise ValueError(f"invalid frame image: {exc}") from exc
+        rel = f"/data/images/supplement/{display_name}"
+        original_rel = f"/data/images/supplement/{original_name}"
         field = "first_frame_path" if frame_type == "first" else "last_frame_path"
-        task = await _update_task_fields(task_id, {field: rel})
+        original_field = (
+            "first_frame_orig_path" if frame_type == "first" else "last_frame_orig_path"
+        )
+        task = await _update_task_fields(
+            task_id,
+            {field: rel, original_field: original_rel},
+        )
         return task
 
     @staticmethod
     async def build_material_archive(task_id: int) -> str:
-        task = await _get_task(task_id)
+        task = await _refresh_material_asset_snapshots(await _get_task(task_id))
         if not task:
             raise ValueError("补镜任务不存在")
         zip_dir = os.path.join(get_data_dir(), "supplement_archives")
@@ -1288,22 +1679,62 @@ class SupplementVideoService:
             raise ValueError("source video file not found")
         images_dir = os.path.join(media_subdir("images"), "supplement")
         os.makedirs(images_dir, exist_ok=True)
-        filename = f"supplement_{task_id}_{frame_type}_from_{source_storyboard_id}_{uuid.uuid4().hex[:8]}.jpg"
-        output_path = os.path.join(images_dir, filename)
+        token = uuid.uuid4().hex[:10]
+        original_name = (
+            f"supplement_{task_id}_{frame_type}_from_{source_storyboard_id}_{token}_orig.jpg"
+        )
+        display_name = (
+            f"supplement_{task_id}_{frame_type}_from_{source_storyboard_id}_{token}.jpg"
+        )
+        original_path = os.path.join(images_dir, original_name)
+        display_path = os.path.join(images_dir, display_name)
         if capture_time is not None:
-            ok = await _extract_frame_at(video_abs, output_path, capture_time, timeout=30)
+            ok = await _extract_frame_at(video_abs, original_path, capture_time, timeout=30)
         elif frame_type == "first":
-            ok = await _extract_first_frame(video_abs, output_path, timeout=30)
+            ok = await _extract_first_frame(video_abs, original_path, timeout=30)
         else:
-            ok = await VideoService().extract_last_frame(video_abs, output_path, sseof_seconds=0.5, timeout=30)
+            ok = await VideoService().extract_last_frame(
+                video_abs,
+                original_path,
+                sseof_seconds=0.5,
+                timeout=30,
+            )
         if not ok:
             raise ValueError("capture frame failed")
-        rel = f"/data/images/supplement/{filename}"
+        try:
+            await _prepare_supplement_frame_copy(
+                task_id,
+                frame_type,
+                original_path,
+                display_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[supplement-frame] task=%s frame=%s captured copy failed: %s",
+                task_id,
+                frame_type,
+                exc,
+            )
+            display_path = original_path
+            display_name = original_name
+        rel = f"/data/images/supplement/{display_name}"
+        original_rel = f"/data/images/supplement/{original_name}"
         field = "first_frame_path" if frame_type == "first" else "last_frame_path"
-        return await _update_task_fields(task_id, {field: rel})
+        original_field = (
+            "first_frame_orig_path" if frame_type == "first" else "last_frame_orig_path"
+        )
+        return await _update_task_fields(
+            task_id,
+            {field: rel, original_field: original_rel},
+        )
 
     @staticmethod
-    async def generate_storyboard(task_id: int, template_id: int, llm_config_id: int) -> Dict[str, Any]:
+    async def generate_storyboard(
+        task_id: int,
+        template_id: int,
+        llm_config_id: int,
+        use_scene_reference_image: bool = False,
+    ) -> Dict[str, Any]:
         task = await _get_task(task_id)
         if not task:
             raise ValueError("补镜任务不存在")
@@ -1317,31 +1748,89 @@ class SupplementVideoService:
         anchor_text = ""
         if anchor:
             anchor_text = (anchor.get("prompt") or anchor.get("description") or "")[:3000]
+        params = task.get("params") or {}
+        style_prompt = str(params.get("style_prompt") or "").strip()
 
-        messages, var_values = _build_messages(template, script_text, anchor_text)
+        messages, var_values = _build_messages(template, script_text, anchor_text, style_prompt)
         assemble_payload = None
         mode, admin_id = _storyboard_assemble_eligibility(template)
         if mode == "assemble":
+            supplement_priority_block = _build_supplement_priority_block(
+                var_values.get("scene_content") or script_text,
+                anchor_text,
+            )
             assemble_payload = _build_storyboard_assemble_payload(
                 template=template,
                 admin_id=admin_id,
                 var_values=var_values,
-                scene_content=script_text,
+                scene_content=var_values.get("scene_content") or script_text,
                 with_character_state=False,
-                inject_block=f"补镜参考上下文:\n{anchor_text}" if anchor_text else "",
+                # admin-server 会把 inject_block 拼在模板末尾，因此这里明确按
+                # “只读参考在前、唯一补镜目标在最后”的顺序传入，预置模板同样不会串镜。
+                inject_block=supplement_priority_block,
             )
 
-        raw = await LLMService.call_llm(
-            config_id=llm_config_id,
-            messages=messages,
-            timeout=900,
-            task_type="storyboard_generate",
-            novel_id=task.get("novel_id"),
-            source_id=task_id,
-            source_type="supplement_video",
-            assemble_payload=assemble_payload,
-        )
-        cleaned = _strip_reasoning_chain(raw or "").strip()
+        async def _call_storyboard_llm(
+            call_messages: List[Dict[str, str]],
+            call_assemble_payload: Optional[Dict[str, Any]],
+            scene_references: List[Dict[str, Any]],
+        ) -> str:
+            return await LLMService.call_llm(
+                config_id=llm_config_id,
+                messages=call_messages,
+                timeout=900,
+                task_type="storyboard_generate",
+                novel_id=task.get("novel_id"),
+                source_id=task_id,
+                source_type="supplement_video",
+                assemble_payload=call_assemble_payload,
+                ephemeral_images=scene_references,
+            )
+
+        scene_references: List[Dict[str, Any]] = []
+        if use_scene_reference_image and task.get("novel_id"):
+            scene_title = _supplement_scene_title(task, anchor, script_text)
+            if scene_title:
+                try:
+                    scene_reference = await prepare_scene_reference(
+                        int(task["novel_id"]), scene_title, script_text
+                    )
+                    if scene_reference:
+                        scene_references.append(scene_reference)
+                except Exception as exc:
+                    logger.warning(
+                        "[supplement-video] task=%s scene reference skipped: %s",
+                        task_id,
+                        exc,
+                    )
+        try:
+            raw = await _call_storyboard_llm(messages, assemble_payload, scene_references)
+            cleaned = _strip_reasoning_chain(raw or "").strip()
+            if not _supplement_output_follows_target(script_text, anchor_text, cleaned):
+                logger.warning(
+                    "[supplement-video] task=%s output followed anchor instead of supplement; retry once",
+                    task_id,
+                )
+                retry_instruction = _build_supplement_retry_instruction(script_text)
+                retry_messages = [dict(item) for item in messages]
+                retry_messages[-1]["content"] = (
+                    f"{retry_messages[-1].get('content', '')}\n\n{retry_instruction}"
+                )
+                retry_assemble_payload = None
+                if assemble_payload:
+                    retry_assemble_payload = dict(assemble_payload)
+                    retry_assemble_payload["inject_block"] = (
+                        f"{retry_assemble_payload.get('inject_block', '')}\n\n{retry_instruction}"
+                    )
+                raw = await _call_storyboard_llm(
+                    retry_messages, retry_assemble_payload, scene_references
+                )
+                cleaned = _strip_reasoning_chain(raw or "").strip()
+                if not _supplement_output_follows_target(script_text, anchor_text, cleaned):
+                    raise ValueError("大模型连续两次返回了正式分镜内容，已拦截错误结果，请重试生成")
+        finally:
+            dispose_scene_references(scene_references)
+
         sections = await StoryboardService._parse_sections_with_dynamic_rules(cleaned, flow=_storyboard_flow(template))
         storyboard_text = ""
         if sections:
@@ -1353,11 +1842,22 @@ class SupplementVideoService:
             raise ValueError("大模型未返回可用分镜")
 
         video_prompt = SupplementVideoService.build_video_prompt(storyboard_text)
-        task = await _update_task_fields(task_id, {
+        generated_duration = _extract_supplement_duration(storyboard_text)
+        update_fields: Dict[str, Any] = {
             "storyboard_text": storyboard_text,
             "video_prompt": video_prompt,
             "status": "storyboard_ready",
             "error_message": None,
+        }
+        if generated_duration is not None:
+            update_fields["duration"] = generated_duration
+            logger.info(
+                "[supplement-video] task=%s generated storyboard duration=%ss",
+                task_id,
+                generated_duration,
+            )
+        task = await _update_task_fields(task_id, {
+            **update_fields,
         })
         await _refresh_materials(task, storyboard_text)
         return await _get_task(task_id)
@@ -1378,12 +1878,44 @@ class SupplementVideoService:
             raise ValueError("补镜任务不存在")
         if payload:
             task = await SupplementVideoService.update_task(task_id, payload)
+        task = await _refresh_material_asset_snapshots(task)
+        if not task:
+            raise ValueError("补镜任务不存在")
         prompt = (task.get("video_prompt") or task.get("storyboard_text") or "").strip()
         if not prompt:
             raise ValueError("请先生成或填写临时分镜/视频提示词")
 
         materials = task.get("materials") or {}
         params = task.get("params") or {}
+        provider_name = task.get("provider") or "jimeng"
+        config = None
+        if provider_name != "jimeng" and task.get("video_config_id"):
+            config = await LLMService.get_by_id(int(task["video_config_id"]))
+            if not config:
+                raise ValueError("视频模型配置不存在，请先到视频管理重新选择对应渠道的视频模型")
+        provider_name = _infer_provider_from_config(provider_name, config)
+        if provider_name == "pippit_cli" and not config:
+            config = await _pippit_provider_config()
+        if provider_name in ("volcengine_ark", "cool", "xinglian") and not config:
+            raise ValueError(f"请先到视频管理配置{PROVIDER_FRIENDLY.get(provider_name, provider_name)}视频模型")
+
+        model_name = (task.get("model_name") or "").strip()
+        model_for_caps = model_name or (config or {}).get("model_name") or "seedance_2_0"
+        from services.video_model_capabilities import (
+            canonical_video_model_name,
+            get_video_model_capabilities,
+        )
+        model_capabilities = get_video_model_capabilities(model_for_caps, provider_name)
+        if not model_capabilities["video_generation_available"]:
+            raise ValueError(
+                f"{PROVIDER_FRIENDLY.get(provider_name, provider_name)}暂未开放"
+                f"{model_capabilities['label']}视频生成"
+            )
+        max_images = int(model_capabilities["max_images"])
+        max_audios = int(model_capabilities["max_audios"])
+        max_duration = int(model_capabilities["max_duration_seconds"])
+        provider = get_provider(provider_name, config or {})
+
         frame_mode = str(params.get("frame_reference_mode") or "auto").strip().lower()
         include_first_frame = frame_mode in ("auto", "first", "first_last")
         include_last_frame = frame_mode in ("auto", "last", "first_last")
@@ -1427,7 +1959,7 @@ class SupplementVideoService:
             if path and path not in dedup_images:
                 dedup_images.append(path)
                 dedup_image_items.append(item)
-            if len(dedup_images) >= 9:
+            if len(dedup_images) >= max_images:
                 break
         images = dedup_images
         image_items = dedup_image_items
@@ -1451,33 +1983,24 @@ class SupplementVideoService:
             if path and path not in dedup_audios:
                 dedup_audios.append(path)
                 dedup_audio_items.append(item)
-            if len(dedup_audios) >= 3:
+            if len(dedup_audios) >= max_audios:
                 break
         audios = dedup_audios
         audio_items = dedup_audio_items
 
-        provider_name = task.get("provider") or "jimeng"
-        config = None
-        if provider_name != "jimeng" and task.get("video_config_id"):
-            config = await LLMService.get_by_id(int(task["video_config_id"]))
-            if not config:
-                raise ValueError("视频模型配置不存在，请先到视频管理重新选择对应渠道的视频模型")
-        provider_name = _infer_provider_from_config(provider_name, config)
-        if provider_name == "pippit_cli" and not config:
-            config = await _pippit_provider_config()
-        if provider_name in ("volcengine_ark", "cool", "xinglian") and not config:
-            raise ValueError(f"请先到视频管理配置{PROVIDER_FRIENDLY.get(provider_name, provider_name)}视频模型")
-        provider = get_provider(provider_name, config or {})
         params.update({
-            "duration": int(task.get("duration") or params.get("duration") or 8),
+            "duration": min(
+                max_duration,
+                max(4, int(task.get("duration") or params.get("duration") or 8)),
+            ),
             "ratio": task.get("ratio") or params.get("ratio") or "9:16",
             "resolution": task.get("resolution") or params.get("resolution") or "720P",
             "generation_mode": task.get("generation_mode") or params.get("generation_mode") or ("multimodal2video" if images or audios else "text2video"),
         })
-        model_name = (task.get("model_name") or "").strip()
         if model_name:
-            params["model_version"] = model_name
-            params["model"] = model_name
+            canonical_model_name = canonical_video_model_name(model_name, provider_name)
+            params["model_version"] = canonical_model_name
+            params["model"] = canonical_model_name
         elif config and config.get("model_name"):
             params["model"] = config.get("model_name")
         final_prompt = _build_supplement_final_prompt(
@@ -1662,12 +2185,17 @@ class SupplementVideoService:
             requested_duration=requested_duration,
             actual_duration=qres.duration or None,
         )
-        output_last_frame = await _extract_output_last_frame(task_id, local_url)
+        output_last_frame, output_last_frame_orig, output_last_frame_upscaled = (
+            await _extract_output_last_frame(task_id, local_url)
+        )
+        if output_last_frame_upscaled:
+            logger.info("[supplement-upscale] task=%s output tail stored as 2x display copy", task_id)
         return await _update_task_fields(task_id, {
             "status": "success",
             "output_video_path": local_url,
             "output_remote_url": remote_url,
             "output_last_frame_path": output_last_frame,
+            "output_last_frame_orig_path": output_last_frame_orig,
             "error_message": None,
             "finished_at": now_beijing_str(),
         })

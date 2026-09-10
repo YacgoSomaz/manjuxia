@@ -4,20 +4,27 @@ import base64
 import json
 import httpx
 import secrets
+import logging
 from typing import Optional, Dict, Any, List
 from openai import AsyncOpenAI, Timeout
 from database.db import get_db
 from services.llm_service import LLMService
 from services.log_service import LogService
-from services.trusted_providers import require_trusted_model_url
 from utils.paths import get_data_dir, media_subdir, resolve_db_path
 from utils.unicode_utils import sanitize_unicode
 # v3.61.37: 打包后 aiohttp 找不到系统根证书,统一走 certifi
 from utils.ssl_helper import get_aiohttp_connector
 
+logger = logging.getLogger(__name__)
+
 
 class ImageService:
     """图片生成服务"""
+
+    # 图片生成统一至少等待 5 分钟。官方算力、自配算力与前端轮询保持一致，
+    # 避免其中任意一层提前结束而留下永久 FAILED 状态。
+    MIN_IMAGE_TIMEOUT_SECONDS = 300
+    COOL_TASK_REMOTE_PREFIX = "cool-task:"
 
     # 图片比例到尺寸的映射
     SIZE_MAP = {
@@ -29,16 +36,6 @@ class ImageService:
         # v3.61.147:VR 720° 全景图,等距柱状投影必须 2:1
         # 2048x1024 是 GPT-Image-2 支持的最高 2:1 尺寸(再大就超 model 限制)
         "2:1": "2048x1024",
-    }
-
-    # Seedream endpoints reject requests below 3,686,400 pixels.
-    VOLCENGINE_SIZE_MAP = {
-        "1:1": "2048x2048",
-        "16:9": "2560x1440",
-        "9:16": "1440x2560",
-        "4:3": "2304x1728",
-        "3:4": "1728x2304",
-        "2:1": "2720x1360",
     }
 
     # 需要通过 chat.completions 接口调用的模型（如智谱 CogView、Gemini 等）
@@ -83,13 +80,6 @@ class ImageService:
     ]
 
     @staticmethod
-    def _trusted_config(config: Dict[str, Any]) -> Dict[str, Any]:
-        """Copy and validate a configured image provider before dispatch."""
-        trusted = dict(config)
-        trusted["base_url"] = require_trusted_model_url(trusted.get("base_url") or "")
-        return trusted
-
-    @staticmethod
     def _find_reference_adapter(model_name: str) -> Optional[Dict[str, Any]]:
         """根据模型名查找匹配的图生图适配器,找不到返回 None(说明模型暂不支持图生图)"""
         m = (model_name or "").lower()
@@ -97,12 +87,20 @@ class ImageService:
             if ad["match"] in m:
                 return ad
         return None
+
+    @staticmethod
+    def is_qekor_gpt_image_config(config: Dict[str, Any]) -> bool:
+        """启科/Qekor 的 GPT-Image 配置能力识别,兼容云端 camelCase 与本地 snake_case。"""
+        provider = str(config.get("provider_code") or config.get("providerCode") or "").lower()
+        base_url = str(config.get("base_url") or config.get("baseUrl") or "").lower()
+        model = str(config.get("model_name") or config.get("modelName") or "").lower()
+        model_flat = model.replace("-", "").replace("_", "").replace(" ", "")
+        is_qekor = provider in ("qekor", "qike") or "qekor" in base_url or "qike" in base_url
+        return is_qekor and "gptimage" in model_flat
     
     @staticmethod
-    def _get_size_from_ratio(ratio: str, base_url: str = "") -> str:
-        """根据比例获取尺寸,仅对需要大像素下限的火山方舟提高尺寸。"""
-        if "volces.com" in (base_url or "").lower():
-            return ImageService.VOLCENGINE_SIZE_MAP.get(ratio, "2048x2048")
+    def _get_size_from_ratio(ratio: str) -> str:
+        """根据比例获取尺寸"""
         return ImageService.SIZE_MAP.get(ratio, "1024x1024")
 
     @staticmethod
@@ -176,7 +174,7 @@ class ImageService:
 
     @staticmethod
     def _safe_name_part(s: Optional[str], maxlen: int = 24) -> str:
-        """把任意字符串转成 Windows 安全的文件名片段:
+        r"""把任意字符串转成 Windows 安全的文件名片段:
         - 去除/替换 < > : " / \ | ? * 等保留字符 + 控制字符
         - ★ v3.59.58:半角 . 和全角 。 也替换为 _
           否则像 "炮灰重生.末世先刀圣母" 这种带句点的小说名,会让最终文件名出现
@@ -286,36 +284,199 @@ class ImageService:
             pass
     
     @staticmethod
-    async def _download_image(url: str, filename: str) -> Optional[str]:
+    def _canonicalize_image_download_url(url: str) -> str:
+        """把 Cool 返回的跳转地址改成实际 CDN 地址。
+
+        Cool 的 ``https://cnd.uidp.cn/?id=xxx.png`` 还要再 302 到
+        ``https://cdn.mjapi.cc.cd/xxx.png``。部分用户网络能访问 Cool API，
+        但解析/访问前一个跳转域名失败，表现为上游已经扣费且生成成功，
+        客户端却始终下载不到。已知格式直接走最终 CDN，同时保留其他服务商
+        URL 原样不动。
+        """
+        clean_url = (url or "").strip()
+        if not clean_url:
+            return clean_url
+        try:
+            from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
+
+            parsed = urlsplit(clean_url)
+            if (parsed.hostname or "").lower() != "cnd.uidp.cn":
+                return clean_url
+            image_id = (parse_qs(parsed.query).get("id") or [""])[0].strip()
+            if not image_id or not all(ch.isalnum() or ch in "._-" for ch in image_id):
+                return clean_url
+            return urlunsplit(
+                ("https", "cdn.mjapi.cc.cd", f"/{quote(image_id, safe='._-')}", "", "")
+            )
+        except Exception:
+            return clean_url
+
+    @staticmethod
+    def _with_image_retry_cache_bust(url: str, attempt_index: int) -> str:
+        """Cool CDN 重试时绕过边缘节点短暂的 404/空响应缓存。"""
+        if attempt_index <= 0:
+            return url
+        try:
+            from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+            import time as _time
+
+            parsed = urlsplit(url)
+            if (parsed.hostname or "").lower() != "cdn.mjapi.cc.cd":
+                return url
+            query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+                     if k != "_qianshan_retry"]
+            query.append(("_qianshan_retry", f"{attempt_index}-{_time.time_ns()}"))
+            return urlunsplit(
+                (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
+            )
+        except Exception:
+            return url
+
+    @staticmethod
+    def _build_cool_remote_ref(task_id: str, image_url: str) -> str:
+        """在一个兼容旧库的字段里同时保留 Cool task_id 与结果 URL。"""
+        clean_task_id = (task_id or "").strip()
+        clean_url = (image_url or "").strip()
+        if not clean_task_id:
+            return clean_url
+        return f"{ImageService.COOL_TASK_REMOTE_PREFIX}{clean_task_id}|{clean_url}"
+
+    @staticmethod
+    def _parse_cool_remote_ref(value: str) -> Optional[tuple]:
+        """解析 ``cool-task:<task_id>|<url>``，旧的纯 URL 返回 None。"""
+        clean_value = (value or "").strip()
+        if not clean_value.startswith(ImageService.COOL_TASK_REMOTE_PREFIX):
+            return None
+        payload = clean_value[len(ImageService.COOL_TASK_REMOTE_PREFIX):]
+        task_id, sep, image_url = payload.partition("|")
+        task_id = task_id.strip()
+        if not task_id:
+            return None
+        return task_id, image_url.strip() if sep else ""
+
+    @staticmethod
+    async def _download_image(
+        url: str,
+        filename: str,
+        retry_404_delays: Optional[List[float]] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """下载图片到本地，返回本地路径
 
-        分阶段 timeout + asyncio.wait_for 双保险,防止 httpx 边缘情况卡死
+        分阶段 timeout + asyncio.wait_for 双保险,防止 httpx 边缘情况卡死。
+        某些服务商会先返回签名 URL，文件稍后才同步完成；调用方可传入
+        retry_404_delays，在 HTTP 404/网络抖动等可恢复错误时按指定间隔重试。
+        diagnostics 为可选输出字典，用于“重下图片”把真实失败原因反馈给用户。
         """
         try:
+            url = ImageService._canonicalize_image_download_url(url)
+            if not url:
+                if diagnostics is not None:
+                    diagnostics["error"] = "远程图片 URL 为空"
+                return None
             images_dir = ImageService._ensure_images_dir()
             # v3.61.202:filename 可能含子目录(小说/类型/名.ext),写盘前建目录 + 同 stem 清理
             local_path = os.path.join(images_dir, filename.replace("/", os.sep))
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
+            def _looks_like_image(raw: bytes, content_type: str = "") -> bool:
+                if not raw:
+                    return False
+                head = raw[:32]
+                if (
+                    head.startswith(b"\x89PNG\r\n\x1a\n")
+                    or head.startswith(b"\xff\xd8\xff")
+                    or head.startswith(b"GIF87a")
+                    or head.startswith(b"GIF89a")
+                    or head.startswith(b"RIFF") and raw[8:12] == b"WEBP"
+                    or head.startswith(b"BM")
+                    or b"ftypavif" in head
+                ):
+                    return True
+                ctype = (content_type or "").lower()
+                if ctype.startswith("image/") and raw[:1] != b"<":
+                    return True
+                return raw.lstrip()[:4].lower() == b"<svg"
+
             timeout_cfg = httpx.Timeout(connect=30.0, read=120.0, write=60.0, pool=10.0)
-            # trust_env=False 关键:绕过系统代理环境变量,避免本地代理拦截 CDN 资源
-            # (实测速创/NanoBanana 的 CDN 在有系统代理时会连接失败或半包)
-            async with httpx.AsyncClient(timeout=timeout_cfg, follow_redirects=True, trust_env=False) as client:
-                # asyncio.wait_for 作为总超时兜底
-                response = await asyncio.wait_for(client.get(url), timeout=180)
-                if response.status_code == 200:
-                    # v3.61.202:只负责写新图返回路径;同 stem 旧图清理由【调用方 DB 更新成功后】做
-                    #   (ImageService 不知道 DB 会不会成功,提前删旧图会导致 DB 失败时指向坏文件)
-                    with open(local_path, 'wb') as f:
-                        f.write(response.content)
-                    return f"data/images/{filename}"
-                print(f"[WARN] 下载图片 HTTP {response.status_code}: {url[:80]}")
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) qianshanAI/1.0",
+                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                "Accept-Encoding": "identity",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            }
+            last_error = ""
+            retry_schedule = [0.0]
+            for delay in retry_404_delays or []:
+                try:
+                    retry_schedule.append(max(0.0, float(delay)))
+                except (TypeError, ValueError):
+                    continue
+
+            for attempt_index, retry_delay in enumerate(retry_schedule):
+                if attempt_index > 0 and retry_delay > 0:
+                    print(
+                        f"[INFO] 图片地址暂未就绪，{retry_delay:g}s 后重试 "
+                        f"({attempt_index}/{len(retry_schedule) - 1}): {url[:80]}"
+                    )
+                    await asyncio.sleep(retry_delay)
+
+                saw_retryable_error = False
+                request_url = ImageService._with_image_retry_cache_bust(url, attempt_index)
+                # 每轮保持旧顺序:先直连避开代理污染，再允许系统代理兜底。
+                for trust_env, label in ((False, "直连"), (True, "系统代理")):
+                    try:
+                        async with httpx.AsyncClient(timeout=timeout_cfg, follow_redirects=True, trust_env=trust_env) as client:
+                            # asyncio.wait_for 作为总超时兜底
+                            response = await asyncio.wait_for(client.get(request_url, headers=headers), timeout=180)
+                        if response.status_code != 200:
+                            saw_retryable_error = saw_retryable_error or response.status_code in {
+                                404, 408, 409, 425, 429, 500, 502, 503, 504,
+                            }
+                            last_error = f"{label} HTTP {response.status_code}"
+                            print(f"[WARN] 下载图片{last_error}: {request_url[:80]}")
+                            continue
+                        raw = response.content
+                        content_type = response.headers.get("content-type", "")
+                        if not _looks_like_image(raw, content_type):
+                            last_error = f"{label}返回内容不是图片(content-type={content_type or '-'})"
+                            print(f"[WARN] 下载图片{last_error}: {request_url[:80]}")
+                            continue
+                        # v3.61.202:只负责写新图返回路径;同 stem 旧图清理由【调用方 DB 更新成功后】做
+                        #   (ImageService 不知道 DB 会不会成功,提前删旧图会导致 DB 失败时指向坏文件)
+                        with open(local_path, 'wb') as f:
+                            f.write(raw)
+                        if diagnostics is not None:
+                            diagnostics["route"] = label
+                            diagnostics["bytes"] = len(raw)
+                            diagnostics["error"] = ""
+                        return f"data/images/{filename}"
+                    except asyncio.TimeoutError:
+                        last_error = f"{label}超时"
+                        saw_retryable_error = True
+                        print(f"[WARN] 下载图片{last_error}: {request_url[:80]}")
+                    except Exception as inner_e:
+                        last_error = f"{label}失败 {type(inner_e).__name__}: {inner_e}"
+                        saw_retryable_error = True
+                        print(f"[WARN] 下载图片{last_error}: {request_url[:80]}")
+
+                if not saw_retryable_error:
+                    break
+            if last_error:
+                print(f"[WARN] 下载图片最终失败({last_error}): {url[:80]}")
+                if diagnostics is not None:
+                    diagnostics["error"] = last_error
             return None
         except asyncio.TimeoutError:
-            print(f"[WARN] 下载图片总超时(120s): {url[:80]}")
+            print(f"[WARN] 下载图片总超时(180s): {url[:80]}")
+            if diagnostics is not None:
+                diagnostics["error"] = "下载总超时"
             return None
         except Exception as e:
             print(f"[WARN] 下载图片失败: {type(e).__name__}: {e}")
+            if diagnostics is not None:
+                diagnostics["error"] = f"{type(e).__name__}: {e}"
             return None
     
     @staticmethod
@@ -397,6 +558,9 @@ class ImageService:
         prompt: str,
         ratio: str = "1:1",
         reference_images_base64: Optional[List[str]] = None,
+        task_type: str = "fusion_image",
+        task_title: Optional[str] = None,
+        feature_name: str = "自由生图",
     ) -> Dict[str, Any]:
         """v3.61.92: 溶图(多参考图融合)— 设置 → 其他功能 → 溶图 模块用
 
@@ -409,8 +573,6 @@ class ImageService:
         import logging as _lg
         _lg2 = _lg.getLogger(__name__)
         reference_images_base64 = [b for b in (reference_images_base64 or []) if b]
-        if not reference_images_base64:
-            return {"success": False, "image_url": None, "message": "至少需要 1 张参考图"}
         if len(reference_images_base64) > 14:
             return {"success": False, "image_url": None, "message": "参考图最多 14 张,当前 " + str(len(reference_images_base64))}
 
@@ -429,24 +591,46 @@ class ImageService:
         _ratio_hint = _ratio_hint_map.get(ratio, f"输出比例 {ratio}")
         prompt = f"[{_ratio_hint},严格按此比例输出,不要跟随任何参考图的比例]\n\n{prompt}"
 
+        if not reference_images_base64:
+            import time as _time
+            override_filename = f"自由生图/文生图_{int(_time.time())}_{secrets.token_hex(4)}.png"
+            result = await ImageService.generate_image(
+                config_id=config_id,
+                prompt=prompt,
+                override_ratio=ratio,
+                override_filename=override_filename,
+            )
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "image_url": result.get("image_url"),
+                    "remote_url": result.get("remote_url"),
+                    "message": "文生图生成成功",
+                }
+            return {
+                "success": False,
+                "image_url": None,
+                "remote_url": None,
+                "message": result.get("message") or "文生图生成失败",
+            }
+
         # 拉配置
         config = await LLMService.get_by_id(config_id)
         if not config:
             return {"success": False, "image_url": None, "message": f"配置 ID {config_id} 不存在"}
         if config.get("config_type") != "image":
             return {"success": False, "image_url": None, "message": "指定的配置不是图片生成配置"}
-        config = ImageService._trusted_config(config)
 
         # 创建日志记录
         log_id = await LogService.create_log(
-            task_type="fusion_image",
+            task_type=task_type,
             model=config.get("model_name", ""),
             config_name=config.get("name", ""),
             provider_code=config.get("provider_code", ""),
             base_url=config.get("base_url", ""),
             input_prompt=prompt + f"\n[参考图 {len(reference_images_base64)} 张]",
             novel_id=None,
-            chapter_title=f"自由生图(融合 {len(reference_images_base64)} 图)",
+            chapter_title=task_title or f"{feature_name}(融合 {len(reference_images_base64)} 图)",
         )
 
         try:
@@ -461,17 +645,27 @@ class ImageService:
             _is_1day = ("1day" in _base_url_lower or "oneday" in _base_url_lower) and ("gpt-image" in _model_norm or "gptimage" in _model_norm)
             # v3.61.191:KKAI(mooko/kkone)融合 — 多参考图走 /images/edits
             _is_mooko = (_provider_code in ("mooko", "kkai", "kkone")) or ("mooko.ai" in _base_url_lower) or ("kkone" in _base_url_lower)
+            # Qekor/启科 GPT-Image-2:文生图走 generations,有参考图必须走 edits multipart。
+            # generations 的 JSON image 数组会被启科静默忽略,不能与 geek_sync 共用。
+            _is_qekor = ImageService.is_qekor_gpt_image_config(config)
 
             if _is_wuyinkeji and api_style != "wuyinkeji_async":
                 api_style = "wuyinkeji_async"
-            if _is_geek_gpt_image and api_style != "geek_sync":
+            if _is_qekor and api_style != "qekor_sync":
+                api_style = "qekor_sync"
+            elif _is_geek_gpt_image and api_style != "geek_sync":
                 api_style = "geek_sync"
             if _is_mooko and api_style != "mooko_sync":
                 api_style = "mooko_sync"
 
-            timeout = max(config.get("request_timeout", 600) or 600, 600)
+            timeout = max(
+                config.get("request_timeout", ImageService.MIN_IMAGE_TIMEOUT_SECONDS)
+                or ImageService.MIN_IMAGE_TIMEOUT_SECONDS,
+                ImageService.MIN_IMAGE_TIMEOUT_SECONDS,
+            )
             model_name = config["model_name"]
             image_url = None
+            cool_task_id = None
 
             if api_style == "wuyinkeji_async":
                 _lg2.info(f"[fusion] 使用速创 wuyinkeji_async 多图融合: {model_name} (ref={len(reference_images_base64)})")
@@ -510,6 +704,30 @@ class ImageService:
                     ref_urls=ref_urls,
                     timeout=timeout,
                 )
+            elif api_style == "qekor_sync":
+                _lg2.info(f"[fusion] 使用 Qekor edits 多图融合: {model_name} (ref={len(reference_images_base64)})")
+                _qekor_size_map = {
+                    "1:1": "2048x2048",
+                    "16:9": "1920x1080",
+                    "9:16": "1080x1920",
+                    "4:3": "1536x1024",
+                    "3:4": "1024x1536",
+                    "2:3": "1024x1536",
+                    "3:2": "1536x1024",
+                    "21:9": "2520x1080",
+                    "9:21": "1080x2520",
+                    "2:1": "2048x1024",
+                    "1:2": "1024x2048",
+                }
+                image_url = await ImageService._generate_with_qekor_sync(
+                    api_key=config["api_key"],
+                    base_url=config["base_url"],
+                    model=model_name,
+                    prompt=prompt,
+                    size=_qekor_size_map.get(ratio, "1920x1080"),
+                    ref_images=list(reference_images_base64),
+                    timeout=timeout,
+                )
             elif api_style == "geek_sync":
                 _lg2.info(f"[fusion] 使用 geek_sync 多图融合: {model_name} (ref={len(reference_images_base64)})")
                 ref_urls = []
@@ -546,6 +764,7 @@ class ImageService:
                     size=geek_size,
                     ref_urls=ref_urls,
                     timeout=timeout,
+                    channel_name="geek",
                 )
             elif api_style == "mooko_sync":
                 # v3.61.191:KKAI(mooko/kkone)多参考图融合 — 有 ref → _generate_with_mooko_sync 走 /images/edits
@@ -586,7 +805,7 @@ class ImageService:
                         _lg2.warning(f"[fusion] 参考图上传 Cool CDN 失败,跳过该张: {_up_err}")
                 if not ref_urls:
                     raise RuntimeError("所有参考图上传 Cool 失败,无法发起融合")
-                image_url = await ImageService._generate_with_cool_async(
+                cool_result = await ImageService._generate_with_cool_async(
                     api_key=config["api_key"],
                     base_url=config["base_url"],
                     model=model_name,
@@ -594,11 +813,14 @@ class ImageService:
                     aspect_ratio=ratio,  # v3.61.96: fix — 之前没传 ratio,Cool 默认 16:9 → 用户选 9:16 不生效
                     ref_urls=ref_urls,
                     timeout=timeout,
+                    return_task_metadata=True,
                 )
+                image_url = cool_result.get("url") if isinstance(cool_result, dict) else cool_result
+                cool_task_id = cool_result.get("task_id") if isinstance(cool_result, dict) else None
             else:
                 err_msg = (
                     f"模型 {model_name}({api_style}) 不支持多参考图融合。"
-                    f"自由生图功能当前支持:速创(wuyinkeji_async) / geek GPT-Image-2(geek_sync) / KKAI(mooko_sync) / Cool API(cool_async)。"
+                    f"{feature_name}功能当前支持:速创(wuyinkeji_async) / geek(geek_sync) / Qekor(qekor_sync) / KKAI(mooko_sync) / Cool API(cool_async)。"
                     f"请到模型 API 配置切换到支持的中转。"
                 )
                 await LogService.update_log_error(log_id=log_id, error_message=err_msg)
@@ -613,7 +835,11 @@ class ImageService:
             #   (KKAI 返 b64_json/dataURL → _generate_with_mooko_sync 已存盘返回本地路径)。
             #   本地路径不该写进 remote_url,也不该再走 _download_image(否则脏日志 + 下载失败 warning)。
             if isinstance(image_url, str) and image_url.startswith("http"):
-                remote_url = image_url
+                remote_url = (
+                    ImageService._build_cool_remote_ref(cool_task_id, image_url)
+                    if cool_task_id
+                    else image_url
+                )
                 try:
                     await LogService.update_log_remote_url(log_id=log_id, remote_url=remote_url)
                 except Exception:
@@ -621,9 +847,26 @@ class ImageService:
                 # 下载到本地 data/images/
                 import time as _time
                 filename = f"fusion_{int(_time.time())}_{secrets.token_hex(4)}.png"
-                local_path = await ImageService._download_image(image_url, filename)
+                local_path = await ImageService._download_image(
+                    image_url,
+                    filename,
+                    retry_404_delays=[2, 5, 10],
+                )
                 if local_path:
                     image_url = local_path
+                else:
+                    err_msg = (
+                        "图片生成成功，但服务商返回的结果文件暂不可下载。"
+                        "上游地址已保存，请稍后在调用日志点击“重下图片”；"
+                        "本次不会自动重新生成，避免重复扣费。"
+                    )
+                    await LogService.update_log_error(log_id=log_id, error_message=err_msg)
+                    return {
+                        "success": False,
+                        "image_url": None,
+                        "remote_url": remote_url,
+                        "message": err_msg,
+                    }
             else:
                 # 已是本地路径(provider 端已存盘),不写 remote_url、不重复下载
                 remote_url = None
@@ -654,6 +897,7 @@ class ImageService:
         variant_name: str = None,      # v3.61.202:马甲名(image_role=variant_* 时用)
         override_filename: str = None,  # v3.61.262:强制指定保存文件名(相对 data/images/ 的片段,可带子目录)。
                                         # 封面多比例用:每比例各唯一名,绕过 _build_image_filename 的"未命名"固定路径互相覆盖。
+        local_only: bool = False,      # 本地模型配置页测试时强制读取本机配置，避免同 ID 云端配置串线
     ) -> Dict[str, Any]:
         """
         调用图片生成大模型生成图片
@@ -673,13 +917,12 @@ class ImageService:
         prompt = sanitize_unicode(prompt)
                 
         # 获取图片模型配置
-        config = await LLMService.get_by_id(config_id)
+        config = await LLMService.get_by_id(config_id, local_only=local_only)
         if not config:
             return {"success": False, "image_url": None, "message": f"配置ID {config_id} 不存在"}
         
         if config.get("config_type") != "image":
             return {"success": False, "image_url": None, "message": "指定的配置不是图片生成配置"}
-        config = ImageService._trusted_config(config)
         
         # 创建日志记录
         log_id = await LogService.create_log(
@@ -703,15 +946,16 @@ class ImageService:
             # 获取尺寸参数
             # v3.61.147:override_ratio(全景图 = 2:1) 优先级最高,绕过 config 配置
             ratio = override_ratio or config.get("image_ratio", "1:1")
+            size = ImageService._get_size_from_ratio(ratio)
             model_name = config["model_name"]
-            size = ImageService._get_size_from_ratio(ratio, config.get("base_url", ""))
 
             # 创建 OpenAI 客户端
-            # 图片生成(nano-banana/gpt-image-2 等)可能需要较长时间,设置 600s(10min)超时
-            timeout = config.get("request_timeout", 600)
-            # 确保图片生成超时至少为 600 秒
-            if timeout < 600:
-                timeout = 600
+            # 图片生成(nano-banana/gpt-image-2 等)可能需要较长时间,至少等待 300s
+            timeout = max(
+                config.get("request_timeout", ImageService.MIN_IMAGE_TIMEOUT_SECONDS)
+                or ImageService.MIN_IMAGE_TIMEOUT_SECONDS,
+                ImageService.MIN_IMAGE_TIMEOUT_SECONDS,
+            )
             # v3.59.69:geek 中转 + gpt-image-2 实测稳定在 31s 切流,定位是 connect=30 太短
             # connect 抬到 60s,write 显式 120s,pool 10s,max_retries=0 防 SDK 静默重试遮蔽日志
             # v3.61.170: 注入 trust_env=False httpx client 防代理污染(同 llm_service / probe-models)
@@ -726,6 +970,7 @@ class ImageService:
             )
             
             image_url = None
+            cool_task_id = None
             
             # 准备参考图 base64（如果需要）
             reference_image_base64 = None
@@ -761,6 +1006,7 @@ class ImageService:
             _is_geek_route = (_provider_code == "geek") or ("geek" in _base_url_lower) or ("geeknow" in _base_url_lower)
             _model_lower_route = (model_name or "").lower()
             _is_geek_gpt_image = _is_geek_route and "gpt-image" in _model_lower_route
+            _is_qekor_gpt_image = ImageService.is_qekor_gpt_image_config(config)
             # v3.61.189:KKAI(mooko)中转 — OpenAI 兼容但 output_format 必需,自拼 JSON 直发
             # codex P2:产品名 KKAI,后台预设/用户配置可能填 kkai,一并识别
             # v3.61.190:实测 KKAI 实际 API 域名是 api.kkone.vip(mooko.ai 同 key 无效),加 kkone 识别
@@ -780,11 +1026,19 @@ class ImageService:
                 print(f"[INFO] 识别为 Cool API(provider={_provider_code or 'fallback-from-url'}),强制 api_style=cool_async (原值={api_style})")
                 api_style = "cool_async"
 
+            # 🛡️ 兜底:Qekor GPT-Image 系列 → 有参考图走 edits multipart,无参考图走 generations。
+            if api_style != "qekor_sync" and _is_qekor_gpt_image:
+                print(
+                    f"[INFO] 识别为 Qekor GPT-Image(provider={_provider_code or 'fallback-from-url'}),"
+                    f"强制 api_style=qekor_sync (原值={api_style})"
+                )
+                api_style = "qekor_sync"
+
             # 🛡️ 兜底:geek + gpt-image-2 系列 → 走 geek_sync 自拼 JSON
             # 原因(v3.59.72):OpenAI SDK 的 extra_body 透传不可靠,实测 image 字段被 SDK 静默吞掉
             #                 → 上游收不到参考图 → 出图等同文生图
             #                 用 aiohttp 直发完全控制请求体,参考图先上传 admin-server 拿公网 URL
-            if api_style != "geek_sync" and _is_geek_gpt_image:
+            if api_style != "geek_sync" and _is_geek_gpt_image and not _is_qekor_gpt_image:
                 print(f"[INFO] 识别为 geek GPT-Image(provider={_provider_code or 'fallback-from-url'}),强制 api_style=geek_sync (原值={api_style})")
                 api_style = "geek_sync"
 
@@ -891,13 +1145,36 @@ class ImageService:
                         _lg2.getLogger(__name__).info(f"[Cool] 参考图已传 CDN: {cool_ref_url[:120]}")
                     except Exception as _up_err:
                         _lg2.getLogger(__name__).warning(f"[Cool] ⚠️ 参考图上传 CDN 失败,fallback 无参考图: {_up_err}")
-                image_url = await ImageService._generate_with_cool_async(
+                cool_result = await ImageService._generate_with_cool_async(
                     api_key=config["api_key"],
                     base_url=config["base_url"],
                     model=model_name,
                     prompt=prompt,
                     aspect_ratio=ratio,
                     ref_urls=ref_urls,
+                    timeout=timeout,
+                    return_task_metadata=True,
+                )
+                image_url = cool_result.get("url") if isinstance(cool_result, dict) else cool_result
+                cool_task_id = cool_result.get("task_id") if isinstance(cool_result, dict) else None
+            elif api_style == "qekor_sync":
+                print(f"[INFO] 使用 Qekor GPT-Image 接口生成: {model_name}")
+                _qekor_size_map = {
+                    "1:1": "2048x2048",
+                    "16:9": "1920x1080",
+                    "9:16": "1080x1920",
+                    "4:3": "1536x1024",
+                    "3:4": "1024x1536",
+                    "2:1": "2048x1024",
+                    "1:2": "1024x2048",
+                }
+                image_url = await ImageService._generate_with_qekor_sync(
+                    api_key=config["api_key"],
+                    base_url=config["base_url"],
+                    model=model_name,
+                    prompt=prompt,
+                    size=_qekor_size_map.get(ratio, "1920x1080"),
+                    ref_images=[reference_image_base64] if reference_image_base64 else [],
                     timeout=timeout,
                 )
             elif api_style == "geek_sync":
@@ -938,6 +1215,7 @@ class ImageService:
                     size=geek_size,
                     ref_urls=ref_urls,
                     timeout=timeout,
+                    channel_name="geek",
                 )
             elif api_style == "mooko_sync":
                 # v3.61.189:KKAI(mooko/kkone)OpenAI 兼容图片生成
@@ -975,7 +1253,7 @@ class ImageService:
             else:  # 'auto' 或未知值,保持原有行为
                 use_chat = ImageService._should_use_chat_completion(model_name)
 
-            if api_style in ("wuyinkeji_async", "bltcy_async", "cool_async", "geek_sync", "mooko_sync"):
+            if api_style in ("wuyinkeji_async", "bltcy_async", "cool_async", "qekor_sync", "geek_sync", "mooko_sync"):
                 # 已在上方分支处理 — 不再走 OpenAI SDK 路径
                 pass
             elif use_chat:
@@ -1018,7 +1296,12 @@ class ImageService:
             # ★ 关键:服务商响应到手立刻持久化 URL(防止后续下载挂掉导致 URL 永久丢失)
             # nano-banana 这类模型返回的 URL 仅 2 小时有效,必须第一时间入库
             if image_url.startswith("http"):
-                await LogService.update_log_remote_url(log_id=log_id, remote_url=image_url)
+                remote_url = (
+                    ImageService._build_cool_remote_ref(cool_task_id, image_url)
+                    if cool_task_id
+                    else image_url
+                )
+                await LogService.update_log_remote_url(log_id=log_id, remote_url=remote_url)
 
                 # 下载到本地(小说/类型/语义名,用户打开目录可一眼区分)
                 # v3.61.262:override_filename 优先(封面多比例各唯一名,避免固定路径互相覆盖)
@@ -1030,7 +1313,11 @@ class ImageService:
                     image_role=image_role,
                     variant_name=variant_name,
                 )
-                local_path = await ImageService._download_image(image_url, filename)
+                local_path = await ImageService._download_image(
+                    image_url,
+                    filename,
+                    retry_404_delays=[2, 5, 10, 20],
+                )
                 if local_path:
                     image_url = local_path
                 else:
@@ -1093,14 +1380,23 @@ class ImageService:
                 except Exception as _wm_err:
                     print(f"[WARN] 水印处理异常(忽略): {_wm_err}")
 
-            # 更新日志为成功状态
-            await LogService.update_log_success(
-                log_id=log_id,
-                output_content=image_url,
-                input_tokens=0,
-                output_tokens=0,
-                total_tokens=0
-            )
+            # 图片已经安全落盘后，日志写入只能是旁路诊断，不能反转业务结果。
+            # 某些用户机器 SQLite 短暂锁表时，旧逻辑会进入外层 except，导致磁盘
+            # 有图但接口返回失败、前端显示 FAILED。
+            try:
+                await LogService.update_log_success(
+                    log_id=log_id,
+                    output_content=image_url,
+                    input_tokens=0,
+                    output_tokens=0,
+                    total_tokens=0
+                )
+            except Exception:
+                logger.exception(
+                    "图片已生成并落盘，但成功日志写入失败；继续返回成功 log_id=%s image_url=%s",
+                    log_id,
+                    image_url,
+                )
 
             return {
                 "success": True,
@@ -1110,6 +1406,17 @@ class ImageService:
             
         except Exception as e:
             raw = f"{type(e).__name__}: {str(e)}"
+            # Persist the real provider/timeout exception for support cases.
+            # Never include the API key or full prompt in this diagnostic.
+            logger.exception(
+                "图片生成调用失败 config_id=%s model=%s api_style=%s provider=%s timeout=%s element_id=%s",
+                config_id,
+                config.get("model_name", ""),
+                config.get("api_style", ""),
+                config.get("provider_code", ""),
+                timeout if "timeout" in locals() else None,
+                element_id,
+            )
             lower = raw.lower()
             # 跟 LLM 路径同款友好化:已识别的错误给精准提示,未识别的兜底"换中转"
             if 'insufficient_user_quota' in lower or 'new_api_error' in lower:
@@ -1120,6 +1427,8 @@ class ImageService:
                 error_msg = 'API Key 无效或已失效,请到"模型API配置"检查密钥是否正确。'
             elif '429' in lower or 'rate limit' in lower or 'too many requests' in lower:
                 error_msg = "调用过于频繁触发服务商限流,请稍候 1-2 分钟再试。"
+            elif 'qekor http 524' in lower or ('cloudflare' in lower and '120 秒' in str(e)):
+                error_msg = str(e)
             elif '404' in lower or 'model not found' in lower:
                 error_msg = "图像模型不存在或接口地址错误,请检查 model_name 和 base_url。"
             elif '502' in lower or '503' in lower or 'bad gateway' in lower:
@@ -1197,7 +1506,6 @@ class ImageService:
             return {"success": False, "image_url": None, "message": f"配置 ID {config_id} 不存在"}
         if config.get("config_type") != "image":
             return {"success": False, "image_url": None, "message": "指定的配置不是图片生成配置"}
-        config = ImageService._trusted_config(config)
 
         # 复用 generate_image 的 provider 识别逻辑(L620-657),保持一致
         api_style = (config.get("api_style") or "auto").lower()
@@ -1209,6 +1517,7 @@ class ImageService:
         _is_bltcy     = _provider == "bltcy" or "bltcy" in _base
         _is_cool      = _provider == "cool" or "mjapi.cc.cd" in _base
         _is_geek      = _provider == "geek" or "geek" in _base or "geeknow" in _base
+        _is_qekor     = ImageService.is_qekor_gpt_image_config(config)
         # v3.61.190:KKAI(mooko/kkone)实测能出真 2:1 equirectangular 全景,放进白名单
         _is_mooko     = _provider in ("mooko", "kkai", "kkone") or "mooko.ai" in _base or "kkone" in _base
         # 1Day 真实检测同步实际 dispatch 逻辑(image_service L1740):
@@ -1277,6 +1586,7 @@ class ImageService:
         # v3.61.158 codex round5: 仅 seedream 非 lite 档放行;速创 + GPT-Image-2 加入
         _channel_ok = (
             (_is_geek and "gpt-image" in _model)              # geek + gpt-image → geek_sync 路径,已加 2:1
+            or _is_qekor                                       # Qekor GPT-Image → qekor_sync,2:1=2048x1024
             or (_is_1day and ("gpt-image" in _model or "nano-banana" in _model))  # 1Day 路径,已加 2:1
             or (_is_openai_direct and "gpt-image" in _model)  # OpenAI 直发 + 限定 gpt-image 系列
             or api_style in ("geek_sync",)                    # 显式指定 geek_sync
@@ -1291,7 +1601,7 @@ class ImageService:
                 "image_url": None,
                 "message": (
                     "当前图片模型配置无法保证生成真正的 2:1 全景图(可能 fallback 到 16:9)。"
-                    "请改用以下配置之一:geek 中转 + gpt-image-2 / 1day 中转 + gpt-image-2 或 nano-banana / "
+                    "请改用以下配置之一:geek/Qekor 中转 + gpt-image-2 / 1day 中转 + gpt-image-2 或 nano-banana / "
                     "OpenAI 官方 + gpt-image-2 / 火山方舟 doubao-seedream-4.x 系列(非 lite)"
                 ),
             }
@@ -1327,7 +1637,6 @@ class ImageService:
             return {"success": False, "image_url": None, "message": f"配置 ID {config_id} 不存在"}
         if config.get("config_type") != "image":
             return {"success": False, "image_url": None, "message": "指定的配置不是图片生成配置"}
-        config = ImageService._trusted_config(config)
 
         api_style = (config.get("api_style") or "auto").lower()
         _provider = (config.get("provider_code") or "").lower()
@@ -1338,6 +1647,7 @@ class ImageService:
         _is_bltcy     = _provider == "bltcy" or "bltcy" in _base
         _is_cool      = _provider == "cool" or "mjapi.cc.cd" in _base
         _is_geek      = _provider == "geek" or "geek" in _base or "geeknow" in _base
+        _is_qekor     = ImageService.is_qekor_gpt_image_config(config)
         # v3.61.190:KKAI(mooko/kkone)实测能出真 2:1 全景,放进白名单
         _is_mooko     = _provider in ("mooko", "kkai", "kkone") or "mooko.ai" in _base or "kkone" in _base
         _is_1day      = _provider == "1day" or "daydreaming.work" in _base or "1day" in _base or "oneday" in _base
@@ -1374,6 +1684,7 @@ class ImageService:
 
         _channel_ok = (
             (_is_geek and "gpt-image" in _model)
+            or _is_qekor
             or (_is_1day and ("gpt-image" in _model or "nano-banana" in _model))
             or (_is_openai_direct and "gpt-image" in _model)
             or api_style in ("geek_sync",)
@@ -1384,7 +1695,7 @@ class ImageService:
         )
         if not _channel_ok:
             return {"success": False, "image_url": None,
-                    "message": "请用 Cool / 速创+GPT-Image-2 / geek / 1day / OpenAI 直发的 gpt-image-2 / nano-banana 或 火山方舟 doubao-seedream-4.x(非 lite)配置"}
+                    "message": "请用 Cool / 速创+GPT-Image-2 / geek / Qekor / 1day / OpenAI 直发的 gpt-image-2 / nano-banana 或 火山方舟 doubao-seedream-4.x(非 lite)配置"}
 
         return await ImageService.generate_image(
             config_id=config_id,
@@ -1408,6 +1719,13 @@ class ImageService:
         把 base64 参考图上传到 admin-server,返回 (public_url, delete_token)。
         成功后该 URL 可被速创等外部 API 直接拉取;1 小时 TTL 内有效。
         """
+        # Production admin object storage is deliberately unavailable in the
+        # migration build.  Local/direct providers can still be used; callers
+        # requiring a public reference URL must use their own provider upload.
+        from services.offline_guard import cloud_enabled
+        if not cloud_enabled():
+            raise RuntimeError("开发迁移版已切断生产参考图服务，请使用支持参考图直传的本地模型配置")
+
         import base64 as _b64
         import httpx as _httpx
         import os as _os
@@ -1491,6 +1809,9 @@ class ImageService:
     async def _cleanup_refs_on_admin(delete_tokens: list) -> None:
         """批量清理上传的参考图。失败不抛异常(服务器有 GC 兜底)"""
         if not delete_tokens:
+            return
+        from services.offline_guard import cloud_enabled
+        if not cloud_enabled():
             return
         import httpx as _httpx
         import os as _os
@@ -1869,8 +2190,14 @@ class ImageService:
         aspect_ratio: str = "16:9",
         ref_urls: list = None,
         timeout: int = 1200,  # 默认 20 分钟,Cool 视频可能 30 分钟,但 C 端不接视频
-    ) -> Optional[str]:
-        """Cool API 异步图片生成:提交 + 轮询 + 取 result.url"""
+        return_task_metadata: bool = False,
+    ) -> Any:
+        """Cool API 异步图片生成:提交 + 轮询 + 取 result.url。
+
+        ``return_task_metadata=True`` 时返回 ``{"url", "task_id"}``，供调用
+        日志同时保存 task_id。这样 CDN 地址失效后，“重下图片”仍可向 Cool
+        查询任务并刷新结果地址；默认仍返回字符串，兼容现有调用/测试。
+        """
         import aiohttp
         import asyncio as _asyncio
 
@@ -1958,6 +2285,8 @@ class ImageService:
                             image_url = result.get("url")
                             if image_url:
                                 print(f"[cool] 任务 {task_id} 成功,URL={image_url}")
+                                if return_task_metadata:
+                                    return {"url": image_url, "task_id": task_id}
                                 return image_url
                             raise RuntimeError(f"Cool 任务成功但 result.url 为空: {resp_text[:500]}")
                         elif status == "failed":
@@ -1991,8 +2320,9 @@ class ImageService:
         size: str = "1920x1080",
         ref_urls: list = None,
         timeout: int = 600,
+        channel_name: str = "geek",
     ) -> Optional[str]:
-        """geek GPT-Image-2 同步直发,完全控制 JSON body。"""
+        """geek/Qekor GPT-Image-2 同步直发,完全控制 JSON body。"""
         import aiohttp
 
         base_url = (base_url or "").rstrip("/")
@@ -2020,20 +2350,126 @@ class ImageService:
             async with session.post(submit_url, json=body, headers=headers) as resp:
                 resp_text = await resp.text()
                 if resp.status != 200:
-                    raise RuntimeError(f"geek HTTP {resp.status}: {resp_text[:500]}")
+                    if resp.status == 524 and channel_name.lower() == "qekor":
+                        raise RuntimeError(
+                            "Qekor HTTP 524: 启科上游 Cloudflare 在约 120 秒主动截断请求。"
+                            "工具端已按 10 分钟等待,但无法覆盖服务商代理层的 120 秒限制;"
+                            "请优先改用 base_url 为 https://api.qekor.com/v1 的启科配置,"
+                            "或联系启科处理 www.qekor.com 的长任务超时。为避免重复扣费,本次不自动重提。"
+                        )
+                    raise RuntimeError(f"{channel_name} HTTP {resp.status}: {resp_text[:500]}")
                 try:
                     data = json.loads(resp_text)
                 except Exception:
-                    raise RuntimeError(f"geek 响应非 JSON: {resp_text[:500]}")
+                    raise RuntimeError(f"{channel_name} 响应非 JSON: {resp_text[:500]}")
 
                 items = data.get("data") or []
                 if not items:
-                    raise RuntimeError(f"geek 响应 data 为空: {resp_text[:500]}")
+                    raise RuntimeError(f"{channel_name} 响应 data 为空: {resp_text[:500]}")
                 # v3.61.189:改用统一三态解析(补老缺口:dataURL 之前被当普通 URL 原样返回 → 下游炸)
                 result = await ImageService._extract_openai_image_result(items[0], fmt_hint="png")
                 if not result:
-                    raise RuntimeError(f"geek 响应缺 url/b64_json: {resp_text[:500]}")
-                print(f"[geek] OK result={result[:120] if isinstance(result, str) else result}")
+                    raise RuntimeError(f"{channel_name} 响应缺 url/b64_json: {resp_text[:500]}")
+                print(f"[{channel_name}] OK result={result[:120] if isinstance(result, str) else result}")
+                return result
+
+    @staticmethod
+    async def _generate_with_qekor_sync(
+        api_key: str,
+        base_url: str,
+        model: str,
+        prompt: str,
+        size: str = "1920x1080",
+        ref_images: list = None,
+        timeout: int = 600,
+    ) -> Optional[str]:
+        """Qekor GPT-Image 同步接口。
+
+        启科的 generations JSON 即使携带 image 数组也会静默按文生图处理。
+        因此有参考图时使用 /images/edits multipart,每张图片用 image[] 文件字段；
+        无参考图时继续使用已验证的 /images/generations JSON 路径。
+        """
+        import aiohttp
+        import base64 as _b64
+
+        refs = [item for item in (ref_images or []) if item]
+        if not refs:
+            return await ImageService._generate_with_geek_sync(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                prompt=prompt,
+                size=size,
+                ref_urls=[],
+                timeout=timeout,
+                channel_name="Qekor",
+            )
+
+        normalized_base_url = (base_url or "").rstrip("/")
+        submit_url = (
+            f"{normalized_base_url}/images/edits"
+            if normalized_base_url.endswith("/v1")
+            else f"{normalized_base_url}/v1/images/edits"
+        )
+        headers = {"Authorization": f"Bearer {api_key}"}
+        form = aiohttp.FormData()
+        form.add_field("model", model)
+        form.add_field("prompt", prompt)
+        form.add_field("n", "1")
+        form.add_field("size", size)
+
+        for idx, value in enumerate(refs):
+            payload = value
+            declared_mime = ""
+            if isinstance(value, str) and value.startswith("data:") and "," in value:
+                header, payload = value.split(",", 1)
+                declared_mime = header[5:].split(";", 1)[0].strip().lower()
+            try:
+                raw = _b64.b64decode(payload)
+            except Exception as exc:
+                raise RuntimeError(f"Qekor 参考图 base64 解码失败(第{idx + 1}张): {exc}")
+            if raw[:2] == b"\xff\xd8":
+                content_type, ext = "image/jpeg", "jpg"
+            elif raw[:8] == b"\x89PNG\r\n\x1a\n":
+                content_type, ext = "image/png", "png"
+            elif len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+                content_type, ext = "image/webp", "webp"
+            elif declared_mime in ("image/jpeg", "image/jpg", "image/png", "image/webp"):
+                content_type = "image/jpeg" if declared_mime == "image/jpg" else declared_mime
+                ext = "jpg" if content_type == "image/jpeg" else content_type.rsplit("/", 1)[-1]
+            else:
+                raise RuntimeError(f"Qekor 参考图格式无法识别(第{idx + 1}张),仅支持 jpg/png/webp")
+            form.add_field(
+                "image[]",
+                raw,
+                filename=f"ref{idx + 1}.{ext}",
+                content_type=content_type,
+            )
+
+        timeout_cfg = aiohttp.ClientTimeout(total=timeout + 30, connect=60)
+        print(f"[Qekor] endpoint={submit_url} refs={len(refs)} size={size}")
+        async with aiohttp.ClientSession(connector=get_aiohttp_connector(), timeout=timeout_cfg) as session:
+            async with session.post(submit_url, data=form, headers=headers) as resp:
+                resp_text = await resp.text()
+                if not 200 <= resp.status < 300:
+                    if resp.status == 524:
+                        raise RuntimeError(
+                            "Qekor HTTP 524: 启科上游 Cloudflare 在约 120 秒主动截断请求。"
+                            "工具端已按 10 分钟等待,但无法覆盖服务商代理层的限制;"
+                            "为避免重复扣费,本次不自动重提。"
+                        )
+                    raise RuntimeError(f"Qekor edits HTTP {resp.status}: {resp_text[:500]}")
+                try:
+                    data = json.loads(resp_text)
+                except Exception:
+                    raise RuntimeError(f"Qekor edits 响应非 JSON: {resp_text[:500]}")
+                items = data.get("data") or []
+                if not items:
+                    raise RuntimeError(f"Qekor edits 响应 data 为空: {resp_text[:500]}")
+                result = await ImageService._extract_openai_image_result(items[0], fmt_hint="png")
+                if not result:
+                    raise RuntimeError(f"Qekor edits 响应缺 url/b64_json: {resp_text[:500]}")
+                print(f"[Qekor] edits OK result={result[:120] if isinstance(result, str) else result}")
                 return result
 
     # v3.61.194:复刻 KKAI 官网 calculateExactSize(image.kkone.vip/app.js)— 按比例+档位精确算 size
@@ -2169,69 +2605,6 @@ class ImageService:
                 return await ImageService._save_base64_image(b64, f"image_{uuid.uuid4().hex[:8]}.{_ext_hint}")
         return None
 
-    @staticmethod
-    def _extract_image_payload(value: Any, key_hint: str = "") -> Optional[tuple[str, str]]:
-        """Extract an image from OpenAI-compatible and common proxy responses.
-
-        Some NewAPI/proxy deployments return ``image_url`` or a nested ``url``
-        instead of the OpenAI ``data[0].url`` shape. Keep this parser limited to
-        image-looking fields so a ``revised_prompt`` or other text is never
-        mistaken for an image result. The return value is ``(kind, value)``.
-        """
-        import re as _re
-
-        if value is None:
-            return None
-        if hasattr(value, "model_dump"):
-            try:
-                value = value.model_dump()
-            except Exception:
-                pass
-        elif hasattr(value, "to_dict"):
-            try:
-                value = value.to_dict()
-            except Exception:
-                pass
-
-        hint = (key_hint or "").lower()
-        if isinstance(value, str):
-            candidate = value.strip()
-            if candidate.startswith(("http://", "https://", "data:image/")):
-                return ("url", candidate)
-            if "content" in hint or "markdown" in hint:
-                match = _re.search(r"!\[[^\]]*\]\((https?://[^)\s]+|data:image/[^)]+)\)", candidate)
-                if match:
-                    return ("url", match.group(1))
-                match = _re.search(r"https?://\S+", candidate)
-                if match:
-                    return ("url", match.group(0).rstrip(".,)"))
-            if "base64" in hint or hint in {"b64", "b64_json", "image_data"}:
-                if len(candidate) >= 32:
-                    return ("base64", candidate)
-            return None
-        if isinstance(value, list):
-            for item in value:
-                found = ImageService._extract_image_payload(item, hint)
-                if found:
-                    return found
-            return None
-        if not isinstance(value, dict):
-            return None
-
-        priority = (
-            "url", "image_url", "imageUrl", "img_url", "imgUrl", "image",
-            "b64_json", "base64", "image_data", "data", "output", "result",
-            "images", "choices", "content",
-        )
-        for key in priority:
-            if key not in value or value[key] in (None, "", [], {}):
-                continue
-            child_hint = key.lower()
-            found = ImageService._extract_image_payload(value[key], child_hint)
-            if found:
-                return found
-        return None
-
     # v3.61.189:KKAI(mooko/kkone)OpenAI 兼容图片生成 — output_format 必需
     # v3.61.193:edits(图生图/溶图)改 multipart/form-data — 实测 JSON image 数组一律 400,只认 multipart 文件
     @staticmethod
@@ -2365,12 +2738,16 @@ class ImageService:
         # v3.61.74:1Day 多模型聚合中转 — base_url 是 daydreaming.work
         # 文档说 GPT-Image-2 最大分辨率 2K(API Beta),宽高比 3:1 ~ 1:3,中转用 OpenAI 标准 images.generate 协议
         is_1day   = (provider == "1day") or ("daydreaming.work" in base_url_lower)
+        is_volcengine = (
+            provider == "volcengine"
+            or ("ark.cn-" in base_url_lower and "volces.com" in base_url_lower)
+        )
         has_ref   = bool(reference_image_base64)
 
         extra_body = {}
 
         # ============ 分支 1: Seedream(豆包系) ============
-        if "seedream" in model_lower:
+        if "seedream" in model_lower or is_volcengine:
             # v3.61.158: 默认 "2K" 预设让模型自适应比例;但 2:1 全景必须显式给像素
             # v3.61.158 codex round5: 5.0-lite 文档不含严格 2:1(只有 21:9),且像素 size 有 2K 最小限制,
             #   2048x1024(≈2.1M 像素)低于 2K 档,大概率 400 — 这里只对非 lite 才传像素
@@ -2387,8 +2764,19 @@ class ImageService:
                     print(f"[INFO] seedream 2:1 全景: 用像素 size={size}")
             else:
                 size = "2K"
-            extra_body["use_pre_llm"] = True
-            extra_body["watermark"] = False
+            # 火山方舟的 ep-... 接入点名不会包含 seedream，但图片配置仍须按
+            # ImageGenerations 协议发送。这里使用官方请求体字段，避免把通用
+            # OpenAI 的 n/像素枚举发给方舟。
+            if is_volcengine:
+                extra_body.update({
+                    "sequential_image_generation": "disabled",
+                    "stream": False,
+                    "response_format": "url",
+                    "watermark": False,
+                })
+            else:
+                extra_body["use_pre_llm"] = True
+                extra_body["watermark"] = False
             if has_ref:
                 # data URL 格式
                 # v3.61.162: 5.0 系列(含 lite,如 doubao-seedream-5-0-260128)官方文档参数名是 `image`
@@ -2396,9 +2784,9 @@ class ImageService:
                 #            参考:https://www.volcengine.com/docs/6791/1541523
                 #   保守只切 5.0 系列;4.0/4.5 维持 image_urls(已验过能用)
                 _is_5x = ("5-0" in model_lower or "5.0" in model_lower or "5_0" in model_lower)
-                if _is_5x:
+                if _is_5x or is_volcengine:
                     extra_body["image"] = [reference_image_base64]
-                    print(f"[INFO] 图生图(seedream 5.x) ref count=1 字段=image")
+                    print(f"[INFO] 图生图(seedream/volcengine) ref count=1 字段=image")
                 else:
                     extra_body["image_urls"] = [reference_image_base64]
                     print(f"[INFO] 图生图(seedream 4.x) ref count=1 字段=image_urls")
@@ -2550,7 +2938,9 @@ class ImageService:
                 extra_body[k] = v  # 用户设置覆盖默认
             print(f"[INFO] extra_body 最终: {list(extra_body.keys())}")
 
-        kwargs = dict(model=model, prompt=prompt, n=1, size=size)
+        kwargs = dict(model=model, prompt=prompt, size=size)
+        if not is_volcengine:
+            kwargs["n"] = 1
         if extra_body:
             kwargs["extra_body"] = extra_body
 
@@ -2572,19 +2962,23 @@ class ImageService:
                         continue
                     return None
 
-                payload = ImageService._extract_image_payload(response.data[0])
-                if payload:
-                    kind, image_value = payload
+                image_data = response.data[0]
+
+                # 优先处理 URL 格式
+                if hasattr(image_data, 'url') and image_data.url:
                     if attempt > 1:
                         _logger.info(f"[images.generate] 第 {attempt} 次尝试成功 model={model}")
-                    if kind == "base64":
-                        import uuid
-                        return await ImageService._save_base64_image(
-                            image_value, f"image_{uuid.uuid4().hex[:8]}.png"
-                        )
-                    return image_value
+                    return image_data.url
 
-                _logger.warning(f"[images.generate] 返回中没有可用图片字段 model={model} attempt={attempt}/{max_attempts}")
+                # 处理 base64 格式
+                if hasattr(image_data, 'b64_json') and image_data.b64_json:
+                    import uuid
+                    filename = f"image_{uuid.uuid4().hex[:8]}.png"
+                    if attempt > 1:
+                        _logger.info(f"[images.generate] 第 {attempt} 次尝试成功(b64) model={model}")
+                    return await ImageService._save_base64_image(image_data.b64_json, filename)
+
+                _logger.warning(f"[images.generate] data[0] 既无 url 也无 b64_json model={model}")
                 if attempt < max_attempts:
                     continue
                 return None
@@ -2597,8 +2991,12 @@ class ImageService:
                     import asyncio as _asyncio
                     await _asyncio.sleep(2 if attempt == 1 else 5)
                     continue
-                # 最后一次也失败,落地
-                return None
+                # 最后一次必须把服务商异常交给上层。旧逻辑返回 None 会把明确的
+                # 401/429/400 全部抹成“无法获取生成的图片”，导致用户误判为
+                # 请求没有发出。
+                raise
+        if last_err is not None:
+            raise last_err
         return None
     
     @staticmethod
