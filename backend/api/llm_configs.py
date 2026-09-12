@@ -101,10 +101,18 @@ async def get_llm_configs(
             # provider base URL or credential.
             minimax.update({
                 "id": -900005,
-                "name": "官方 NewAPI · MiniMax H3",
-                "model_name": "minimax-H3-1080p-IR",
+                "name": "官方 NewAPI · MiniMax H3（768P）",
+                "model_name": "minimax-H3-768p-IR",
             })
             configs.append(minimax)
+        if config_type == "video" and not any(item.get("id") == -900007 for item in configs):
+            minimax_official = dict(official)
+            minimax_official.update({
+                "id": -900007,
+                "name": "官方 MiniMax H3",
+                "model_name": "MiniMax-H3",
+            })
+            configs.append(minimax_official)
         if config_type == "video":
             official["name"] = "官方 Seedance2"
         if config_type == "llm" and not any(item.get("id") == -900006 for item in configs):
@@ -116,7 +124,8 @@ async def get_llm_configs(
     # base URL/key can never look like a user-editable official credential.
     official_video_rows = {
         -900004: ("官方 Seedance2", "Seedance2"),
-        -900005: ("官方 NewAPI · MiniMax H3", "minimax-H3-1080p-IR"),
+        -900005: ("官方 NewAPI · MiniMax H3（768P）", "minimax-H3-768p-IR"),
+        -900007: ("官方 MiniMax H3", "MiniMax-H3"),
     }
     for item in configs:
         if not isinstance(item, dict):
