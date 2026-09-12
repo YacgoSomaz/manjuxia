@@ -208,6 +208,7 @@
       .manjuxia-quick-recharge__close{right:20px;top:18px}.manjuxia-quick-recharge__dialog{position:relative}.manjuxia-quick-recharge__plans{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:17px}.manjuxia-quick-recharge__plan{display:grid;gap:8px;padding:16px;border:1px solid #d3e1f2;border-radius:10px;background:#fff!important}.manjuxia-quick-recharge__plan strong{color:#193252!important;font-size:16px}.manjuxia-quick-recharge__price{color:#246bfe!important;font-size:20px;font-weight:800}.manjuxia-quick-recharge__plan button{height:30px;border:0;border-radius:6px;background:#246bfe!important;color:#fff!important;font-size:11px;font-weight:750;cursor:pointer}.manjuxia-quick-recharge__plan button:disabled{opacity:.6;cursor:wait}.manjuxia-quick-recharge__note{margin:15px 0 0;color:#72849a!important;font-size:11px}.manjuxia-quick-recharge__status{min-height:18px;margin:14px 0 0;color:#536b87!important;font-size:12px}.manjuxia-quick-recharge__status.error{color:#bf3d4d!important}.manjuxia-quick-recharge__payment{display:grid;grid-template-columns:150px 1fr;align-items:center;gap:18px;margin-top:18px;padding:17px;border:1px solid #cfe0f7;border-radius:10px;background:#fff!important}.manjuxia-quick-recharge__payment[hidden]{display:none}.manjuxia-quick-recharge__payment img{width:140px;height:140px;object-fit:contain;background:#fff}.manjuxia-quick-recharge__payment strong{display:block;color:#193252!important;font-size:16px}.manjuxia-quick-recharge__payment p{margin:8px 0;color:#667991!important;font-size:12px;line-height:1.7}
       @media(max-width:700px){.manjuxia-quick-recharge__dialog{padding:20px}.manjuxia-quick-recharge__head p{display:none}.manjuxia-quick-recharge__plans{grid-template-columns:repeat(2,minmax(0,1fr))}.manjuxia-quick-recharge__payment{grid-template-columns:1fr;text-align:center;justify-items:center}}
     `;
+    style.textContent += `.manjuxia-quick-recharge__payment.is-success{grid-template-columns:1fr;padding:23px;border-color:#78d4a4;background:#edfff5!important;text-align:center}.manjuxia-quick-recharge__payment.is-success img{display:none}.manjuxia-quick-recharge__payment.is-success strong{color:#087b45!important;font-size:23px}.manjuxia-quick-recharge__payment.is-success p{margin:10px 0 0;color:#24714e!important;font-size:14px;font-weight:700}`;
     document.head.appendChild(style);
   }
 
@@ -256,9 +257,14 @@
         if (result.order.status === "SUCCESS") {
           if (paymentTimer) window.clearInterval(paymentTimer);
           paymentTimer = null;
+          if (paymentExpiry) window.clearTimeout(paymentExpiry);
+          paymentExpiry = null;
           await account.me();
+          payment.classList.add("is-success");
+          payment.querySelector("strong").textContent = "✓ 充值成功";
           paymentCopy.textContent = `${credits} 积分已到账，客户端余额已刷新。`;
           setStatus("支付成功，积分已到账。");
+          window.setTimeout(close, 2200);
         } else if (result.order.status !== "PENDING") {
           if (paymentTimer) window.clearInterval(paymentTimer);
           paymentTimer = null;
