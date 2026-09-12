@@ -197,6 +197,125 @@
     if (window.electronAPI && typeof window.electronAPI.openExternal === "function") await window.electronAPI.openExternal(url);
   }
 
+  function installQuickRechargeStyle() {
+    if (document.getElementById("manjuxia-quick-recharge-style")) return;
+    const style = document.createElement("style");
+    style.id = "manjuxia-quick-recharge-style";
+    style.textContent = `
+      #manjuxia-quick-recharge{position:fixed;inset:0;z-index:200100;display:grid;place-items:center;padding:20px;background:rgba(4,12,30,.62)}
+      .manjuxia-quick-recharge__dialog{width:min(940px,calc(100vw - 40px));max-height:calc(100vh - 40px);overflow:auto;padding:23px;border:1px solid #bdd7ff;border-radius:16px;background:#f8fbff!important;color:#183252!important;box-shadow:0 28px 86px rgba(0,0,0,.36)}
+      .manjuxia-quick-recharge__head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.manjuxia-quick-recharge__eyebrow{color:#246bfe!important;font-size:10px;font-weight:800;letter-spacing:.13em}.manjuxia-quick-recharge__head h3{margin:6px 0 0;color:#193252!important;font-size:22px!important}.manjuxia-quick-recharge__head p{max-width:330px;margin:25px 30px 0 0;color:#607590!important;font-size:11px!important;line-height:1.6;text-align:right}.manjuxia-quick-recharge__close{position:absolute;width:31px;height:31px;border:0;border-radius:7px;background:#eaf1fb!important;color:#49627d!important;font-size:22px;line-height:1;cursor:pointer}
+      .manjuxia-quick-recharge__close{right:20px;top:18px}.manjuxia-quick-recharge__dialog{position:relative}.manjuxia-quick-recharge__plans{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:17px}.manjuxia-quick-recharge__plan{display:grid;gap:8px;padding:16px;border:1px solid #d3e1f2;border-radius:10px;background:#fff!important}.manjuxia-quick-recharge__plan strong{color:#193252!important;font-size:16px}.manjuxia-quick-recharge__price{color:#246bfe!important;font-size:20px;font-weight:800}.manjuxia-quick-recharge__plan button{height:30px;border:0;border-radius:6px;background:#246bfe!important;color:#fff!important;font-size:11px;font-weight:750;cursor:pointer}.manjuxia-quick-recharge__plan button:disabled{opacity:.6;cursor:wait}.manjuxia-quick-recharge__note{margin:15px 0 0;color:#72849a!important;font-size:11px}.manjuxia-quick-recharge__status{min-height:18px;margin:14px 0 0;color:#536b87!important;font-size:12px}.manjuxia-quick-recharge__status.error{color:#bf3d4d!important}.manjuxia-quick-recharge__payment{display:grid;grid-template-columns:150px 1fr;align-items:center;gap:18px;margin-top:18px;padding:17px;border:1px solid #cfe0f7;border-radius:10px;background:#fff!important}.manjuxia-quick-recharge__payment[hidden]{display:none}.manjuxia-quick-recharge__payment img{width:140px;height:140px;object-fit:contain;background:#fff}.manjuxia-quick-recharge__payment strong{display:block;color:#193252!important;font-size:16px}.manjuxia-quick-recharge__payment p{margin:8px 0;color:#667991!important;font-size:12px;line-height:1.7}
+      @media(max-width:700px){.manjuxia-quick-recharge__dialog{padding:20px}.manjuxia-quick-recharge__head p{display:none}.manjuxia-quick-recharge__plans{grid-template-columns:repeat(2,minmax(0,1fr))}.manjuxia-quick-recharge__payment{grid-template-columns:1fr;text-align:center;justify-items:center}}
+    `;
+    document.head.appendChild(style);
+  }
+
+  function formatRechargePrice(amountCents) {
+    return `¥${(Number(amountCents || 0) / 100).toFixed(2)}`;
+  }
+
+  async function openQuickRecharge() {
+    const account = window.electronAPI && window.electronAPI.account;
+    if (!account || typeof account.creditPlans !== "function" || typeof account.createPayment !== "function") {
+      window.alert("当前客户端版本暂不支持快速充值，请更新客户端后重试。");
+      return;
+    }
+    document.getElementById("manjuxia-quick-recharge")?.remove();
+    installQuickRechargeStyle();
+    const mask = document.createElement("div");
+    mask.id = "manjuxia-quick-recharge";
+    mask.innerHTML = `<section class="manjuxia-quick-recharge__dialog" role="dialog" aria-modal="true" aria-label="漫剧虾算力积分充值"><button type="button" class="manjuxia-quick-recharge__close" aria-label="关闭">×</button><header class="manjuxia-quick-recharge__head"><div><div class="manjuxia-quick-recharge__eyebrow">MANJUXIA CREDITS</div><h3>漫剧虾算力积分充值</h3></div><p>¥0.10 = 1 积分。支付成功后自动到账，仅用于漫剧虾官方 AI 算力。</p></header><div class="manjuxia-quick-recharge__plans" aria-live="polite"></div><p class="manjuxia-quick-recharge__note">正在加载充值档位…</p><div class="manjuxia-quick-recharge__payment" hidden><img alt="微信支付二维码"><div><strong>请使用微信扫码支付</strong><p class="manjuxia-quick-recharge__payment-copy">订单已创建，正在等待支付。</p></div></div><p class="manjuxia-quick-recharge__status" aria-live="polite"></p></section>`;
+    document.body.appendChild(mask);
+    const plansNode = mask.querySelector(".manjuxia-quick-recharge__plans");
+    const note = mask.querySelector(".manjuxia-quick-recharge__note");
+    const status = mask.querySelector(".manjuxia-quick-recharge__status");
+    const payment = mask.querySelector(".manjuxia-quick-recharge__payment");
+    const paymentQr = payment.querySelector("img");
+    const paymentCopy = payment.querySelector(".manjuxia-quick-recharge__payment-copy");
+    let paymentTimer = null;
+    let paymentExpiry = null;
+    const close = () => {
+      if (paymentTimer) window.clearInterval(paymentTimer);
+      if (paymentExpiry) window.clearTimeout(paymentExpiry);
+      document.removeEventListener("keydown", onKey, true);
+      mask.remove();
+    };
+    const onKey = (event) => { if (event.key === "Escape") close(); };
+    document.addEventListener("keydown", onKey, true);
+    mask.addEventListener("click", (event) => { if (event.target === mask) close(); });
+    mask.querySelector(".manjuxia-quick-recharge__close").addEventListener("click", close);
+    const setStatus = (message, isError = false) => {
+      status.textContent = message;
+      status.classList.toggle("error", isError);
+    };
+    const startPolling = (orderNo, credits) => {
+      const poll = async () => {
+        const result = await account.paymentStatus(orderNo);
+        if (!result || !result.success || !result.order) return;
+        if (result.order.status === "SUCCESS") {
+          if (paymentTimer) window.clearInterval(paymentTimer);
+          paymentTimer = null;
+          await account.me();
+          paymentCopy.textContent = `${credits} 积分已到账，客户端余额已刷新。`;
+          setStatus("支付成功，积分已到账。");
+        } else if (result.order.status !== "PENDING") {
+          if (paymentTimer) window.clearInterval(paymentTimer);
+          paymentTimer = null;
+          setStatus("订单当前无法继续支付，请重新选择充值档位。", true);
+        }
+      };
+      void poll();
+      paymentTimer = window.setInterval(() => { void poll(); }, 2000);
+      paymentExpiry = window.setTimeout(() => {
+        if (paymentTimer) window.clearInterval(paymentTimer);
+        paymentTimer = null;
+        setStatus("二维码已过期，请重新选择充值档位。", true);
+      }, 15 * 60 * 1000);
+    };
+    try {
+      const catalog = await account.creditPlans();
+      if (!catalog || !catalog.success || !catalog.paymentsEnabled || !Array.isArray(catalog.plans) || !catalog.plans.length) {
+        throw new Error((catalog && catalog.message) || "积分充值暂未开放");
+      }
+      plansNode.replaceChildren(...catalog.plans.map((plan) => {
+        const card = document.createElement("article");
+        card.className = "manjuxia-quick-recharge__plan";
+        const credits = document.createElement("strong");
+        credits.textContent = `${Number(plan.credits).toLocaleString("zh-CN")} 积分`;
+        const price = document.createElement("span");
+        price.className = "manjuxia-quick-recharge__price";
+        price.textContent = formatRechargePrice(plan.amountCents);
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = "立即充值";
+        button.addEventListener("click", async () => {
+          button.disabled = true;
+          setStatus("正在创建微信支付订单…");
+          try {
+            const result = await account.createPayment(plan.id);
+            if (!result || !result.success || !result.orderNo || !result.qrDataUrl) throw new Error((result && result.message) || "创建支付订单失败");
+            paymentQr.src = result.qrDataUrl;
+            payment.hidden = false;
+            paymentCopy.textContent = `订单 ${result.orderNo}，请使用微信扫码支付。`;
+            setStatus("等待微信扫码支付…");
+            startPolling(result.orderNo, Number(plan.credits));
+          } catch (error) {
+            setStatus(error instanceof Error ? error.message : "创建支付订单失败", true);
+          } finally {
+            button.disabled = false;
+          }
+        });
+        card.append(credits, price, button);
+        return card;
+      }));
+      note.textContent = "积分仅用于漫剧虾官方 AI 算力，充值后自动到账。";
+    } catch (error) {
+      note.textContent = "积分档位加载失败，请检查登录状态后重试。";
+      setStatus(error instanceof Error ? error.message : "积分档位加载失败", true);
+    }
+  }
+
   function openAccountLogin() {
     window.location.hash = "#/activation";
   }
@@ -255,7 +374,7 @@
       const action = accountFooter.querySelector(".manjuxia-account-footer__action");
       if (action) action.addEventListener("click", openRechargePage);
       const recharge = accountFooter.querySelector(".manjuxia-account-footer__recharge");
-      if (recharge) recharge.addEventListener("click", openRechargePage);
+      if (recharge) recharge.addEventListener("click", openQuickRecharge);
       const login = accountFooter.querySelector(".manjuxia-account-footer__login");
       if (login) login.addEventListener("click", openAccountLogin);
     }).catch(() => {
@@ -346,7 +465,7 @@
       if (!document.querySelector(".main-layout")) return;
       const button = event.target && event.target.closest ? event.target.closest("button") : null;
       if (!button) return;
-      if (button.closest(".manjuxia-membership-dialog") || button.matches(".manjuxia-theme-toggle, .manjuxia-account-footer__login, .manjuxia-account-footer__logout, .manjuxia-account-footer__action, .manjuxia-login, .manjuxia-send-code, .manjuxia-open-recharge-top, .el-dialog__headerbtn")) return;
+      if (button.closest(".manjuxia-membership-dialog, #manjuxia-quick-recharge") || button.matches(".manjuxia-theme-toggle, .manjuxia-account-footer__login, .manjuxia-account-footer__logout, .manjuxia-account-footer__action, .manjuxia-account-footer__recharge, .manjuxia-login, .manjuxia-send-code, .manjuxia-open-recharge-top, .el-dialog__headerbtn")) return;
       if (isGuestReadOnlyButton(button)) return;
       const info = window.__manjuxiaAccountInfo;
       if (!info || !info.phone) {

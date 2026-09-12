@@ -1145,6 +1145,13 @@ ipcMain.handle("account:payment-status", async (_event, orderNo) => {
   return licenseClient.getPaymentStatus(orderNo);
 });
 
+ipcMain.handle("account:credit-plans", async () => {
+  if (!commercialBuild || authMode !== "account" || !licenseClient || typeof licenseClient.getCreditPlans !== "function") {
+    return { success: false, message: "积分充值服务未启用" };
+  }
+  return licenseClient.getCreditPlans();
+});
+
 ipcMain.handle("account:recharge-url", async () => {
   if (!commercialBuild || authMode !== "account" || !licenseClient || typeof licenseClient.createWebHandoff !== "function") {
     return { success: true, continueUrl: "https://anyq.site/" };

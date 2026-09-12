@@ -488,6 +488,22 @@ class AccountClient {
     }
   }
 
+  async getCreditPlans() {
+    const state = this._readState();
+    if (!state || !state.cookie) return { success: false, message: "请先登录" };
+    try {
+      const { data } = await this._request("/api/pay/credit-plans", { cookie: state.cookie });
+      const plans = Array.isArray(data && data.plans) ? data.plans
+        .filter((plan) => plan && typeof plan.id === "string" && typeof plan.name === "string"
+          && Number.isInteger(plan.amountCents) && plan.amountCents > 0
+          && Number.isInteger(plan.credits) && plan.credits > 0)
+        .map((plan) => ({ id: plan.id, name: plan.name, amountCents: plan.amountCents, credits: plan.credits })) : [];
+      return { success: true, paymentsEnabled: Boolean(data && data.paymentsEnabled), plans };
+    } catch (error) {
+      return { success: false, message: error instanceof Error ? error.message : "积分档位加载失败" };
+    }
+  }
+
   // Used only by the main-process official AI bridge. The cookie never crosses
   // IPC and the renderer receives only the sanitized result from the bridge.
   async requestOfficialAi(pathname, options = {}) {

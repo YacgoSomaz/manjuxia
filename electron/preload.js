@@ -50,6 +50,7 @@ const electronAPI = {
     logout: () => ipcRenderer.invoke("account:logout"),
     createPayment: (planId) => ipcRenderer.invoke("account:create-payment", planId),
     paymentStatus: (orderNo) => ipcRenderer.invoke("account:payment-status", orderNo),
+    creditPlans: () => ipcRenderer.invoke("account:credit-plans"),
     rechargeUrl: () => ipcRenderer.invoke("account:recharge-url")
   },
   officialAi: {
