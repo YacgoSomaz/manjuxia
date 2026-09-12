@@ -273,6 +273,30 @@
         ensureAccountFooter();
       });
     }
+    // Web payment is completed in the user's browser, outside the Electron
+    // renderer. Refresh from the server when the user returns to the app so
+    // the displayed official-AI balance does not remain a stale local value.
+    if (account && typeof account.me === "function" && !window.__manjuxiaAccountFocusRefresh) {
+      let lastRefreshAt = 0;
+      let refreshing = false;
+      const refreshAfterReturn = async () => {
+        if (document.hidden || refreshing || Date.now() - lastRefreshAt < 5000) return;
+        refreshing = true;
+        lastRefreshAt = Date.now();
+        try {
+          await account.me();
+        } catch (_) {
+          // Keep the last verified balance during a temporary network failure.
+        } finally {
+          refreshing = false;
+        }
+      };
+      window.__manjuxiaAccountFocusRefresh = refreshAfterReturn;
+      window.addEventListener("focus", refreshAfterReturn);
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) void refreshAfterReturn();
+      });
+    }
   }
 
   function patchLegacyLogoutDialog() {
