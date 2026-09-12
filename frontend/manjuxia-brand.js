@@ -165,8 +165,10 @@
       .manjuxia-account-footer { margin: 8px 0 6px; padding: 9px 10px; border: 1px solid rgba(100,181,246,.28); border-radius: 8px; text-align: left; background: rgba(15,23,42,.42); color: #dcecff; }
       .manjuxia-account-footer__phone { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 700; }
       .manjuxia-account-footer__status { margin-top: 4px; color: #9fb7cc; font-size: 11px; line-height: 1.5; }
-      .manjuxia-account-footer__credits { margin-top: 8px; font-size: 11px; color: #b9d0e8; }
+      .manjuxia-account-footer__credits { display:flex; align-items:center; justify-content:space-between; gap:7px; margin-top: 8px; font-size: 11px; color: #b9d0e8; }
       .manjuxia-account-footer__credit { padding: 5px 7px; border: 1px solid rgba(148,163,184,.2); border-radius: 5px; text-align: left; }
+      .manjuxia-account-footer__recharge { flex:0 0 auto; padding:5px 8px; border:1px solid rgba(79,209,197,.7); border-radius:5px; background:rgba(45,212,191,.12); color:#73f3dd; font-size:11px; font-weight:700; cursor:pointer; }
+      .manjuxia-account-footer__recharge:hover { background:rgba(45,212,191,.22); }
       .manjuxia-account-footer__action { margin-top: 7px; padding: 0; border: 0; background: transparent; color: #4fd1c5; font-size: 11px; font-weight: 700; cursor: pointer; }
       .manjuxia-account-footer__login { width: 100%; height: 29px; margin-top: 9px; border: 1px solid #38bdf8; border-radius: 6px; background: #0ea5e9; color: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }
       .manjuxia-account-footer__logout { width: 100%; height: 29px; margin-top: 9px; border: 1px solid #ef4444; border-radius: 6px; background: transparent; color: #f87171; font-size: 12px; font-weight: 700; cursor: pointer; }
@@ -175,6 +177,7 @@
       body.manjuxia-light-theme .manjuxia-account-footer__status { color: #64748b; }
       body.manjuxia-light-theme .manjuxia-account-footer__credits { color: #475569; }
       body.manjuxia-light-theme .manjuxia-account-footer__credit { border-color: #cbd5e1; }
+      body.manjuxia-light-theme .manjuxia-account-footer__recharge { border-color:#0f766e; background:#ecfdf5; color:#0f766e; }
       body.manjuxia-light-theme .manjuxia-account-footer__action { color: #0f766e; }
       body.manjuxia-light-theme .manjuxia-account-footer__login { color: #fff; }
       body.manjuxia-light-theme .manjuxia-account-footer__logout { color: #dc2626; border-color: #dc2626; }
@@ -245,11 +248,14 @@
         <div class="manjuxia-account-footer__status">${!loggedIn ? "未登录 · 登录后使用账号功能" : active ? `漫剧虾会员 · 有效至 ${expires}` : "普通用户 · 开通后可使用生成、编辑与导出"}</div>
         <div class="manjuxia-account-footer__credits" aria-label="官方算力剩余积分">
           <span class="manjuxia-account-footer__credit">积分余额：${formatCreditBalance(credits)}</span>
+          ${loggedIn ? '<button type="button" class="manjuxia-account-footer__recharge">充值</button>' : ''}
         </div>
         ${!loggedIn ? '<button type="button" class="manjuxia-account-footer__login">登录</button>' : active ? "" : '<button type="button" class="manjuxia-account-footer__action">去官网开通</button>'}
         ${loggedIn ? '<button type="button" class="manjuxia-account-footer__logout">退出登录</button>' : ""}`;
       const action = accountFooter.querySelector(".manjuxia-account-footer__action");
       if (action) action.addEventListener("click", openRechargePage);
+      const recharge = accountFooter.querySelector(".manjuxia-account-footer__recharge");
+      if (recharge) recharge.addEventListener("click", openRechargePage);
       const login = accountFooter.querySelector(".manjuxia-account-footer__login");
       if (login) login.addEventListener("click", openAccountLogin);
     }).catch(() => {

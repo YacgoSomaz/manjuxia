@@ -94,6 +94,15 @@ const PAYMENT_PLANS = Object.freeze({
     entitlements: ['operation_course'], featureEntitlements: [],
   },
 });
+// Credit top-ups are intentionally separate from membership plans.  A paid
+// credit order must never create, extend, or otherwise alter a product
+// membership record.
+const CREDIT_TOPUP_PLANS = Object.freeze({
+  credit_1: { name: '测试充值 1 积分', amountCents: 10, energy: 1 },
+  credit_500: { name: '充值 500 积分', amountCents: 5000, energy: 500 },
+  credit_2000: { name: '充值 2000 积分', amountCents: 20000, energy: 2000 },
+  credit_10000: { name: '充值 10000 积分', amountCents: 100000, energy: 10000 },
+});
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new Database(DB_FILE);
@@ -138,6 +147,7 @@ db.exec(`
     amount_cents INTEGER NOT NULL,
     duration_days INTEGER NOT NULL,
     energy INTEGER NOT NULL,
+    order_kind TEXT NOT NULL DEFAULT 'membership',
     status TEXT NOT NULL DEFAULT 'PENDING',
     transaction_id TEXT,
     code_url TEXT,
@@ -234,6 +244,7 @@ function ensureRechargeOrderColumn(name, definition) {
 }
 
 ensureRechargeOrderColumn('entitlements_json', "TEXT NOT NULL DEFAULT '[]'");
+ensureRechargeOrderColumn('order_kind', "TEXT NOT NULL DEFAULT 'membership'");
 
 function enforceSessionTtl() {
   const sessions = db.prepare('SELECT token_hash, created_at, expires_at FROM sessions').all();
@@ -807,29 +818,43 @@ function settleRechargeOrder(orderNo, transactionId, paidAt) {
 
     const user = db.prepare('SELECT id FROM users WHERE id = ?').get(order.user_id);
     if (!user) throw new Error('充值用户不存在');
-    const existing = db.prepare('SELECT expires_at FROM user_products WHERE user_id = ? AND product_id = ?')
-      .get(order.user_id, order.plan_id);
-    const currentExpiry = Date.parse(existing?.expires_at || '');
-    const baseTime = Math.max(Date.now(), Number.isFinite(currentExpiry) ? currentExpiry : 0);
-    const expiresAt = new Date(baseTime + Number(order.duration_days) * 24 * 60 * 60 * 1000).toISOString();
     const timestamp = paidAt || nowIso();
-    const entitlements = parseEntitlementList(order.entitlements_json);
-
-    db.prepare(`
-      INSERT INTO user_products
-        (user_id, product_id, product_name, price_cents, duration_days, entitlements_json, expires_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(user_id, product_id) DO UPDATE SET
-        product_name = excluded.product_name,
-        price_cents = excluded.price_cents,
-        duration_days = excluded.duration_days,
-        entitlements_json = excluded.entitlements_json,
-        expires_at = excluded.expires_at,
-        updated_at = excluded.updated_at
-    `).run(order.user_id, order.plan_id, order.plan_name, order.amount_cents, order.duration_days,
-      JSON.stringify(entitlements), expiresAt, timestamp, timestamp);
-    db.prepare('UPDATE users SET energy_balance = COALESCE(energy_balance, 0) + ?, last_recharge_at = ? WHERE id = ?')
-      .run(Number(order.energy || 0), timestamp, order.user_id);
+    const isCreditTopup = order.order_kind === 'credit_topup';
+    if (isCreditTopup) {
+      const current = db.prepare('SELECT energy_balance FROM users WHERE id = ?').get(order.user_id);
+      const balanceAfter = Number(current?.energy_balance || 0) + Number(order.energy || 0);
+      db.prepare('UPDATE users SET energy_balance = ?, last_recharge_at = ? WHERE id = ?')
+        .run(balanceAfter, timestamp, order.user_id);
+      // This ledger row makes payment-side crediting auditable independently
+      // of later official-AI reservation and refund records.
+      db.prepare(`
+        INSERT INTO ai_credit_ledger
+          (user_id, delta, balance_after, reason, status, note, created_at)
+        VALUES (?, ?, ?, 'payment_topup', 'settled', ?, ?)
+      `).run(order.user_id, Number(order.energy || 0), balanceAfter, order.order_no, timestamp);
+    } else {
+      const existing = db.prepare('SELECT expires_at FROM user_products WHERE user_id = ? AND product_id = ?')
+        .get(order.user_id, order.plan_id);
+      const currentExpiry = Date.parse(existing?.expires_at || '');
+      const baseTime = Math.max(Date.now(), Number.isFinite(currentExpiry) ? currentExpiry : 0);
+      const expiresAt = new Date(baseTime + Number(order.duration_days) * 24 * 60 * 60 * 1000).toISOString();
+      const entitlements = parseEntitlementList(order.entitlements_json);
+      db.prepare(`
+        INSERT INTO user_products
+          (user_id, product_id, product_name, price_cents, duration_days, entitlements_json, expires_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, product_id) DO UPDATE SET
+          product_name = excluded.product_name,
+          price_cents = excluded.price_cents,
+          duration_days = excluded.duration_days,
+          entitlements_json = excluded.entitlements_json,
+          expires_at = excluded.expires_at,
+          updated_at = excluded.updated_at
+      `).run(order.user_id, order.plan_id, order.plan_name, order.amount_cents, order.duration_days,
+        JSON.stringify(entitlements), expiresAt, timestamp, timestamp);
+      db.prepare('UPDATE users SET energy_balance = COALESCE(energy_balance, 0) + ?, last_recharge_at = ? WHERE id = ?')
+        .run(Number(order.energy || 0), timestamp, order.user_id);
+    }
     db.prepare(`
       UPDATE recharge_orders
       SET status = 'SUCCESS', transaction_id = ?, paid_at = ?, notified_at = ?, last_error = NULL
@@ -863,7 +888,7 @@ function sendAccountPage(res, script) {
     'X-Frame-Options': 'DENY',
     'Content-Security-Policy': `default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; connect-src 'self'; img-src 'self' data:; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; form-action 'self'`,
   });
-  return res.type('html').send(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>温州获客 - 账户中心</title><style nonce="${nonce}">body{margin:0;background:#f5f7fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}.card{box-sizing:border-box;width:min(680px,calc(100% - 32px));margin:64px auto;background:#fff;border:1px solid #e6ebf3;border-radius:16px;padding:30px;box-shadow:0 20px 48px rgba(30,55,90,.10)}h1{margin:0 0 8px;font-size:24px}.muted{color:#6f7d91;line-height:1.7}.status{margin:22px 0;padding:15px;border-radius:10px;background:#f7f9fd}.row{display:flex;justify-content:space-between;gap:18px;padding:10px 0;border-bottom:1px solid #edf0f5}.row:last-child{border:0}.label{color:#718096}.value{font-weight:650;text-align:right;word-break:break-all}.notice{margin-top:20px;padding:13px 14px;border-radius:10px;background:#fff8e8;color:#8a6115;line-height:1.7}.error{color:#c23d3d}.hidden{display:none}</style></head><body><main class="card"><h1>账户中心</h1><p id="subtitle" class="muted">正在确认登录状态…</p><section id="account" class="status hidden"><div class="row"><span class="label">手机号</span><span id="phone" class="value"></span></div><div class="row"><span class="label">会员状态</span><span id="level" class="value"></span></div><div class="row"><span class="label">已开通软件</span><span id="products" class="value"></span></div><div class="row"><span class="label">软件到期时间</span><span id="expiry" class="value"></span></div><div class="row"><span class="label">已开通权益</span><span id="entitlements" class="value"></span></div></section><div id="notice" class="notice hidden"></div></main><script nonce="${nonce}">${script}</script></body></html>`);
+  return res.type('html').send(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>漫剧虾 - 账户中心</title><style nonce="${nonce}">body{margin:0;background:#f5f7fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}.card{box-sizing:border-box;width:min(680px,calc(100% - 32px));margin:64px auto;background:#fff;border:1px solid #e6ebf3;border-radius:16px;padding:30px;box-shadow:0 20px 48px rgba(30,55,90,.10)}h1{margin:0 0 8px;font-size:24px}.muted{color:#6f7d91;line-height:1.7}.status{margin:22px 0;padding:15px;border-radius:10px;background:#f7f9fd}.row{display:flex;justify-content:space-between;gap:18px;padding:10px 0;border-bottom:1px solid #edf0f5}.row:last-child{border:0}.label{color:#718096}.value{font-weight:650;text-align:right;word-break:break-all}.notice{margin-top:20px;padding:13px 14px;border-radius:10px;background:#fff8e8;color:#8a6115;line-height:1.7}.error{color:#c23d3d}.hidden{display:none}.topup{margin-top:24px;border-top:1px solid #edf0f4;padding-top:22px}.topup h2{margin:0 0 7px;font-size:18px}.topup p{margin:0 0 14px;color:#6f7d91;font-size:13px;line-height:1.6}.plans{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.plan{border:1px solid #d8e3f2;border-radius:11px;background:#fbfdff;padding:14px;text-align:left;cursor:pointer;color:#172033}.plan:hover,.plan:focus{border-color:#287df5;box-shadow:0 0 0 3px rgba(40,125,245,.12);outline:0}.plan strong{display:block;font-size:18px}.plan span{display:block;margin-top:5px;color:#52647d;font-size:13px}.plan em{display:block;margin-top:8px;color:#167a50;font-size:14px;font-style:normal;font-weight:700}.pay{margin-top:16px;padding:16px;border-radius:11px;background:#f7f9fd}.pay img{display:block;width:220px;height:220px;max-width:100%;margin:12px auto 4px}.pay button{display:block;margin:10px auto 0;border:0;border-radius:8px;background:#286cf5;color:#fff;padding:9px 14px;font:inherit;font-weight:700;cursor:pointer}@media(max-width:520px){.card{margin:24px auto;padding:22px}.plans{grid-template-columns:1fr}}</style></head><body><main class="card"><h1>漫剧虾账户中心</h1><p id="subtitle" class="muted">正在确认登录状态…</p><section id="account" class="status hidden"><div class="row"><span class="label">手机号</span><span id="phone" class="value"></span></div><div class="row"><span class="label">会员状态</span><span id="level" class="value"></span></div><div class="row"><span class="label">已开通软件</span><span id="products" class="value"></span></div><div class="row"><span class="label">软件到期时间</span><span id="expiry" class="value"></span></div><div class="row"><span class="label">已开通权益</span><span id="entitlements" class="value"></span></div></section><div id="notice" class="notice hidden"></div></main><script nonce="${nonce}">${script}</script></body></html>`);
 }
 
 function sendReleaseAdminPage(res) {
@@ -904,7 +929,7 @@ app.get('/account/continue', (req, res) => sendAccountPage(res, `
       const response = await fetch('/api/auth/web-handoff/consume', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ticket}), credentials:'same-origin'});
       const data = await response.json();
       if (!response.ok || !data.ok) throw new Error('handoff failed');
-      location.replace('/account/recharge');
+      location.replace('/account/topup');
     } catch {
       subtitle.textContent = '登录交接已失效或已使用，请返回客户端重新进入账户中心。';
       subtitle.className = 'muted error';
@@ -941,11 +966,107 @@ app.get('/account/recharge', (req, res) => sendAccountPage(res, `
   })();
 `));
 
+app.get('/account/topup', (req, res) => sendAccountPage(res, `
+  (async () => {
+    const subtitle = document.getElementById('subtitle');
+    const account = document.getElementById('account');
+    const notice = document.getElementById('notice');
+    const set = (id, value) => { document.getElementById(id).textContent = value || '—'; };
+    const request = async (url, options) => {
+      const response = await fetch(url, Object.assign({ credentials: 'same-origin' }, options || {}));
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.ok) throw new Error(data.error || '请求失败');
+      return data;
+    };
+    const money = (cents) => '¥' + (Number(cents || 0) / 100).toFixed(2);
+    let paymentTimer = null;
+    const stopPolling = () => { if (paymentTimer) { clearInterval(paymentTimer); paymentTimer = null; } };
+    const showPayment = (payment, credits) => {
+      const old = document.getElementById('wechat-payment');
+      if (old) old.remove();
+      const panel = document.createElement('section');
+      panel.id = 'wechat-payment'; panel.className = 'pay';
+      const title = document.createElement('strong');
+      title.textContent = '请使用微信扫描二维码支付 ' + money(payment.amountCents);
+      const image = document.createElement('img'); image.src = payment.qrDataUrl; image.alt = '微信支付二维码';
+      const status = document.createElement('p'); status.textContent = '等待支付确认…';
+      const cancel = document.createElement('button'); cancel.type = 'button'; cancel.textContent = '关闭支付二维码';
+      cancel.onclick = () => { stopPolling(); panel.remove(); };
+      panel.append(title, image, status, cancel);
+      document.querySelector('.topup').append(panel);
+      stopPolling();
+      paymentTimer = setInterval(async () => {
+        try {
+          const result = await request('/api/pay/wechat/status/' + encodeURIComponent(payment.orderNo));
+          if (result.order && result.order.status === 'SUCCESS') {
+            stopPolling();
+            status.textContent = '支付成功，' + credits + ' 积分已到账。';
+            notice.textContent = '充值成功：' + credits + ' 积分已到账。返回客户端后积分会自动刷新。';
+            notice.classList.remove('hidden');
+          }
+        } catch (_) {}
+      }, 2000);
+    };
+    try {
+      const me = await request('/api/auth/me');
+      const user = me.user || {};
+      const membership = me.membership || {};
+      const products = Array.isArray(me.products) ? me.products.filter((item) => item && item.status === 'active') : [];
+      subtitle.textContent = '已安全登录。支付完成后积分将直接记入当前手机号账户。';
+      set('phone', user.phone);
+      set('level', membership.status === 'active' ? '已开通 ' + products.length + ' 款软件' : '普通用户');
+      set('products', products.length ? products.map((item) => item.name).join('、') : '暂未开通');
+      set('expiry', products.length ? products.map((item) => item.name + '：' + new Date(item.expires_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })).join('；') : '—');
+      set('entitlements', '当前积分：' + String(user.energy_balance == null ? 0 : user.energy_balance));
+      account.classList.remove('hidden');
+      const topup = document.createElement('section'); topup.className = 'topup';
+      const heading = document.createElement('h2'); heading.textContent = '充值算力积分';
+      const hint = document.createElement('p'); hint.textContent = '固定兑换比例：¥0.10 = 1 积分。支付成功后由服务端验签并入账。';
+      const plans = document.createElement('div'); plans.className = 'plans';
+      topup.append(heading, hint, plans); document.querySelector('main.card').append(topup);
+      const catalog = await request('/api/pay/credit-plans');
+      if (!catalog.paymentsEnabled) {
+        hint.textContent = '充值服务暂未开启，请稍后再试。';
+        return;
+      }
+      (catalog.plans || []).forEach((plan) => {
+        const button = document.createElement('button'); button.type = 'button'; button.className = 'plan';
+        button.innerHTML = '<strong>' + String(plan.credits) + ' 积分</strong><span>' + String(plan.name) + '</span><em>' + money(plan.amountCents) + '</em>';
+        button.onclick = async () => {
+          button.disabled = true;
+          try {
+            const payment = await request('/api/pay/wechat/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ planId: plan.id }) });
+            showPayment(payment, plan.credits);
+          } catch (error) {
+            notice.textContent = error.message || '创建支付订单失败，请稍后重试。';
+            notice.classList.remove('hidden');
+          } finally { button.disabled = false; }
+        };
+        plans.append(button);
+      });
+    } catch (_) {
+      subtitle.textContent = '当前网页未登录。请返回客户端后重新点击“充值”。';
+      subtitle.className = 'muted error';
+    }
+  })();
+`));
+
 app.get('/api/pay/plans', (req, res) => {
   const paymentsEnabled = parseBoolean(process.env.PAYMENTS_ENABLED, false);
   const plans = paymentsEnabled ? Object.entries(PAYMENT_PLANS).map(([id, plan]) => ({
     id, name: plan.name, amountCents: plan.amountCents, durationDays: plan.durationDays, entitlements: plan.entitlements,
   })) : [];
+  return res.json({ ok: true, paymentsEnabled, plans });
+});
+
+app.get('/api/pay/credit-plans', requireUser, (req, res) => {
+  const paymentsEnabled = parseBoolean(process.env.PAYMENTS_ENABLED, false);
+  const plans = Object.entries(CREDIT_TOPUP_PLANS).map(([id, plan]) => ({
+    id,
+    name: plan.name,
+    amountCents: plan.amountCents,
+    credits: plan.energy,
+  }));
   return res.json({ ok: true, paymentsEnabled, plans });
 });
 
@@ -1954,12 +2075,16 @@ app.post('/api/pay/wechat/create', requireUser, async (req, res) => {
     return jsonResponse(res, 503, { ok: false, error: '充值套餐尚未上线' });
   }
   const planId = String(req.body?.planId || '').trim();
-  const plan = PAYMENT_PLANS[planId];
+  const creditPlan = CREDIT_TOPUP_PLANS[planId];
+  const membershipPlan = PAYMENT_PLANS[planId];
+  const plan = creditPlan || membershipPlan;
   if (!plan) return jsonResponse(res, 400, { ok: false, error: '充值方案不存在' });
-  const orderPricing = resolveOrderAmountCents({
-    phone: req.user.phone,
-    normalAmountCents: plan.amountCents,
-  });
+  const orderKind = creditPlan ? 'credit_topup' : 'membership';
+  // Credit denominations are fixed at ¥0.10 per point. Membership plans keep
+  // their existing pricing policy (for example, any approved campaign price).
+  const orderPricing = creditPlan
+    ? { amountCents: creditPlan.amountCents }
+    : resolveOrderAmountCents({ phone: req.user.phone, normalAmountCents: plan.amountCents });
 
   let config;
   try {
@@ -1976,10 +2101,10 @@ app.post('/api/pay/wechat/create', requireUser, async (req, res) => {
   const createdAt = nowIso();
   db.prepare(`
     INSERT INTO recharge_orders
-      (order_no, user_id, plan_id, plan_name, amount_cents, duration_days, energy, entitlements_json, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
-  `).run(orderNo, req.user.id, planId, plan.name, orderPricing.amountCents, plan.durationDays, plan.energy,
-    JSON.stringify(plan.entitlements), createdAt);
+      (order_no, user_id, plan_id, plan_name, amount_cents, duration_days, energy, entitlements_json, order_kind, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
+  `).run(orderNo, req.user.id, planId, plan.name, orderPricing.amountCents,
+    creditPlan ? 0 : plan.durationDays, plan.energy, JSON.stringify(creditPlan ? [] : plan.entitlements), orderKind, createdAt);
 
   try {
     const result = await createNativeOrder(config, {
