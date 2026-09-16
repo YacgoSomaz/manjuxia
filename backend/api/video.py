@@ -2482,7 +2482,11 @@ def _newapi_upload_asset(value: str, kind: str) -> Dict[str, str]:
     source = str(value or "").strip()
     if source.startswith(("http://", "https://")):
         return {"url": source, "kind": kind}
-    path = resolve_db_path(source) if source.startswith("/data/") else os.path.abspath(source)
+    # DB 中同时存在两种历史格式：/data/images/... 与 data/images/....
+    # 后一种若交给 abspath() 会被解析到后端的当前工作目录；安装/升级后
+    # 工作目录可变，导致 UI 能预览本机媒体但 NewAPI 上传阶段误报“找不到素材”。
+    # 两种 data 路径都必须从用户数据/媒体目录解析，而不是从安装目录解析。
+    path = resolve_db_path(source) if source.startswith(("/data/", "data/")) else os.path.abspath(source)
     if not os.path.isfile(path):
         return {"error": f"找不到{kind}素材文件: {source}", "kind": kind}
     mime_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
