@@ -860,6 +860,87 @@
     }
   }
 
+  const MINIMAX_H3_RESOLUTION_KEY = "manjuxia_minimax_h3_resolution";
+  const MINIMAX_H3_RESOLUTIONS = ["768P", "2K"];
+
+  function getMiniMaxH3Resolution() {
+    try {
+      const saved = String(localStorage.getItem(MINIMAX_H3_RESOLUTION_KEY) || "").toUpperCase();
+      return MINIMAX_H3_RESOLUTIONS.includes(saved) ? saved : "2K";
+    } catch (_) {
+      return "2K";
+    }
+  }
+
+  function installMiniMaxH3ResolutionStyle() {
+    if (document.getElementById("manjuxia-minimax-h3-resolution-style")) return;
+    const style = document.createElement("style");
+    style.id = "manjuxia-minimax-h3-resolution-style";
+    style.textContent = `
+      .manjuxia-minimax-h3-resolution { width:100px; height:32px; padding:0 9px; border:1px solid #3c6ca7; border-radius:5px; background:#15244c; color:#e7f4ff; font-size:14px; outline:none; cursor:pointer; }
+      .manjuxia-minimax-h3-resolution:focus { border-color:#4fc3f7; box-shadow:0 0 0 2px rgba(79,195,247,.16); }
+      .manjuxia-minimax-h3-resolution__legacy { display:none !important; }
+      body.manjuxia-light-theme .manjuxia-minimax-h3-resolution { border-color:#b9cce2; background:#fff; color:#1f3553; }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function installMiniMaxH3ResolutionControl() {
+    installMiniMaxH3ResolutionStyle();
+    const group = Array.from(document.querySelectorAll("div")).find((node) => {
+      const text = String(node.textContent || "").replace(/\s+/g, "");
+      return text.includes("MiniMax-H3") && text.includes("多模态参考") && node.querySelectorAll(".el-select").length >= 3;
+    });
+    if (!group || group.dataset.manjuxiaMiniMaxResolutionReady === "true") return;
+
+    const selects = group.querySelectorAll(".el-select");
+    const legacyResolution = selects[2];
+    if (!legacyResolution) return;
+
+    const control = document.createElement("select");
+    control.className = "manjuxia-minimax-h3-resolution";
+    control.setAttribute("aria-label", "MiniMax H3 分辨率");
+    for (const resolution of MINIMAX_H3_RESOLUTIONS) {
+      const option = document.createElement("option");
+      option.value = resolution;
+      option.textContent = resolution;
+      control.appendChild(option);
+    }
+    control.value = getMiniMaxH3Resolution();
+    control.addEventListener("change", () => {
+      const resolution = MINIMAX_H3_RESOLUTIONS.includes(control.value) ? control.value : "2K";
+      try { localStorage.setItem(MINIMAX_H3_RESOLUTION_KEY, resolution); } catch (_) {}
+    });
+
+    legacyResolution.classList.add("manjuxia-minimax-h3-resolution__legacy");
+    legacyResolution.parentNode.insertBefore(control, legacyResolution);
+    group.dataset.manjuxiaMiniMaxResolutionReady = "true";
+  }
+
+  function installMiniMaxH3ResolutionFetchAdapter() {
+    const currentFetch = window.fetch;
+    if (!currentFetch || currentFetch.__manjuxiaMiniMaxH3ResolutionAdapter) return;
+    const previousFetch = currentFetch.bind(window);
+    const wrappedFetch = async function manjuxiaMiniMaxH3ResolutionFetch(input, init) {
+      const url = typeof input === "string" ? input : (input && input.url) || "";
+      if (!/\/api\/video\/minimax\/submit(?:\?|$)/.test(url) || !init || typeof init.body !== "string") {
+        return previousFetch(input, init);
+      }
+      try {
+        const payload = JSON.parse(init.body);
+        if (payload && typeof payload === "object") {
+          payload.params = { ...(payload.params || {}), resolution: getMiniMaxH3Resolution() };
+          return previousFetch(input, { ...init, body: JSON.stringify(payload) });
+        }
+      } catch (_) {
+        // Keep the original request untouched if a future client changes its body format.
+      }
+      return previousFetch(input, init);
+    };
+    wrappedFetch.__manjuxiaMiniMaxH3ResolutionAdapter = true;
+    window.fetch = wrappedFetch;
+  }
+
   function run() {
     patchBrandMeta();
     patchTextNodes(document.body);
@@ -868,6 +949,8 @@
     void syncFooterVersion();
     ensureAccountFooter();
     installAccountLogoutGuard();
+    installMiniMaxH3ResolutionControl();
+    installMiniMaxH3ResolutionFetchAdapter();
     // The bundled app signs requests with the session secret it read during
     // its initial boot.  The backend rotates that secret on every restart;
     // install the repair layer after the bundle has initialized so a stale
@@ -1217,6 +1300,13 @@
       });
     };
     run();
+    // index.html installs multipart, local-model and official-compute fetch
+    // wrappers asynchronously. Re-apply after those layers settle so the
+    // selected 768P/2K value is rewritten before request signing.
+    [300, 1200, 3000].forEach((delay) => window.setTimeout(() => {
+      installMiniMaxH3ResolutionControl();
+      installMiniMaxH3ResolutionFetchAdapter();
+    }, delay));
     const observer = new MutationObserver(schedule);
     observer.observe(document.body, { childList: true, subtree: true });
   });

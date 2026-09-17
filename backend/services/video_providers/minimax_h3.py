@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://api.minimaxi.com"
 MODEL_NAME = "MiniMax-H3"
-RESOLUTION = "2K"
+DEFAULT_RESOLUTION = "2K"
+ALLOWED_RESOLUTIONS = {"768P", "2K"}
 ALLOWED_RATIOS = {"adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 ALLOWED_AUDIO_EXTENSIONS = {".wav", ".mp3"}
@@ -355,9 +356,13 @@ class MiniMaxH3Provider(VideoProviderBase):
         if duration < 4 or duration > 15:
             return SubmitResult(False, fail_reason=f"MiniMax H3 生成时长仅支持 4-15 秒，当前 {duration} 秒", error_code="INVALID_PARAM")
 
-        resolution = str(params.get("resolution") or RESOLUTION).upper()
-        if resolution != RESOLUTION.upper():
-            return SubmitResult(False, fail_reason=f"MiniMax H3 当前仅支持 2K，不能使用 {resolution}", error_code="INVALID_PARAM")
+        resolution = str(params.get("resolution") or DEFAULT_RESOLUTION).upper()
+        if resolution not in ALLOWED_RESOLUTIONS:
+            return SubmitResult(
+                False,
+                fail_reason=f"MiniMax H3 不支持 {resolution}，可选: 768P、2K",
+                error_code="INVALID_PARAM",
+            )
 
         ratio = str(params.get("ratio") or "9:16").strip()
         if ratio not in ALLOWED_RATIOS:
@@ -433,7 +438,7 @@ class MiniMaxH3Provider(VideoProviderBase):
         payload: Dict[str, Any] = {
             "model": MODEL_NAME,
             "content": content,
-            "resolution": RESOLUTION,
+            "resolution": resolution,
             "duration": duration,
             "ratio": ratio,
             "aigc_watermark": bool(params.get("aigc_watermark", False)),
@@ -442,7 +447,7 @@ class MiniMaxH3Provider(VideoProviderBase):
         sanitized_payload = {
             "provider": self.provider_type,
             "model": MODEL_NAME,
-            "resolution": RESOLUTION,
+            "resolution": resolution,
             "duration": duration,
             "ratio": ratio,
             "aigc_watermark": payload["aigc_watermark"],
@@ -470,7 +475,8 @@ class MiniMaxH3Provider(VideoProviderBase):
             )
 
         logger.info(
-            "[minimax_h3] submit duration=%ss ratio=%s images=%s videos=%s audios=%s request=%.2fMB",
+            "[minimax_h3] submit resolution=%s duration=%ss ratio=%s images=%s videos=%s audios=%s request=%.2fMB",
+            resolution,
             duration,
             ratio,
             len(image_urls),
