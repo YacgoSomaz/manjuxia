@@ -10,8 +10,8 @@ module.exports = async function afterPack(context) {
   const icon = path.resolve(__dirname, "..", "build", "icon.ico");
   await rcedit(executable, {
     icon,
-    "file-version": "0.1.40",
-    "product-version": "0.1.40",
+    "file-version": "0.1.41",
+    "product-version": "0.1.41",
     "version-string": {
       ProductName: "漫剧虾",
       FileDescription: "漫剧虾 AI 漫剧创作平台",
