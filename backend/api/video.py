@@ -2561,6 +2561,11 @@ class MiniMaxConfigSaveRequest(BaseModel):
     api_key: str = ""
 
 
+def _normalize_minimax_resolution(value: Any) -> str:
+    """Preserve the UI choice while supplying H3's historical 2K default."""
+    return str(value or "2K").upper()
+
+
 @router.get("/pippit/config")
 async def get_pippit_config():
     env_key = _env_pippit_access_key()
@@ -3142,7 +3147,10 @@ async def minimax_submit(request: MiniMaxSubmitRequest):
 
         final_params = dict(request.params or {})
         final_params["model"] = "MiniMax-H3"
-        final_params["resolution"] = "2K"
+        # Keep the renderer's selected H3 resolution. The provider performs
+        # the authoritative allow-list validation (768P / 2K) before calling
+        # MiniMax; do not silently force every submission back to 2K here.
+        final_params["resolution"] = _normalize_minimax_resolution(final_params.get("resolution"))
         if declared_duration is not None:
             import math
             final_params["duration"] = int(math.ceil(declared_duration))

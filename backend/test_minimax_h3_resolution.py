@@ -2,9 +2,14 @@ import unittest
 from unittest.mock import AsyncMock
 
 from services.video_providers.minimax_h3 import MiniMaxH3Provider
+from api.video import _normalize_minimax_resolution
 
 
 class MiniMaxH3ResolutionTests(unittest.IsolatedAsyncioTestCase):
+    def test_submit_route_preserves_768p_before_provider_validation(self):
+        self.assertEqual(_normalize_minimax_resolution("768p"), "768P")
+        self.assertEqual(_normalize_minimax_resolution(None), "2K")
+
     async def test_submit_passes_selected_768p_to_minimax(self):
         provider = MiniMaxH3Provider({"api_key": "test-key"})
         provider._post = AsyncMock(return_value={"status_code": 200, "body": {"task_id": "task-768p"}})

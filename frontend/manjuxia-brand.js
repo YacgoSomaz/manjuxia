@@ -887,15 +887,12 @@
 
   function installMiniMaxH3ResolutionControl() {
     installMiniMaxH3ResolutionStyle();
-    const group = Array.from(document.querySelectorAll("div")).find((node) => {
-      const text = String(node.textContent || "").replace(/\s+/g, "");
-      return text.includes("MiniMax-H3") && text.includes("多模态参考") && node.querySelectorAll(".el-select").length >= 3;
-    });
-    if (!group || group.dataset.manjuxiaMiniMaxResolutionReady === "true") return;
-
-    const selects = group.querySelectorAll(".el-select");
-    const legacyResolution = selects[2];
-    if (!legacyResolution) return;
+    // The compiled VideoView may change its internal container class between
+    // builds. Match the disabled H3 selector by its actual rendered value so
+    // the adapter does not depend on a minified class name or tab hierarchy.
+    const legacyResolution = Array.from(document.querySelectorAll(".el-select"))
+      .find((node) => String(node.textContent || "").replace(/\s+/g, "") === "2K");
+    if (!legacyResolution || legacyResolution.dataset.manjuxiaMiniMaxResolutionReady === "true") return;
 
     const control = document.createElement("select");
     control.className = "manjuxia-minimax-h3-resolution";
@@ -914,7 +911,7 @@
 
     legacyResolution.classList.add("manjuxia-minimax-h3-resolution__legacy");
     legacyResolution.parentNode.insertBefore(control, legacyResolution);
-    group.dataset.manjuxiaMiniMaxResolutionReady = "true";
+    legacyResolution.dataset.manjuxiaMiniMaxResolutionReady = "true";
   }
 
   function installMiniMaxH3ResolutionFetchAdapter() {
