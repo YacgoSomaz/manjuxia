@@ -780,6 +780,9 @@ async def add_custom_audio_voice(
 
         with open(file_path, "wb") as f:
             f.write(content)
+        file_path, converted_from_m4a = await _normalize_uploaded_m4a_audio(file_path, ext)
+        if converted_from_m4a:
+            rel_name = f"{os.path.splitext(rel_name)[0]}.mp3"
 
         try:
             dur = _probe_audio_duration_seconds(file_path)
@@ -807,6 +810,7 @@ async def add_custom_audio_voice(
             "success": True,
             "voice": voice,
             "voices": await voice_service.list_voices(element_id=element_id),
+            "converted_from_m4a": converted_from_m4a,
         }
     except HTTPException:
         raise
@@ -2688,6 +2692,18 @@ def _ensure_audios_dir() -> str:
     os.makedirs(audios_dir, exist_ok=True)
     return audios_dir
 
+
+async def _normalize_uploaded_m4a_audio(file_path: str, extension: str) -> tuple[str, bool]:
+    """Convert an uploaded M4A reference to MP3 while retaining the M4A source."""
+    if extension.lower() != ".m4a":
+        return file_path, False
+    from services.audio_conversion import AudioTranscodeError, transcode_m4a_to_mp3
+
+    try:
+        return await asyncio.to_thread(transcode_m4a_to_mp3, file_path), True
+    except AudioTranscodeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 @router.post("/element/{element_id}/upload-audio")
 async def upload_audio(element_id: int, file: UploadFile = File(...)):
     """上传音频文件（仅人物类型）"""
@@ -2729,9 +2745,13 @@ async def upload_audio(element_id: int, file: UploadFile = File(...)):
         file_path = os.path.join(images_dir, rel_name.replace("/", os.sep))
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
-        # 保存文件
+        # 保存文件。M4A 会保留原文件，同时生成同名 MP3 作为视频参考素材。
         with open(file_path, 'wb') as f:
             f.write(content)
+        raw_file_path = file_path
+        file_path, converted_from_m4a = await _normalize_uploaded_m4a_audio(file_path, ext)
+        if converted_from_m4a:
+            rel_name = f"{os.path.splitext(rel_name)[0]}.mp3"
 
         # 上传时按最宽的 2.5 容差探测；生成前再按所选 2.0/2.5 模型复核。
         try:
@@ -2758,7 +2778,8 @@ async def upload_audio(element_id: int, file: UploadFile = File(...)):
         old_audio_file = element.get("audio_file")
         if old_audio_file:
             old_path = resolve_db_path(old_audio_file)  # v3.61.202:统一用 resolve_db_path,支持子目录+自定义媒体目录
-            if old_path and os.path.exists(old_path) and os.path.abspath(old_path) != os.path.abspath(file_path):
+            protected_paths = {os.path.abspath(raw_file_path), os.path.abspath(file_path)}
+            if old_path and os.path.exists(old_path) and os.path.abspath(old_path) not in protected_paths:
                 os.remove(old_path)
         
         # 更新数据库
@@ -2770,8 +2791,9 @@ async def upload_audio(element_id: int, file: UploadFile = File(...)):
         
         return {
             "success": True,
-            "message": "音频上传成功",
+            "message": "音频上传成功" + ("（已自动转换为 MP3）" if converted_from_m4a else ""),
             "audio_file": audio_file_path,
+            "converted_from_m4a": converted_from_m4a,
             "updated_at": (updated or {}).get("updated_at"),
         }
         
@@ -3730,6 +3752,10 @@ async def upload_variant_audio(variant_id: int, file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"文件大小超过限制,最大 {MAX_AUDIO_FILE_SIZE // (1024*1024)}MB")
     with open(dest, 'wb') as _f:
         _f.write(content)
+    raw_dest = dest
+    dest, converted_from_m4a = await _normalize_uploaded_m4a_audio(dest, ext)
+    if converted_from_m4a:
+        rel_name = f"{os.path.splitext(rel_name)[0]}.mp3"
     rel = f"/data/images/{rel_name}"
     # v3.61.158 codex P2: 同款即梦时长校验 — 跟本体音频上传一致
     abs_path = resolve_db_path(rel)
@@ -3755,11 +3781,12 @@ async def upload_variant_audio(variant_id: int, file: UploadFile = File(...)):
     old_audio = v.get("audio_file")
     if old_audio:
         old_path = resolve_db_path(old_audio)
-        if old_path and os.path.exists(old_path) and os.path.abspath(old_path) != os.path.abspath(dest):
+        protected_paths = {os.path.abspath(raw_dest), os.path.abspath(dest)}
+        if old_path and os.path.exists(old_path) and os.path.abspath(old_path) not in protected_paths:
             try: os.remove(old_path)
             except Exception: pass
     updated = await ExtractionService.update_variant(variant_id, audio_file=rel)
-    return {"success": True, "audio_file": rel, "updated_at": (updated or {}).get("updated_at")}
+    return {"success": True, "audio_file": rel, "converted_from_m4a": converted_from_m4a, "updated_at": (updated or {}).get("updated_at")}
 
 
 @router.delete("/variant/{variant_id}/audio")

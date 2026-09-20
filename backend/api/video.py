@@ -3246,6 +3246,22 @@ async def minimax_submit(request: MiniMaxSubmitRequest):
         return {"success": False, "message": f"MiniMax H3 提交异常: {e}"}
 
 
+async def _normalize_video_reference_audios(audio_paths: List[str], *, log_prefix: str) -> List[str]:
+    """Normalize old and newly-uploaded local M4A references before provider handoff."""
+    from services.audio_conversion import AudioTranscodeError, normalize_video_reference_audio
+
+    normalized: List[str] = []
+    for source in audio_paths:
+        try:
+            converted = await asyncio.to_thread(normalize_video_reference_audio, source)
+        except AudioTranscodeError as exc:
+            raise ValueError(f"参考音频转换失败：{exc}") from exc
+        if converted != source:
+            logger.info("[%s] 已将视频参考音频转为 MP3: %s -> %s", log_prefix, source, converted)
+        normalized.append(converted)
+    return normalized
+
+
 async def _collect_storyboard_assets_for_ark(
     sb_id: int,
     use_chain_frame: bool = False,
@@ -3602,6 +3618,7 @@ async def _collect_storyboard_assets_for_ark(
     ):
         audios.append(_audio_path)
         audio_labels.append(_audio_label)
+    audios = await _normalize_video_reference_audios(audios, log_prefix="ark/collect")
 
     # Cloud/全局队列/Pippit 都会在 provider 层截到 9 张。必须在这里先按
     # 统一优先级同步裁 images + labels，不能让 provider 简单取前 9 张造成
@@ -4720,6 +4737,10 @@ async def _process_video_generation(
         # 构建文件路径列表和引用描述
         images = [item[0] for item in image_items]
         audios = [item[0] for item in audio_items]
+        audios = await _normalize_video_reference_audios(
+            audios,
+            log_prefix=f"video-gen/{storyboard_id}",
+        )
 
         logger.info(
             f"[video-gen] 分镜 {storyboard_id} 最终上传: 图片 {len(images)} 张, "
