@@ -16,12 +16,12 @@
     "!node_modules/**/*"
   ],
   "extraResources": [
-    { "from": "packaging/release/漫剧虾-0.1.41/resources/frontend", "to": "frontend" },
-    { "from": "packaging/release/漫剧虾-0.1.41/resources/backend", "to": "backend" },
-    { "from": "packaging/release/漫剧虾-0.1.41/resources/public", "to": "public" },
-    { "from": "packaging/release/漫剧虾-0.1.41/resources/build", "to": "build" },
-    { "from": "packaging/release/漫剧虾-0.1.41/resources/python", "to": "python" },
-    { "from": "packaging/release/漫剧虾-0.1.41/resources/release_config.json", "to": "release_config.json" }
+    { "from": "packaging/release/漫剧虾-0.1.42/resources/frontend", "to": "frontend" },
+    { "from": "packaging/release/漫剧虾-0.1.42/resources/backend", "to": "backend" },
+    { "from": "packaging/release/漫剧虾-0.1.42/resources/public", "to": "public" },
+    { "from": "packaging/release/漫剧虾-0.1.42/resources/build", "to": "build" },
+    { "from": "packaging/release/漫剧虾-0.1.42/resources/python", "to": "python" },
+    { "from": "packaging/release/漫剧虾-0.1.42/resources/release_config.json", "to": "release_config.json" }
   ],
   "win": {
     "target": [{ "target": "nsis", "arch": ["x64"] }],

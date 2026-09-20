@@ -3,7 +3,7 @@ import { dirname, join, resolve, relative, sep } from "node:path";
 
 const root = resolve(import.meta.dirname, "..");
 const packaging = join(root, "packaging");
-const packageVersion = "0.1.41";
+const packageVersion = "0.1.42";
 const staging = join(packaging, "release", `漫剧虾-${packageVersion}`);
 const resources = join(staging, "resources");
 const appSource = join(packaging, ".app-source");
