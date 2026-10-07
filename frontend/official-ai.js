@@ -276,6 +276,22 @@
     };
   }
 
+  function officialVideoFailure(job, jobId) {
+    const code = String(job && (job.failure_code || job.error_code || job.code) || "").trim();
+    const messages = {
+      AI_UPSTREAM_TIMEOUT: "官方视频生成超时，积分已自动退回。请稍后重新生成。",
+      AI_UPSTREAM_RATE_LIMITED: "官方视频服务当前繁忙，积分已自动退回。请稍后重试。",
+      AI_UPSTREAM_AUTH_FAILED: "官方视频服务认证异常，积分已自动退回。请联系管理员。",
+      AI_UPSTREAM_BAD_REQUEST: "官方视频请求未被模型接受，积分已自动退回。请检查分镜和参考素材。",
+      AI_VIDEO_RESULT_INVALID: "上游显示生成完成，但没有返回可用的视频地址；积分已自动退回。",
+      AI_UPSTREAM_FAILED: "官方视频上游任务失败，积分已自动退回。请稍后重试。",
+      AI_JOB_INTERRUPTED: "官方视频任务中断，积分已自动退回。请重新生成。",
+    };
+    const message = messages[code] || "官方视频生成失败，积分已自动退回。请联系管理员排查。";
+    const reference = jobId ? `任务编号：${jobId}` : "";
+    return [message, code ? `错误码：${code}` : "", reference].filter(Boolean).join(" ");
+  }
+
   function getResultText(job) {
     if (!job || typeof job !== "object") return "";
     const candidates = [job.result_text, job.output_text, job.content, job.text, job.result && job.result.text, job.result && job.result.content];
@@ -1251,14 +1267,18 @@
       const response = await bridge.getVideoJob(jobId);
       const job = response && (response.job || response.data || response);
       const state = String(job && (job.status || job.state) || "").toLowerCase();
-      if (!response || response.ok === false || ["failed", "error", "cancelled", "canceled"].includes(state)) {
+      if (!response || response.ok === false) {
+        // Keep the paid task id during a temporary polling failure.
+        console.warn("[official-video] 查询任务暂时失败", { jobId, code: response && response.code || "poll_unavailable" });
+        mapped.push({ id: storyboardId, video_status: "generating", video_url: null });
+      } else if (["failed", "error", "cancelled", "canceled"].includes(state)) {
         try { localStorage.removeItem(`manjuxia-official-video:${storyboardId}`); } catch (_) {}
-        mapped.push({ id: storyboardId, video_status: "failed", video_url: null, fail_reason: job && job.failure_code || response && response.message || "官方视频任务失败" });
+        mapped.push({ id: storyboardId, video_status: "failed", video_url: null, fail_reason: officialVideoFailure(job, jobId) });
       } else if (["succeeded", "success", "completed", "complete"].includes(state)) {
         const url = String(job && (job.result_text || job.video_url || job.output_url) || "");
         const localUrl = url ? await persistOfficialVideoLocally(storyboardId, url) : "";
         if (localUrl) try { localStorage.removeItem(`manjuxia-official-video:${storyboardId}`); } catch (_) {}
-        mapped.push(localUrl ? { id: storyboardId, video_status: "done", video_url: localUrl } : { id: storyboardId, video_status: "failed", video_url: null, fail_reason: "官方视频未返回播放地址" });
+        mapped.push(localUrl ? { id: storyboardId, video_status: "done", video_url: localUrl } : { id: storyboardId, video_status: "failed", video_url: null, fail_reason: url ? `官方视频已生成，但客户端下载失败。请稍后重试；任务编号：${jobId}` : `官方视频已完成，但上游没有返回播放地址。任务编号：${jobId}` });
       } else {
         mapped.push({ id: storyboardId, video_status: "generating", video_url: null });
       }

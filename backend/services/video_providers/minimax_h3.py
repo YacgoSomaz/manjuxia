@@ -289,19 +289,24 @@ class MiniMaxH3Provider(VideoProviderBase):
     @classmethod
     def _translate_http_error(cls, status_code: int, body: Any) -> Tuple[str, str]:
         message, upstream_type = cls._extract_error(body)
+        detail = f"{upstream_type} {message}".lower()
+        if re.search(r"(?<!\d)2013(?!\d)", detail) and ("tokenplan" in detail or "minimax-h3" in detail):
+            return "当前 MiniMax 账户套餐不支持 H3 模型，请联系管理员开通该模型或切换视频模型（错误码 2013）。", "MODEL_NOT_ENTITLED"
+        if re.search(r"(?<!\d)1026(?!\d)", detail) and ("sensitive" in detail or "审核" in detail):
+            return "视频未通过上游内容审核（错误码 1026）。请检查分镜描述、动作和人物台词后重试。", "CONTENT_REJECTED"
         if status_code == 400:
-            return f"MiniMax H3 参数错误: {message}", "INVALID_PARAM"
+            return "MiniMax H3 不接受本次请求参数，请检查模型、时长、画质和参考素材；详情见本地日志。", "INVALID_PARAM"
         if status_code == 401:
             return "MiniMax API Key 无效或已失效，请重新保存 Key", "AUTH"
         if status_code == 402:
             return "MiniMax 账户余额或额度不足，请充值后重试", "BALANCE"
         if status_code == 422:
-            return f"MiniMax H3 内容审核未通过: {message}", "REVIEW"
+            return "MiniMax H3 未通过内容审核，请调整分镜文字或参考素材后重试。", "REVIEW"
         if status_code == 429:
-            return f"MiniMax H3 请求过于频繁: {message}", "RATE_LIMIT"
+            return "MiniMax H3 请求过于频繁，请稍后重试。", "RATE_LIMIT"
         if status_code in (500, 502, 503, 504, 529):
-            return f"MiniMax H3 服务繁忙: {message}", "NETWORK"
-        return f"MiniMax H3 HTTP {status_code}: {message or upstream_type}", "UNKNOWN"
+            return f"MiniMax H3 上游未完成任务（HTTP {status_code}），请稍后重试；如持续失败，请提供本地日志。", "NETWORK"
+        return f"MiniMax H3 返回异常状态（HTTP {status_code}），请提供本地日志和报错时间。", "UNKNOWN"
 
     async def submit(
         self,
@@ -494,9 +499,10 @@ class MiniMaxH3Provider(VideoProviderBase):
                 sanitized_payload=sanitized_payload,
             )
         except Exception as exc:
+            logger.warning("[minimax_h3] 提交连接异常: %s: %s", type(exc).__name__, exc)
             return SubmitResult(
                 False,
-                fail_reason=f"MiniMax H3 提交网络异常: {type(exc).__name__}: {exc}",
+                fail_reason="MiniMax H3 连接失败，请检查网络后重试；如持续失败，请提供本地日志。",
                 error_code="NETWORK",
                 sanitized_payload=sanitized_payload,
             )
@@ -521,6 +527,7 @@ class MiniMaxH3Provider(VideoProviderBase):
             )
 
         friendly, error_code = self._translate_http_error(status_code, body)
+        logger.warning("[minimax_h3] 提交被上游拒绝: http=%s code=%s detail=%s", status_code, error_code, self._extract_error(body)[0][:1000])
         return SubmitResult(
             False,
             fail_reason=friendly,
@@ -541,13 +548,15 @@ class MiniMaxH3Provider(VideoProviderBase):
         except asyncio.TimeoutError:
             return QueryResult(status="running", fail_reason="MiniMax H3 查询超时，稍后自动重试", error_code="NETWORK")
         except Exception as exc:
-            return QueryResult(status="running", fail_reason=f"MiniMax H3 查询网络异常: {exc}", error_code="NETWORK")
+            logger.warning("[minimax_h3] 查询连接异常: %s: %s", type(exc).__name__, exc)
+            return QueryResult(status="running", fail_reason="查询 MiniMax H3 视频任务时网络异常，系统稍后自动重试。", error_code="NETWORK")
 
         status_code = int(response.get("status_code") or 0)
         body = response.get("body") or {}
         if status_code != 200:
             friendly, error_code = self._translate_http_error(status_code, body)
-            if status_code in (429, 500, 502, 503, 504, 529):
+            logger.warning("[minimax_h3] 查询被上游拒绝: task=%s http=%s code=%s detail=%s", task_id, status_code, error_code, self._extract_error(body)[0][:1000])
+            if error_code in ("NETWORK", "RATE_LIMIT"):
                 return QueryResult(status="running", fail_reason=friendly, error_code=error_code, raw=body)
             return QueryResult(status="fail", fail_reason=friendly, error_code=error_code, raw=body)
 
@@ -567,6 +576,19 @@ class MiniMaxH3Provider(VideoProviderBase):
         status = status_map.get(raw_status, "running")
         content = task.get("content") if isinstance(task.get("content"), dict) else {}
         error = task.get("error") if isinstance(task.get("error"), dict) else {}
+        failure_message = None
+        failure_code = str(error.get("code") or "")
+        if status in ("fail", "expired", "cancelled"):
+            if failure_code == "1026" and "sensitive" in str(error.get("message") or "").lower():
+                failure_message = "视频未通过上游内容审核（错误码 1026）。请调整分镜文字或参考素材后重试。"
+            elif status == "expired":
+                failure_message = "MiniMax H3 任务已过期，请重新生成。"
+            elif status == "cancelled":
+                failure_message = "MiniMax H3 任务已取消。"
+            else:
+                suffix = f"（上游错误码 {failure_code}）" if failure_code else ""
+                failure_message = f"MiniMax H3 生成失败{suffix}，请查看本地日志或联系管理员。"
+            logger.warning("[minimax_h3] 视频任务失败: task=%s code=%s detail=%s", task_id, failure_code, str(error.get("message") or "")[:1000])
         try:
             duration = float(task.get("duration") or 0)
         except (TypeError, ValueError):
@@ -575,8 +597,8 @@ class MiniMaxH3Provider(VideoProviderBase):
             status=status,
             video_url=str(content.get("url")) if content.get("url") else None,
             duration=duration,
-            fail_reason=str(error.get("message")) if status in ("fail", "expired", "cancelled") and error.get("message") else None,
-            error_code=str(error.get("code")) if error.get("code") else None,
+            fail_reason=failure_message,
+            error_code=failure_code or None,
             raw=body,
         )
 

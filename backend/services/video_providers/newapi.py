@@ -10,6 +10,7 @@ upload bridge first.
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -102,20 +103,63 @@ class NewApiVideoProvider(VideoProviderBase):
             return str(err or body.get("message") or body.get("detail") or body.get("raw_text") or "未知错误")[:500]
         return str(body or "未知错误")[:500]
 
+    @staticmethod
+    def _content_review_error(body: Any) -> bool:
+        """Recognize MiniMax's review failure even when the relay nests it in text."""
+        try:
+            detail = json.dumps(body, ensure_ascii=False).lower()
+        except (TypeError, ValueError):
+            detail = str(body or "").lower()
+        return bool(re.search(r"(?<!\d)1026(?!\d)", detail)) and (
+            "input text sensitive" in detail
+            or "input new_sensitive" in detail
+            or "h3_context_ir_error" in detail
+        )
+
+    @staticmethod
+    def _content_review_message() -> str:
+        return (
+            "视频未通过上游内容审核（错误码 1026）。请检查并调整本节分镜的"
+            "场景描述、动作和人物台词后重试；上游未指出具体命中的句子。"
+        )
+
+    @staticmethod
+    def _error_text(body: Any) -> str:
+        try:
+            return json.dumps(body, ensure_ascii=False).lower()
+        except (TypeError, ValueError):
+            return str(body or "").lower()
+
     @classmethod
     def _http_error(cls, status: int, body: Any) -> Tuple[str, str]:
-        message = cls._error_message(body)
+        if cls._content_review_error(body):
+            return cls._content_review_message(), "CONTENT_REJECTED"
+        detail = cls._error_text(body)
+        if re.search(r"(?<!\d)2013(?!\d)", detail) and ("tokenplan" in detail or "minimax-h3" in detail):
+            return "当前上游账号的套餐不支持 MiniMax-H3，请联系管理员开通该模型或切换视频模型（错误码 2013）。", "MODEL_NOT_ENTITLED"
+        if any(term in detail for term in ("insufficient balance", "insufficient credit", "insufficient quota", "余额不足", "额度不足")):
+            return "视频中转站账户余额或额度不足，请联系管理员处理后重试。", "BALANCE"
+        if any(term in detail for term in ("invalid api key", "invalid token", "unauthorized", "api key is invalid")):
+            return "视频中转站鉴权失败，请联系管理员检查 API Key。", "AUTH"
+        if any(term in detail for term in ("rate limit", "too many requests", "频率限制")):
+            return "视频中转站请求过于频繁，请稍后重试。", "RATE_LIMIT"
+        if "duration" in detail and any(term in detail for term in ("invalid", "unsupported", "out of range")):
+            return "视频时长不被当前模型接受，请检查分镜时长是否在模型支持范围内。", "INVALID_PARAM"
+        if "model" in detail and any(term in detail for term in ("not found", "unavailable", "not supported")):
+            return "当前视频模型不可用或未开通，请联系管理员检查模型配置。", "MODEL_UNAVAILABLE"
+        if any(term in detail for term in ("failed to download", "download failed", "url inaccessible", "fetch image failed")):
+            return "视频模型无法读取参考素材，请检查素材链接是否可从公网访问。", "ASSET_UNAVAILABLE"
         if status in (400, 422):
-            return f"New API 参数或素材不符合要求: {message}", "INVALID_PARAM"
+            return f"视频请求参数或参考素材未被中转站接受（HTTP {status}）。请检查模型、时长和素材；详情见本地日志。", "INVALID_PARAM"
         if status in (401, 403):
-            return "New API Key 无效、过期或没有该模型权限", "AUTH"
+            return "视频中转站鉴权失败或没有该模型权限，请联系管理员检查配置。", "AUTH"
         if status == 402:
-            return "New API 账户余额或额度不足", "BALANCE"
+            return "视频中转站账户余额或额度不足，请联系管理员处理后重试。", "BALANCE"
         if status == 429:
-            return f"New API 请求过于频繁: {message}", "RATE_LIMIT"
+            return "视频中转站请求过于频繁，请稍后重试。", "RATE_LIMIT"
         if status in (500, 502, 503, 504):
-            return f"New API 服务暂时不可用: {message}", "NETWORK"
-        return f"New API HTTP {status}: {message}", "UNKNOWN"
+            return f"视频中转站未能完成任务（HTTP {status}）。请稍后重试；如持续失败，请提供本地日志和报错时间。", "NETWORK"
+        return f"视频中转站返回异常状态（HTTP {status}）。请提供本地日志和报错时间。", "UNKNOWN"
 
     @staticmethod
     def _urls(values: Any) -> List[str]:
@@ -203,7 +247,8 @@ class NewApiVideoProvider(VideoProviderBase):
         except asyncio.TimeoutError:
             return SubmitResult(False, fail_reason="New API 提交 180 秒未返回任务编号，请在供应商后台核对后再重试", error_code="SUBMIT_TIMEOUT_UNCONFIRMED", sanitized_payload=sanitized)
         except Exception as exc:
-            return SubmitResult(False, fail_reason=f"New API 提交网络异常: {type(exc).__name__}: {exc}", error_code="NETWORK", sanitized_payload=sanitized)
+            logger.warning("[newapi] 提交连接异常: %s: %s", type(exc).__name__, exc)
+            return SubmitResult(False, fail_reason="视频中转站连接失败，请检查网络后重试；如持续失败，请提供本地日志。", error_code="NETWORK", sanitized_payload=sanitized)
         status = int(response["status_code"])
         body = response["body"]
         if status in (200, 201, 202):
@@ -213,6 +258,7 @@ class NewApiVideoProvider(VideoProviderBase):
                 return SubmitResult(True, submit_id=str(task_id), raw=body if isinstance(body, dict) else {}, sanitized_payload=sanitized)
             return SubmitResult(False, fail_reason="New API 已响应成功但未返回 task_id", error_code="UNKNOWN", raw=body if isinstance(body, dict) else {}, sanitized_payload=sanitized)
         message, code = self._http_error(status, body)
+        logger.warning("[newapi] 提交被上游拒绝: http=%s code=%s detail=%s", status, code, self._error_message(body)[:1000])
         return SubmitResult(False, fail_reason=message, error_code=code, raw=body if isinstance(body, dict) else {}, sanitized_payload=sanitized)
 
     @staticmethod
@@ -240,12 +286,15 @@ class NewApiVideoProvider(VideoProviderBase):
         except asyncio.TimeoutError:
             return QueryResult(status="running", fail_reason="New API 查询超时，稍后自动重试", error_code="NETWORK")
         except Exception as exc:
-            return QueryResult(status="running", fail_reason=f"New API 查询网络异常: {exc}", error_code="NETWORK")
+            logger.warning("[newapi] 查询连接异常: %s: %s", type(exc).__name__, exc)
+            return QueryResult(status="running", fail_reason="查询视频任务时网络连接异常，系统稍后自动重试。", error_code="NETWORK")
         status = int(response["status_code"])
         body = response["body"]
         if status != 200:
             message, code = self._http_error(status, body)
-            return QueryResult(status="running" if status >= 500 or status == 429 else "fail", fail_reason=message, error_code=code, raw=body if isinstance(body, dict) else {})
+            logger.warning("[newapi] 查询被上游拒绝: task=%s http=%s code=%s detail=%s", task_id, status, code, self._error_message(body)[:1000])
+            retryable = code in {"NETWORK", "RATE_LIMIT"}
+            return QueryResult(status="running" if retryable else "fail", fail_reason=message, error_code=code, raw=body if isinstance(body, dict) else {})
         data = body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) else {}
         state = str((body.get("status") if isinstance(body, dict) else "") or data.get("status") or "").lower()
         if state in {"queued", "pending", "running", "in_progress", "processing"}:
@@ -256,7 +305,9 @@ class NewApiVideoProvider(VideoProviderBase):
                 return QueryResult(status="success", video_url=url, raw=body if isinstance(body, dict) else {})
             return QueryResult(status="running", fail_reason="New API 已完成但视频地址尚未返回", raw=body if isinstance(body, dict) else {})
         if state in {"failed", "error", "cancelled", "canceled", "expired"}:
-            return QueryResult(status="fail", fail_reason=self._error_message(body), raw=body if isinstance(body, dict) else {})
+            message, code = self._http_error(502, body)
+            logger.warning("[newapi] 视频任务失败: task=%s code=%s detail=%s", task_id, code, self._error_message(body)[:1000])
+            return QueryResult(status="fail", fail_reason=message, error_code=code, raw=body if isinstance(body, dict) else {})
         return QueryResult(status="running", raw=body if isinstance(body, dict) else {})
 
     async def cancel(self, submit_id: str) -> bool:

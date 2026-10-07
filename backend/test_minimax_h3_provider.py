@@ -139,7 +139,7 @@ class MiniMaxH3ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(success.duration, 12)
         self.assertEqual(failed.status, "fail")
         self.assertEqual(failed.error_code, "1026")
-        self.assertIn("sensitive", failed.fail_reason or "")
+        self.assertIn("内容审核", failed.fail_reason or "")
 
     async def test_query_keeps_transient_http_error_running(self):
         provider = self.make_provider()

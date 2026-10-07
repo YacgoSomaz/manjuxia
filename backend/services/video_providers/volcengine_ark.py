@@ -400,7 +400,7 @@ class VolcengineArkProvider(VideoProviderBase):
             logger.error(f"[ark] submit 网络异常: {e}", exc_info=True)
             return SubmitResult(
                 success=False,
-                fail_reason=f"网络异常: {e}",
+                fail_reason="连接火山方舟失败，请检查网络后重试；详细原因已记录在本地日志。",
                 error_code="NETWORK",
                 sanitized_payload=sanitized_payload_full,
             )
@@ -416,9 +416,10 @@ class VolcengineArkProvider(VideoProviderBase):
                     success=True, submit_id=task_id, raw=body,
                     sanitized_payload=sanitized_payload_full,
                 )
+            logger.warning("[ark] 提交响应缺少任务 id: %s", str(body)[:1000])
             return SubmitResult(
                 success=False,
-                fail_reason=f"火山方舟返回成功但缺 id: {body}",
+                fail_reason="火山方舟已响应，但未返回视频任务编号；请稍后重试并提供本地日志。",
                 error_code="UNKNOWN",
                 raw=body,
                 sanitized_payload=sanitized_payload_full,
@@ -443,17 +444,21 @@ class VolcengineArkProvider(VideoProviderBase):
             resp = await self._get(f"/contents/generations/tasks/{submit_id}", timeout=30)
         except Exception as e:
             logger.warning(f"[ark] query 网络异常: {e}")
-            return QueryResult(status="running", fail_reason=str(e), error_code="NETWORK")
+            return QueryResult(status="running", fail_reason="暂时无法查询火山方舟任务，正在继续重试。", error_code="NETWORK")
 
         sc = resp.get("status_code", 0)
         body = resp.get("body") or {}
 
         if sc != 200:
             err = (body or {}).get("error") or {}
+            err_code = str(err.get("code") or sc)
+            err_msg = str(err.get("message") or "")
+            friendly, classified = self._translate_ark_error(sc, err_code, err_msg)
+            logger.warning("[ark] query 失败 sc=%s code=%s msg=%s", sc, err_code, err_msg[:1000])
             return QueryResult(
-                status="fail",
-                fail_reason=err.get("message") or f"查询失败 HTTP {sc}",
-                error_code=str(err.get("code") or sc),
+                status="running" if classified in ("NETWORK", "RATE_LIMIT") else "fail",
+                fail_reason=friendly,
+                error_code=classified,
                 raw=body,
             )
 
@@ -480,6 +485,7 @@ class VolcengineArkProvider(VideoProviderBase):
             err = body.get("error") or {}
             fail_reason = err.get("message") or f"任务{status_raw}"
             err_code = err.get("code")
+            logger.warning("[ark] 任务失败 id=%s status=%s code=%s msg=%s", submit_id, status_raw, err_code, str(fail_reason)[:1000])
             # 翻译
             friendly, _ = self._translate_ark_error(0, err_code or "", fail_reason)
             fail_reason = friendly
@@ -621,7 +627,7 @@ class VolcengineArkProvider(VideoProviderBase):
 
         # 模型不支持的参数
         if "invalid" in msg_low and ("ratio" in msg_low or "resolution" in msg_low or "duration" in msg_low):
-            return (f"参数不被当前模型支持: {message}", "INVALID_PARAM")
+            return ("当前模型不支持所选画幅、分辨率或时长，请调整视频参数后重试。", "INVALID_PARAM")
 
         # 任务超时(火山方舟侧)
         if "expired" in msg_low or "timeout" in msg_low:
@@ -632,4 +638,6 @@ class VolcengineArkProvider(VideoProviderBase):
             return (f"火山方舟服务异常 (HTTP {http_status}),稍后重试", "NETWORK")
 
         # 默认
-        return (f"火山方舟错误: {message}", "UNKNOWN")
+        safe_code = "".join(c for c in str(code or "")[:40] if c.isalnum() or c in "_-.")
+        code_hint = f"（上游错误码：{safe_code}）" if safe_code else ""
+        return (f"火山方舟视频任务失败{code_hint}。请提供本地日志和报错时间以便定位。", "UNKNOWN")
