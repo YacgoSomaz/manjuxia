@@ -229,7 +229,7 @@
     installQuickRechargeStyle();
     const mask = document.createElement("div");
     mask.id = "manjuxia-quick-recharge";
-    mask.innerHTML = `<section class="manjuxia-quick-recharge__dialog" role="dialog" aria-modal="true" aria-label="漫剧虾算力积分充值"><button type="button" class="manjuxia-quick-recharge__close" aria-label="关闭">×</button><header class="manjuxia-quick-recharge__head"><div><div class="manjuxia-quick-recharge__eyebrow">MANJUXIA CREDITS</div><h3>漫剧虾算力积分充值</h3></div><p>¥0.10 = 1 积分。支付成功后自动到账，仅用于漫剧虾官方 AI 算力。</p></header><div class="manjuxia-quick-recharge__plans" aria-live="polite"></div><p class="manjuxia-quick-recharge__note">正在加载充值档位…</p><div class="manjuxia-quick-recharge__payment" hidden><img alt="微信支付二维码"><div><strong>请使用微信扫码支付</strong><p class="manjuxia-quick-recharge__payment-copy">订单已创建，正在等待支付。</p></div></div><p class="manjuxia-quick-recharge__status" aria-live="polite"></p></section>`;
+    mask.innerHTML = `<section class="manjuxia-quick-recharge__dialog" role="dialog" aria-modal="true" aria-label="漫剧虾算力积分充值"><button type="button" class="manjuxia-quick-recharge__close" aria-label="关闭">×</button><header class="manjuxia-quick-recharge__head"><div><div class="manjuxia-quick-recharge__eyebrow">MANJUXIA CREDITS</div><h3>漫剧虾算力积分充值</h3></div><p>¥1 = 100 积分。支付成功后自动到账，仅用于漫剧虾官方 AI 算力。</p></header><div class="manjuxia-quick-recharge__plans" aria-live="polite"></div><p class="manjuxia-quick-recharge__note">正在加载充值档位…</p><div class="manjuxia-quick-recharge__payment" hidden><img alt="微信支付二维码"><div><strong>请使用微信扫码支付</strong><p class="manjuxia-quick-recharge__payment-copy">订单已创建，正在等待支付。</p></div></div><p class="manjuxia-quick-recharge__status" aria-live="polite"></p></section>`;
     document.body.appendChild(mask);
     const plansNode = mask.querySelector(".manjuxia-quick-recharge__plans");
     const note = mask.querySelector(".manjuxia-quick-recharge__note");
@@ -287,6 +287,9 @@
       if (!catalog || !catalog.success || !catalog.paymentsEnabled || !Array.isArray(catalog.plans) || !catalog.plans.length) {
         throw new Error((catalog && catalog.message) || "积分充值暂未开放");
       }
+      if (!catalog.plans.every((plan) => plan.amountCents === plan.credits)) {
+        throw new Error("服务端充值价格尚未更新至 ¥1 = 100 积分，请稍后重试，避免按旧价格付款。");
+      }
       plansNode.replaceChildren(...catalog.plans.map((plan) => {
         const card = document.createElement("article");
         card.className = "manjuxia-quick-recharge__plan";
@@ -304,6 +307,7 @@
           try {
             const result = await account.createPayment(plan.id);
             if (!result || !result.success || !result.orderNo || !result.qrDataUrl) throw new Error((result && result.message) || "创建支付订单失败");
+            if (result.amountCents !== plan.amountCents) throw new Error("订单金额与显示价格不一致，请勿支付并联系管理员。");
             paymentQr.src = result.qrDataUrl;
             payment.hidden = false;
             paymentCopy.textContent = `订单 ${result.orderNo}，请使用微信扫码支付。`;

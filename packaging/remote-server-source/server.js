@@ -98,10 +98,10 @@ const PAYMENT_PLANS = Object.freeze({
 // credit order must never create, extend, or otherwise alter a product
 // membership record.
 const CREDIT_TOPUP_PLANS = Object.freeze({
-  credit_1: { name: '测试充值 1 积分', amountCents: 10, energy: 1 },
-  credit_500: { name: '充值 500 积分', amountCents: 5000, energy: 500 },
-  credit_2000: { name: '充值 2000 积分', amountCents: 20000, energy: 2000 },
-  credit_10000: { name: '充值 10000 积分', amountCents: 100000, energy: 10000 },
+  credit_1: { name: '测试充值 1 积分', amountCents: 1, energy: 1 },
+  credit_500: { name: '充值 500 积分', amountCents: 500, energy: 500 },
+  credit_2000: { name: '充值 2000 积分', amountCents: 2000, energy: 2000 },
+  credit_10000: { name: '充值 10000 积分', amountCents: 10000, energy: 10000 },
 });
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -1021,7 +1021,7 @@ app.get('/account/topup', (req, res) => sendAccountPage(res, `
       account.classList.remove('hidden');
       const topup = document.createElement('section'); topup.className = 'topup';
       const heading = document.createElement('h2'); heading.textContent = '充值算力积分';
-      const hint = document.createElement('p'); hint.textContent = '固定兑换比例：¥0.10 = 1 积分。支付成功后由服务端验签并入账。';
+      const hint = document.createElement('p'); hint.textContent = '固定兑换比例：¥1 = 100 积分。支付成功后由服务端验签并入账。';
       const plans = document.createElement('div'); plans.className = 'plans';
       topup.append(heading, hint, plans); document.querySelector('main.card').append(topup);
       const catalog = await request('/api/pay/credit-plans');
@@ -2080,7 +2080,7 @@ app.post('/api/pay/wechat/create', requireUser, async (req, res) => {
   const plan = creditPlan || membershipPlan;
   if (!plan) return jsonResponse(res, 400, { ok: false, error: '充值方案不存在' });
   const orderKind = creditPlan ? 'credit_topup' : 'membership';
-  // Credit denominations are fixed at ¥0.10 per point. Membership plans keep
+  // Credit denominations are fixed at ¥0.01 per point. Membership plans keep
   // their existing pricing policy (for example, any approved campaign price).
   const orderPricing = creditPlan
     ? { amountCents: creditPlan.amountCents }
