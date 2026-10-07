@@ -173,6 +173,8 @@
       .manjuxia-account-footer__login { width: 100%; height: 29px; margin-top: 9px; border: 1px solid #38bdf8; border-radius: 6px; background: #0ea5e9; color: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }
       .manjuxia-account-footer__logout { width: 100%; height: 29px; margin-top: 9px; border: 1px solid #ef4444; border-radius: 6px; background: transparent; color: #f87171; font-size: 12px; font-weight: 700; cursor: pointer; }
       .manjuxia-account-footer__logout:hover { background: rgba(239,68,68,.12); border-color: #fb7185; color: #fda4af; }
+      .manjuxia-open-logs { display:block; width:calc(100% - 32px); height:30px; margin:7px 16px; border:1px solid rgba(100,181,246,.35); border-radius:6px; background:rgba(32,68,110,.25); color:#bde8f2; font-size:11px; cursor:pointer; }
+      .manjuxia-open-logs:hover { border-color:#4fd1c5; color:#e4ffff; background:rgba(32,142,158,.18); }
       body.manjuxia-light-theme .manjuxia-account-footer { border-color: #d9e2ec; background: #f8fafc; color: #1f2937; }
       body.manjuxia-light-theme .manjuxia-account-footer__status { color: #64748b; }
       body.manjuxia-light-theme .manjuxia-account-footer__credits { color: #475569; }
@@ -181,6 +183,7 @@
       body.manjuxia-light-theme .manjuxia-account-footer__action { color: #0f766e; }
       body.manjuxia-light-theme .manjuxia-account-footer__login { color: #fff; }
       body.manjuxia-light-theme .manjuxia-account-footer__logout { color: #dc2626; border-color: #dc2626; }
+      body.manjuxia-light-theme .manjuxia-open-logs { border-color:#cbd5e1; background:#f8fafc; color:#334155; }
     `;
     document.head.appendChild(style);
   }
@@ -938,6 +941,30 @@
     window.fetch = wrappedFetch;
   }
 
+  function ensureLogAccessButton() {
+    const footer = document.querySelector(".sidebar-footer");
+    if (!footer || footer.querySelector(".manjuxia-open-logs")) return;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "manjuxia-open-logs";
+    button.textContent = "打开本地日志";
+    button.title = "打开 app.log 和 auth-debug.log 所在文件夹";
+    button.addEventListener("click", async () => {
+      const openDataDir = window.electronAPI && window.electronAPI.openDataDir;
+      if (typeof openDataDir !== "function") {
+        window.alert("当前客户端不支持直接打开日志目录，请更新软件。");
+        return;
+      }
+      try {
+        const result = await openDataDir();
+        if (!result || !result.success) throw new Error(result && result.error || "无法打开日志目录");
+      } catch (error) {
+        window.alert(`打开日志目录失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+    });
+    footer.insertBefore(button, footer.querySelector(".version-text") || null);
+  }
+
   function run() {
     patchBrandMeta();
     patchTextNodes(document.body);
@@ -945,6 +972,7 @@
     ensureThemeToggle();
     void syncFooterVersion();
     ensureAccountFooter();
+    ensureLogAccessButton();
     installAccountLogoutGuard();
     installMiniMaxH3ResolutionControl();
     installMiniMaxH3ResolutionFetchAdapter();
