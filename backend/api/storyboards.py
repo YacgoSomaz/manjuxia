@@ -855,9 +855,16 @@ async def get_storyboards_by_novel(novel_id: int, script_id: int = None):
 
 
 @router.put("/{storyboard_id}/video-status")
-async def update_video_status(storyboard_id: int, video_status: str = Query(...), video_url: str = Query(None)):
+async def update_video_status(
+    storyboard_id: int,
+    video_status: str = Query(...),
+    video_url: str = Query(None),
+    submit_id: str = Query(None),
+):
     """更新分镜的视频生成状态"""
-    success = await StoryboardService.update_video_status(storyboard_id, video_status, video_url)
+    success = await StoryboardService.update_video_status(
+        storyboard_id, video_status, video_url, submit_id=submit_id
+    )
     if success:
         return {"success": True, "message": "视频状态已更新"}
     raise HTTPException(status_code=500, detail="更新视频状态失败")

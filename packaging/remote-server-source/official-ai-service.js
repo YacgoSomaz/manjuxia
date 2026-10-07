@@ -310,6 +310,14 @@ function readOfficialAiConfig(env = process.env, db = null) {
     model: String(env.OFFICIAL_VIDEO_NEWAPI_MODEL || '').trim(),
   };
   videoNewApi.configured = videoNewApi.enabled && Boolean(videoNewApi.apiBase && videoNewApi.apiKey && videoNewApi.model);
+  const videoMiniMax = {
+    enabled: parseBoolean(env.OFFICIAL_VIDEO_MINIMAX_ENABLED, false),
+    provider: 'minimax_official', label: String(env.OFFICIAL_VIDEO_MINIMAX_LABEL || '官方 MiniMax H3').slice(0, 80),
+    apiBase: String(env.OFFICIAL_VIDEO_MINIMAX_BASE || 'https://api.minimaxi.com').trim().replace(/\/+$/, ''),
+    apiKey: String(env.OFFICIAL_VIDEO_MINIMAX_KEY || '').trim(),
+    model: String(env.OFFICIAL_VIDEO_MINIMAX_MODEL || 'MiniMax-H3').trim(),
+  };
+  videoMiniMax.configured = videoMiniMax.enabled && Boolean(videoMiniMax.apiBase && videoMiniMax.apiKey && videoMiniMax.model);
   const videoArk = {
     enabled: parseBoolean(env.OFFICIAL_VIDEO_ARK_ENABLED, false),
     provider: 'volcengine_ark', label: String(env.OFFICIAL_VIDEO_ARK_LABEL || '官方火山方舟即梦').slice(0, 80),
@@ -330,7 +338,7 @@ function readOfficialAiConfig(env = process.env, db = null) {
     timeoutMs: clamp(parseInteger(env.OFFICIAL_AI_TIMEOUT_MS, 90_000), 10_000, 180_000),
     image,
     imageSeedream2,
-    video: { configured: videoNewApi.configured || videoArk.configured, providers: [videoNewApi, videoArk].filter((item) => item.configured) },
+    video: { configured: videoNewApi.configured || videoMiniMax.configured || videoArk.configured, providers: [videoNewApi, videoMiniMax, videoArk].filter((item) => item.configured) },
   };
 }
 
@@ -538,7 +546,14 @@ function refundAiJob(db, jobId, code = 'AI_UPSTREAM_FAILED', timestamp = nowIso(
 
 function refundStaleAiJobs(db, timestamp = nowIso()) {
   const deadline = new Date(Date.parse(timestamp) - 15 * 60 * 1000).toISOString();
-  const jobs = db.prepare(`SELECT id FROM ai_jobs WHERE status = 'running' AND created_at < ?`).all(deadline);
+  // Video jobs that already have an upstream task id can be resumed after a
+  // process restart, so do not refund them as if they were stale local work.
+  const jobs = db.prepare(`
+    SELECT id FROM ai_jobs
+    WHERE status = 'running'
+      AND created_at < ?
+      AND (task_type <> 'comic_video' OR provider_request_id IS NULL)
+  `).all(deadline);
   for (const job of jobs) refundAiJob(db, job.id, 'AI_JOB_INTERRUPTED', timestamp);
   return jobs.length;
 }
@@ -627,6 +642,9 @@ async function callOfficialAi(config, job) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        // This upstream's WAF rejects bare runtime clients (CF 1010). Keep a
+        // stable, non-sensitive UA for its OpenAI-compatible endpoints.
+        'User-Agent': 'Mozilla/5.0 (compatible; ManJuXia-OfficialAI/1.0)',
         'Authorization': `Bearer ${config.apiKey}`,
         'Idempotency-Key': job.id,
       },
@@ -634,7 +652,27 @@ async function callOfficialAi(config, job) {
       signal: controller.signal,
     });
     const payload = await response.json().catch(() => null);
-    if (!response.ok) throw new OfficialAiError('官方AI服务暂时不可用', response.status === 429 ? 'AI_UPSTREAM_RATE_LIMITED' : 'AI_UPSTREAM_FAILED', 502);
+    if (!response.ok) {
+      const upstreamError = payload && typeof payload.error === 'object' ? payload.error : payload || {};
+      const failureCode = response.status === 429
+        ? 'AI_UPSTREAM_RATE_LIMITED'
+        : response.status === 402
+          ? 'AI_UPSTREAM_INSUFFICIENT_BALANCE'
+          : response.status === 401 || response.status === 403
+            ? 'AI_UPSTREAM_AUTH_FAILED'
+            : 'AI_UPSTREAM_FAILED';
+      throw new OfficialAiError(
+        '官方AI服务暂时不可用',
+        failureCode,
+        502,
+        {
+          provider_status: response.status,
+          provider_code: String(upstreamError.code || '').slice(0, 120),
+          provider_message: String(upstreamError.message || upstreamError.error || '').slice(0, 600),
+          provider_request_id: String(response.headers.get('x-request-id') || payload?.id || '').slice(0, 160),
+        },
+      );
+    }
     return {
       text: extractCompletionText(payload),
       inputTokens: Number(payload?.usage?.prompt_tokens) || null,
@@ -650,7 +688,7 @@ async function callOfficialAi(config, job) {
   }
 }
 
-function normalizeOfficialImageResult(payload) {
+function normalizeOfficialImageResult(payload, config = null) {
   const findUrl = (value, depth = 0) => {
     if (depth > 5 || value == null) return '';
     if (typeof value === 'string') {
@@ -692,10 +730,13 @@ function normalizeOfficialImageResult(payload) {
     }
     return { deliveryUrl: deliveryUrl.toString(), buffer: null, mimeType: 'image/png', width: 1024, height: 1024 };
   }
-  // Keep the production path URL-only so generated image bytes never pass through
-  // the official server. Base64 is opt-in for emergency provider compatibility.
+  // Most providers return a CDN URL. This particular OpenAI-compatible image
+  // provider returns `b64_json` even when a URL is requested. Accept that
+  // bounded result only for the configured GPT Image family, then persist it
+  // directly to OSS; it is never returned as base64 to the desktop client.
   const item = Array.isArray(payload?.data) ? payload.data[0] : null;
-  if (process.env.OFFICIAL_AI_ALLOW_BASE64_IMAGE !== '1') {
+  const allowBase64 = /^gpt-image-/i.test(String(config?.model || '').trim());
+  if (!allowBase64) {
     throw new OfficialAiError('官方图片服务未返回可用图片 URL', 'AI_IMAGE_RESULT_UNSUPPORTED', 502);
   }
   if (!item || typeof item.b64_json !== 'string' || !item.b64_json) {
@@ -753,6 +794,9 @@ function officialImageUpstreamError(response, payload) {
 }
 
 function officialImageSize(config) {
+  // OpenAI-compatible GPT Image endpoints use the standard 1024 canvas;
+  // the 1920 minimum below is specific to the previous Seedream endpoint.
+  if (/^gpt-image-/i.test(String(config?.model || '').trim())) return '1024x1024';
   // Seedream inference endpoints reject the legacy 1024×1024 payload: their
   // minimum is 3,686,400 pixels.  1920×1920 meets that documented limit
   // exactly while preserving a neutral canvas for character/scene prompts.
@@ -774,7 +818,12 @@ async function callOfficialImage(config, job) {
   try {
     const response = await fetch(`${config.apiBase}/images/generations`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.apiKey}`, 'Idempotency-Key': job.id },
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (compatible; ManJuXia-OfficialAI/1.0)',
+        'Authorization': `Bearer ${config.apiKey}`,
+        'Idempotency-Key': job.id,
+      },
       body: JSON.stringify({
         model: config.model,
         prompt: job.input_text,
@@ -786,7 +835,7 @@ async function callOfficialImage(config, job) {
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok) throw officialImageUpstreamError(response, payload);
-    const image = normalizeOfficialImageResult(payload);
+    const image = normalizeOfficialImageResult(payload, config);
     return { ...image, providerRequestId: String(response.headers.get('x-request-id') || payload?.id || '').slice(0, 160) || null };
   } catch (error) {
     if (error instanceof OfficialAiError) throw error;

@@ -1487,6 +1487,32 @@ async function callOfficialImageWithRetry(config, job) {
   }
   throw lastError;
 }
+
+async function callOfficialTextWithRetry(config, job) {
+  // NewAPI relays occasionally return a blank 5xx while their model worker is
+  // healthy a few seconds later. Reuse the same idempotency key so a retry
+  // cannot create a second billable completion upstream.
+  const retryableCodes = new Set(['AI_UPSTREAM_FAILED', 'AI_UPSTREAM_TIMEOUT', 'AI_UPSTREAM_RATE_LIMITED']);
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      return await callOfficialAi(config, job);
+    } catch (error) {
+      lastError = error;
+      if (!retryableCodes.has(error?.code) || attempt >= 3) throw error;
+      const delayMs = attempt * 2500;
+      console.warn('[OFFICIAL_AI]', JSON.stringify({
+        code: error.code,
+        job_id: job.id,
+        retry_attempt: attempt + 1,
+        provider_status: error.details?.provider_status,
+      }));
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError;
+}
+
 async function storeOfficialAiImage(job, image) {
   const assetId = crypto.randomUUID();
   let imageBuffer = Buffer.isBuffer(image.buffer) ? image.buffer : null;
@@ -1625,11 +1651,21 @@ app.post('/api/v1/ai/jobs', requireUser, async (req, res) => {
     // this worker settles or refunds it in the background.
     void (async () => {
       try {
-        const result = await callOfficialAi(taskConfig, { ...reservation.job, input_text: resolved.inputText, max_output_tokens: resolved.maxOutputTokens });
+        const result = await callOfficialTextWithRetry(taskConfig, { ...reservation.job, input_text: resolved.inputText, max_output_tokens: resolved.maxOutputTokens });
         settleAiJob(db, reservation.job.id, result);
       } catch (error) {
         refundAiJob(db, reservation.job.id, error.code || 'AI_UPSTREAM_FAILED');
-        console.warn('[OFFICIAL_AI]', JSON.stringify({ code: error.code || 'AI_UPSTREAM_FAILED', job_id: reservation.job.id }));
+        // Text-model errors used to drop the upstream response details. Keep
+        // only bounded diagnostics on the server so a temporary 5xx can be
+        // distinguished from an invalid model/key without exposing secrets.
+        console.warn('[OFFICIAL_AI]', JSON.stringify({
+          code: error.code || 'AI_UPSTREAM_FAILED',
+          job_id: reservation.job.id,
+          provider_status: error.details?.provider_status,
+          provider_code: error.details?.provider_code,
+          provider_message: error.details?.provider_message,
+          provider_request_id: error.details?.provider_request_id,
+        }));
       }
     })();
     const queued = db.prepare('SELECT * FROM ai_jobs WHERE id = ?').get(reservation.job.id);
@@ -1671,7 +1707,8 @@ function officialVideoResultUrl(payload, provider = null) {
   if (!payload || typeof payload !== 'object') return '';
   const candidates = [payload.url, payload.video_url, payload.download_url, payload.output_url,
     payload.data?.url, payload.data?.video_url, payload.data?.download_url,
-    payload.data?.output?.url, payload.data?.output?.video_url];
+    payload.data?.output?.url, payload.data?.output?.video_url,
+    payload.task?.content?.url];
   for (const candidate of candidates) {
     const value = officialVideoUrl(candidate, provider);
     if (value) return value;
@@ -1681,12 +1718,25 @@ function officialVideoResultUrl(payload, provider = null) {
 
 async function officialVideoFetch(provider, pathName, method = 'GET', body = undefined) {
   const endpoint = `${String(provider.apiBase || '').replace(/\/+$/, '')}${pathName}`;
-  const response = await fetch(endpoint, {
-    method,
-    headers: { Authorization: `Bearer ${provider.apiKey}`, 'Content-Type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(method === 'POST' ? 180_000 : 60_000),
-  });
+  let response;
+  try {
+    // NewAPI can spend several minutes admitting a video job during a busy
+    // period. It is safe to wait here: this runs in the server-side async
+    // worker, not in the desktop request-response path.
+    response = await fetch(endpoint, {
+      method,
+      headers: { Authorization: `Bearer ${provider.apiKey}`, 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(method === 'POST' ? 300_000 : 60_000),
+    });
+  } catch (error) {
+    const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError' || Number(error?.code) === 23;
+    throw new OfficialAiError(
+      timedOut ? '官方视频上游响应超时，请稍后重试' : '官方视频上游连接失败',
+      timedOut ? 'AI_UPSTREAM_TIMEOUT' : 'AI_UPSTREAM_FAILED',
+      timedOut ? 504 : 502,
+    );
+  }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const upstreamError = payload?.error && typeof payload.error === 'object' ? payload.error : payload;
@@ -1730,6 +1780,17 @@ async function submitOfficialVideo(provider, job) {
     if (!taskId) throw new OfficialAiError('官方视频服务未返回任务编号', 'AI_UPSTREAM_FAILED', 502);
     return { taskId: String(taskId), pollPath: `/v1/videos/${encodeURIComponent(String(taskId))}` };
   }
+  if (provider.provider === 'minimax_official') {
+    const content = [{ type: 'text', text: job.input_text }];
+    source.images.forEach((url) => content.push({ type: 'image_url', image_url: { url }, role: 'reference_image' }));
+    source.videos.forEach((url) => content.push({ type: 'video_url', video_url: { url }, role: 'reference_video' }));
+    source.audios.forEach((url) => content.push({ type: 'audio_url', audio_url: { url }, role: 'reference_audio' }));
+    const response = await officialVideoFetch(provider, '/v2/video_generation', 'POST', {
+      model: provider.model, content, resolution: '2K', duration: Number(params.duration || 5), ratio: String(params.ratio || '9:16'), aigc_watermark: false,
+    });
+    if (!response.task_id) throw new OfficialAiError('官方 MiniMax H3 未返回任务编号', 'AI_UPSTREAM_FAILED', 502);
+    return { taskId: String(response.task_id), pollPath: `/v2/query/video_generation/${encodeURIComponent(String(response.task_id))}` };
+  }
   const content = [{ type: 'text', text: job.input_text }];
   source.images.forEach((url) => content.push({ type: 'image_url', image_url: { url }, role: 'reference_image' }));
   source.audios.forEach((url) => content.push({ type: 'audio_url', audio_url: { url }, role: 'reference_audio' }));
@@ -1742,23 +1803,7 @@ async function runOfficialVideoJob(provider, reservedJob, video) {
   try {
     const submitted = await submitOfficialVideo(provider, { ...reservedJob, video });
     db.prepare('UPDATE ai_jobs SET provider_request_id = ? WHERE id = ?').run(`${provider.provider}:${submitted.taskId}`, reservedJob.id);
-    // NewAPI video queues can legitimately take longer than the previous
-    // 15-minute window during peak demand. Poll every 5 seconds for up to
-    // 30 minutes before declaring a refundable timeout.
-    for (let attempt = 0; attempt < 360; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-      const current = await officialVideoFetch(provider, submitted.pollPath);
-      const record = current.data || current;
-      const state = String(record.status || record.state || '').toLowerCase();
-      const url = officialVideoResultUrl(record, provider);
-      if (url || ['succeeded', 'success', 'completed'].includes(state)) {
-        if (!url) throw new OfficialAiError('官方视频任务完成但没有返回视频地址', 'AI_VIDEO_RESULT_INVALID', 502);
-        settleAiJob(db, reservedJob.id, { text: url, providerRequestId: `${provider.provider}:${submitted.taskId}` });
-        return;
-      }
-      if (['failed', 'error', 'cancelled', 'canceled', 'expired'].includes(state)) throw new OfficialAiError('官方视频任务失败', 'AI_UPSTREAM_FAILED', 502);
-    }
-    throw new OfficialAiError('官方视频生成超时', 'AI_UPSTREAM_TIMEOUT', 504);
+    await pollOfficialVideoTask(provider, reservedJob, submitted.taskId, submitted.pollPath);
   } catch (error) {
     refundAiJob(db, reservedJob.id, error.code || 'AI_UPSTREAM_FAILED');
     console.warn('[OFFICIAL_VIDEO]', JSON.stringify({
@@ -1771,6 +1816,53 @@ async function runOfficialVideoJob(provider, reservedJob, video) {
       provider_request_id: error.details?.provider_request_id,
     }));
   }
+}
+
+async function pollOfficialVideoTask(provider, job, taskId, pollPath, options = {}) {
+  // NewAPI video queues can legitimately take much longer than a text job.
+  // It is also reused when the server resumes an upstream task after restart.
+  const initialDelayMs = Number(options.initialDelayMs ?? 5000);
+  for (let attempt = 0; attempt < 360; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? initialDelayMs : 5000));
+    const current = await officialVideoFetch(provider, pollPath);
+    const record = provider.provider === 'minimax_official' ? (current.task || current) : (current.data || current);
+    const state = String(record.status || record.state || '').toLowerCase();
+    const url = officialVideoResultUrl(record, provider);
+    if (url || ['succeeded', 'success', 'completed'].includes(state)) {
+      if (!url) throw new OfficialAiError('官方视频任务完成但没有返回视频地址', 'AI_VIDEO_RESULT_INVALID', 502);
+      settleAiJob(db, job.id, { text: url, providerRequestId: `${provider.provider}:${taskId}` });
+      return;
+    }
+    if (['failed', 'error', 'cancelled', 'canceled', 'expired'].includes(state)) throw new OfficialAiError('官方视频任务失败', 'AI_UPSTREAM_FAILED', 502);
+  }
+  throw new OfficialAiError('官方视频生成超时', 'AI_UPSTREAM_TIMEOUT', 504);
+}
+
+function resumeOfficialVideoJobs() {
+  const config = readOfficialAiConfig(process.env, db);
+  const providers = new Map((config.video?.providers || []).map((item) => [item.provider, item]));
+  const jobs = db.prepare(`
+    SELECT * FROM ai_jobs
+    WHERE task_type = 'comic_video' AND status = 'running'
+      AND provider_request_id IS NOT NULL AND provider_request_id <> ''
+  `).all();
+  for (const job of jobs) {
+    const divider = String(job.provider_request_id).indexOf(':');
+    const providerName = divider > 0 ? String(job.provider_request_id).slice(0, divider) : '';
+    const taskId = divider > 0 ? String(job.provider_request_id).slice(divider + 1) : '';
+    const provider = providers.get(providerName);
+    if (!provider || !taskId) continue;
+    const pollPath = provider.provider === 'minimax_official'
+      ? `/v2/query/video_generation/${encodeURIComponent(taskId)}`
+      : provider.provider === 'newapi'
+        ? `/v1/videos/${encodeURIComponent(taskId)}`
+        : `/contents/generations/tasks/${encodeURIComponent(taskId)}`;
+    void pollOfficialVideoTask(provider, job, taskId, pollPath, { initialDelayMs: 0 }).catch((error) => {
+      refundAiJob(db, job.id, error.code || 'AI_UPSTREAM_FAILED');
+      console.warn('[OFFICIAL_VIDEO_RESUME]', JSON.stringify({ job_id: job.id, code: error.code || 'AI_UPSTREAM_FAILED' }));
+    });
+  }
+  if (jobs.length) console.log(`[OFFICIAL_VIDEO_RESUME] resuming ${jobs.length} upstream task(s)`);
 }
 
 const OFFICIAL_VIDEO_ASSET_RULES = Object.freeze({
@@ -2357,6 +2449,8 @@ const retentionStartupTimer = setTimeout(runScheduledRetentionSweep, 10_000);
 retentionStartupTimer.unref?.();
 const retentionInterval = setInterval(runScheduledRetentionSweep, 6 * 60 * 60 * 1000);
 retentionInterval.unref?.();
+
+resumeOfficialVideoJobs();
 
 app.listen(PORT, '127.0.0.1', () => {
   const config = getSmsConfig();

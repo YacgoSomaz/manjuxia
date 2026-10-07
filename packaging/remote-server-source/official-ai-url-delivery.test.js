@@ -19,6 +19,15 @@ test('拒绝非 HTTPS 的上游图片地址', () => {
   assert.throws(() => normalizeOfficialImageResult({ data: [{ url: 'http://unsafe.example.test/a.png' }] }), /图片/);
 });
 
+test('GPT Image 的标准 b64_json 结果会交给 OSS 持久化，而不回传客户端', () => {
+  const result = normalizeOfficialImageResult({
+    data: [{ b64_json: Buffer.from('generated-image-bytes').toString('base64') }],
+  }, { model: 'gpt-image-2' });
+  assert.equal(result.deliveryUrl, null);
+  assert.deepEqual(result.buffer, Buffer.from('generated-image-bytes'));
+  assert.equal(result.mimeType, 'image/png');
+});
+
 test('上游内容安全拒绝被识别为可执行安全回退的独立错误', () => {
   const response = { status: 400, headers: { get: () => 'request-1' } };
   const error = officialImageUpstreamError(response, { error: { code: 'IMAGE_BAD_REQUEST', message: 'prompt violates safety policy' } });

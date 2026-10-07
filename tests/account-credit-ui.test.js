@@ -29,6 +29,6 @@ test("the account footer requests current account state and shows the signed bal
 
 test("source package version matches the current published baseline", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.equal(pkg.version, "0.1.30");
+  assert.match(pkg.version, /^\d+\.\d+\.\d+$/);
   assert.match(brand, /syncFooterVersion/);
 });

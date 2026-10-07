@@ -9,6 +9,7 @@
   const OFFICIAL_SEEDREAM2_CONFIG_ID = "-900003";
   const OFFICIAL_SEEDANCE2_VIDEO_CONFIG_ID = "-900004";
   const OFFICIAL_MINIMAX_H3_VIDEO_CONFIG_ID = "-900005";
+  const OFFICIAL_MINIMAX_OFFICIAL_VIDEO_CONFIG_ID = "-900007";
   const OFFICIAL_DEEPSEEK_V41_CONFIG_ID = "-900006";
   const OFFICIAL_TEXT_CONFIG_PREFIX = "official:text:";
   const OFFICIAL_IMAGE_TASK_TYPE = "comic_image";
@@ -65,6 +66,8 @@
       .section-card .section-header .section-title,.section-card .section-header .section-scene,.section-card .section-header .chain-tooltip{display:none!important}
       #manjuxia-official-video-progress{position:fixed;right:22px;bottom:22px;z-index:2147482991;display:flex;align-items:center;gap:10px;max-width:min(480px,calc(100vw - 44px));padding:12px 15px;border:1px solid #2d8db6;border-radius:10px;background:#101a35;box-shadow:0 15px 38px rgba(0,0,0,.38);color:#d9ebff;font:13px/1.45 "Microsoft YaHei",sans-serif}.mjx-video-spinner{width:16px;height:16px;flex:0 0 16px;border:2px solid rgba(104,198,255,.28);border-top-color:#57c8ff;border-radius:50%;animation:mjx-video-spin .8s linear infinite}@keyframes mjx-video-spin{to{transform:rotate(360deg)}}
       .el-tag.mjx-video-active{display:inline-flex;align-items:center;gap:6px;border-color:#4ca9e8!important;background:rgba(61,137,218,.17)!important;color:#8bd6ff!important}.mjx-video-tag-spinner{width:11px;height:11px;border:2px solid rgba(139,214,255,.3);border-top-color:#8bd6ff;border-radius:50%;animation:mjx-video-spin .8s linear infinite}.mjx-video-live-copy{display:flex;align-items:center;min-height:34px;margin:0 0 12px;padding:0 14px;border:1px solid rgba(76,169,232,.42);border-radius:7px;background:rgba(36,92,151,.16);color:#8bd6ff;font-size:12px;white-space:nowrap}.section-header .mjx-video-header-status{display:flex;align-items:center;gap:10px;min-width:0;margin-left:16px;margin-right:auto;white-space:nowrap}.section-header .mjx-video-header-status .mjx-video-live-copy{display:inline-flex;min-height:0;margin:0;padding:0;border:0;background:transparent;font-size:12px;color:#8bd6ff}
+      .log-content{max-height:132px!important}.video-section video[src*="/data/videos/"]{cursor:pointer}.mjx-default-video-launcher{position:relative;display:block;width:100%;line-height:0}.mjx-default-video-launcher video{display:block;pointer-events:none}.mjx-default-video-launcher video::-webkit-media-controls{display:none!important}.mjx-default-video-launcher button{position:absolute;z-index:3;inset:0;width:100%;height:100%;border:0;background:transparent;cursor:pointer}.mjx-default-video-launcher button:focus-visible{outline:2px solid #66d9ff;outline-offset:3px}
+      .mjx-minimax-personal-config{display:flex;align-items:center;gap:7px;min-width:230px;margin-right:8px;color:#a8c7e9;font:12px/1.2 "Microsoft YaHei",sans-serif}.mjx-minimax-personal-config label{white-space:nowrap}.mjx-minimax-personal-config select{min-width:145px;max-width:250px;height:30px;padding:0 26px 0 9px;border:1px solid #3970aa;border-radius:5px;background:#122345;color:#e6f2ff;outline:0;cursor:pointer}.mjx-minimax-personal-config select:focus{border-color:#55c9ff;box-shadow:0 0 0 2px rgba(85,201,255,.14)}.mjx-minimax-personal-config small{color:#84b8de;white-space:nowrap}
     `;
     document.head.append(style);
   }
@@ -77,11 +80,16 @@
     const replacements = [
       ["⏳ NewAPI 中转生成中（章节图片、视频、音频素材已走临时 OSS）", "⏳ NewAPI 正在准备参考素材"],
       ["临时 OSS", "临时素材"],
+      ["NewAPI 中转", "自建算力"],
     ];
     let textNode;
     while ((textNode = walker.nextNode())) {
       let text = textNode.nodeValue || "";
       for (const [from, to] of replacements) text = text.replaceAll(from, to);
+      // A key fingerprint has no value to an end user on this screen and can
+      // make an official/server-side credential look as if it was exposed.
+      // Keep the state, never any portion of the secret, visible.
+      text = text.replace(/\bKey\s+sk-[A-Za-z0-9_*.-]+/g, "密钥已配置");
       if (text !== textNode.nodeValue) textNode.nodeValue = text;
     }
   }
@@ -96,6 +104,84 @@
     };
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", observe, { once: true });
     else observe();
+  }
+
+  function installDefaultVideoPlayer() {
+    if (window.__manjuxiaDefaultVideoPlayerInstalled) return;
+    window.__manjuxiaDefaultVideoPlayerInstalled = true;
+    const isLocalVideo = (video) => /\/data\/videos\//i.test(String(video && (video.currentSrc || video.src) || ""));
+    const open = async (videoOrSource) => {
+      const source = typeof videoOrSource === "string"
+        ? videoOrSource.trim()
+        : String(videoOrSource && (videoOrSource.currentSrc || videoOrSource.src) || "").trim();
+      const opener = window.electronAPI && window.electronAPI.openDataVideo;
+      if (!source || typeof opener !== "function") return;
+      try {
+        const result = await opener(source);
+        if (!result || !result.success) throw new Error(result && result.error || "无法打开本地视频");
+      } catch (error) {
+        console.warn("[default-video-player]", error && error.message || error);
+      }
+    };
+    const bindVideos = () => {
+    document.querySelectorAll("video").forEach((video) => {
+      if (isLocalVideo(video) && video.closest(".mjx-default-video-launcher")) {
+        // The component sometimes re-adds `controls` during a reactive update.
+        // This preview is deliberately a single launcher surface instead.
+        if (video.controls) video.removeAttribute("controls");
+        const existingLauncher = video.closest(".mjx-default-video-launcher").querySelector(":scope > button");
+        if (existingLauncher) existingLauncher.dataset.videoSource = String(video.currentSrc || video.src || "");
+        return;
+      }
+      // Vue can re-render the <video> node while its parent remains in the DOM.
+      // The existing launcher already owns the full preview click target, so do
+      // not wrap the replacement node a second time.
+      if (
+        !isLocalVideo(video) ||
+        video.dataset.mjxDefaultPlayerBound ||
+        video.closest(".mjx-default-video-launcher")
+      ) return;
+        video.dataset.mjxDefaultPlayerBound = "1";
+        // The entire completed preview is a single launcher. It deliberately
+        // replaces Chromium's codec-dependent control bar with one stable,
+        // accessible click target that opens Windows' default player.
+        const wrapper = document.createElement("div");
+        wrapper.className = "mjx-default-video-launcher";
+        video.parentNode.insertBefore(wrapper, video);
+        wrapper.appendChild(video);
+        video.removeAttribute("controls");
+        const launcher = document.createElement("button");
+        launcher.type = "button";
+        launcher.setAttribute("aria-label", "用默认播放器打开视频");
+        launcher.title = "点击用默认播放器打开视频";
+        launcher.dataset.videoSource = String(video.currentSrc || video.src || "");
+        // Do not close over `video`: Vue may replace that node while keeping
+        // this overlay. The latest source is refreshed by the observer above.
+        launcher.addEventListener("click", () => open(launcher.dataset.videoSource));
+        wrapper.appendChild(launcher);
+        // Native media controls live in Chromium's closed shadow DOM. Its
+        // play button reliably emits `play`, even when a click listener sees
+        // no internal target, so use that exact event as the launcher.
+        video.addEventListener("play", () => {
+          try { video.pause(); } catch (_) {}
+          open(launcher.dataset.videoSource || video);
+        });
+      });
+    };
+    const observer = new MutationObserver(bindVideos);
+    const begin = () => { bindVideos(); observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "controls"] }); };
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", begin, { once: true }); else begin();
+    document.addEventListener("click", (event) => {
+      const video = event.target && event.target.closest && event.target.closest("video");
+      if (!video || !isLocalVideo(video)) return;
+      const source = String(video.currentSrc || video.src || "").trim();
+      const opener = window.electronAPI && window.electronAPI.openDataVideo;
+      if (typeof opener !== "function") return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      try { video.pause(); } catch (_) {}
+      open(video);
+    }, true);
   }
 
   // The bundled video view only renders the static word “生成中”.  Keep a
@@ -189,6 +275,80 @@
     };
     refresh();
     window.setInterval(refresh, 1000);
+  }
+
+  // The bundled MiniMax page fixes H3's native model/mode/resolution controls
+  // by design.  Credentials must still be switchable: a creator can select a
+  // saved personal MiniMax configuration here and avoid using official points.
+  function installMiniMaxPersonalConfigSelector() {
+    const widgetId = "mjx-minimax-personal-config";
+    let loading = false;
+    const requestOptions = async () => {
+      const response = await localBackendFetch("/api/video/minimax/config-options");
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success) throw new Error(data.detail || data.message || "无法读取个人 MiniMax 配置");
+      return data;
+    };
+    const mount = async () => {
+      const keyInput = Array.from(document.querySelectorAll("input")).find((input) =>
+        String(input.getAttribute("placeholder") || "").trim() === "MiniMax API Key"
+      );
+      if (!keyInput || document.getElementById(widgetId) || loading) return;
+      loading = true;
+      try {
+        const data = await requestOptions();
+        const inputShell = keyInput.closest(".el-input") || keyInput.parentElement?.parentElement;
+        const host = keyInput.closest(".pippit-top-config") || inputShell?.parentElement;
+        if (!host || document.getElementById(widgetId)) return;
+        const wrapper = document.createElement("div");
+        wrapper.id = widgetId;
+        wrapper.className = "mjx-minimax-personal-config";
+        const label = document.createElement("label");
+        label.htmlFor = `${widgetId}-select`;
+        label.textContent = "个人 MiniMax：";
+        const select = document.createElement("select");
+        select.id = `${widgetId}-select`;
+        select.title = "切换到自己的 MiniMax API 配置，不使用官方积分";
+        const direct = document.createElement("option");
+        direct.value = "";
+        direct.textContent = "直接输入的 Key";
+        select.append(direct);
+        (data.options || []).forEach((config) => {
+          const option = document.createElement("option");
+          option.value = String(config.id);
+          option.textContent = `${config.name || "MiniMax H3"} · ${config.model_name || "MiniMax-H3"}`;
+          select.append(option);
+        });
+        select.value = data.selected_config_id == null ? "" : String(data.selected_config_id);
+        select.addEventListener("change", async () => {
+          select.disabled = true;
+          try {
+            const configId = select.value ? Number(select.value) : null;
+            const response = await localBackendFetch("/api/video/minimax/select-config", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ config_id: configId })
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok || !result.success) throw new Error(result.detail || result.message || "切换个人 MiniMax 配置失败");
+            // Refresh only this route so the bundled view re-reads credential state.
+            location.reload();
+          } catch (error) {
+            select.disabled = false;
+            window.alert(error && error.message || "切换个人 MiniMax 配置失败");
+          }
+        });
+        wrapper.append(label, select);
+        host.insertBefore(wrapper, inputShell || host.firstChild);
+      } catch (_) {
+        // The normal direct-key field remains available if the local backend
+        // is restarting; try again on the next pass without disturbing input.
+      } finally {
+        loading = false;
+      }
+    };
+    window.setInterval(mount, 800);
+    mount();
   }
 
   function stopPolling() {
@@ -568,12 +728,12 @@
 
   function isOfficialConfig(value) {
     const id = String(value || "");
-    return id === OFFICIAL_TEXT_CONFIG_ID || id === OFFICIAL_DEEPSEEK_V41_CONFIG_ID || isOfficialImageConfig(id) || id === OFFICIAL_SEEDANCE2_VIDEO_CONFIG_ID || id === OFFICIAL_MINIMAX_H3_VIDEO_CONFIG_ID || id.startsWith(OFFICIAL_TEXT_CONFIG_PREFIX);
+    return id === OFFICIAL_TEXT_CONFIG_ID || id === OFFICIAL_DEEPSEEK_V41_CONFIG_ID || isOfficialImageConfig(id) || id === OFFICIAL_SEEDANCE2_VIDEO_CONFIG_ID || id === OFFICIAL_MINIMAX_H3_VIDEO_CONFIG_ID || id === OFFICIAL_MINIMAX_OFFICIAL_VIDEO_CONFIG_ID || id.startsWith(OFFICIAL_TEXT_CONFIG_PREFIX);
   }
 
   function officialVideoProvider(value) {
     const id = String(value || "");
-    return id === OFFICIAL_SEEDANCE2_VIDEO_CONFIG_ID ? "volcengine_ark" : id === OFFICIAL_MINIMAX_H3_VIDEO_CONFIG_ID ? "newapi" : "";
+    return id === OFFICIAL_SEEDANCE2_VIDEO_CONFIG_ID ? "volcengine_ark" : id === OFFICIAL_MINIMAX_H3_VIDEO_CONFIG_ID ? "newapi" : id === OFFICIAL_MINIMAX_OFFICIAL_VIDEO_CONFIG_ID ? "minimax_official" : "";
   }
 
   function officialTaskTypeForConfig(configId) {
@@ -853,7 +1013,12 @@
       }
       if (["failed", "error", "cancelled", "canceled"].includes(state)) {
         const failureCode = String(job.failure_code || job.error_code || job.code || "").trim();
-        const message = job.message || "官方语言任务失败，积分将自动退回";
+        const friendlyFailures = {
+          AI_UPSTREAM_INSUFFICIENT_BALANCE: "官方 DeepSeek 上游账户余额不足，请联系管理员充值；本次积分已自动退回",
+          AI_UPSTREAM_AUTH_FAILED: "官方语言服务认证异常，请联系管理员；本次积分已自动退回",
+          AI_UPSTREAM_RATE_LIMITED: "官方语言服务当前繁忙，请稍后重试；本次积分已自动退回",
+        };
+        const message = friendlyFailures[failureCode] || job.message || "官方语言任务失败，积分将自动退回";
         throw new Error(failureCode ? `${message} [${failureCode}]` : message);
       }
       const serviceProgress = Number(job.progress || job.percent || job.percentage);
@@ -1220,6 +1385,16 @@
     // desktop restart so completed official jobs are still polled and written
     // back into the local storyboard instead of becoming invisible.
     try { localStorage.setItem(`manjuxia-official-video:${body.storyboard_id}`, id); } catch (_) {}
+    // The normal /ark/submit handler is intentionally bypassed for official
+    // compute, so persist the remote job mapping ourselves. Without this a
+    // route remount reloads the storyboard's old "pending" row and invites a
+    // duplicate submission while the paid task is still running upstream.
+    try {
+      await localBackendFetch(
+        `/api/storyboards/${Number(storyboardId)}/video-status?video_status=generating&submit_id=${encodeURIComponent(id)}`,
+        { method: "PUT" }
+      );
+    } catch (_) {}
     return jsonResponse({ success: true, task_id: id, submit_id: id, video_provider: "official" }, 202);
   }
 
@@ -1263,16 +1438,37 @@
     for (const storyboardId of ids) {
       let jobId = "";
       try { jobId = localStorage.getItem(`manjuxia-official-video:${storyboardId}`) || ""; } catch (_) {}
+      // localStorage can be cleared independently of the project database.
+      // Recover the persisted official job id before falling back to the
+      // native poller, which cannot understand an official-server task id.
+      if (!jobId) {
+        try {
+          const local = await localBackendFetch(`/api/storyboards/${Number(storyboardId)}`);
+          const row = await local.json().catch(() => ({}));
+          const stored = String(row && row.submit_id || "").trim();
+          if (/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(stored)) {
+            jobId = stored;
+            localStorage.setItem(`manjuxia-official-video:${storyboardId}`, jobId);
+          }
+        } catch (_) {}
+      }
       if (!jobId) return null; // preserve the native poller for mixed/local batches
       const response = await bridge.getVideoJob(jobId);
       const job = response && (response.job || response.data || response);
       const state = String(job && (job.status || job.state) || "").toLowerCase();
       if (!response || response.ok === false) {
-        // Keep the paid task id during a temporary polling failure.
+        // A temporary polling failure is not proof that the paid upstream job
+        // failed. Keep its mapping so the next poll can recover the result.
         console.warn("[official-video] 查询任务暂时失败", { jobId, code: response && response.code || "poll_unavailable" });
         mapped.push({ id: storyboardId, video_status: "generating", video_url: null });
       } else if (["failed", "error", "cancelled", "canceled"].includes(state)) {
         try { localStorage.removeItem(`manjuxia-official-video:${storyboardId}`); } catch (_) {}
+        try {
+          await localBackendFetch(
+            `/api/storyboards/${Number(storyboardId)}/video-status?video_status=failed`,
+            { method: "PUT" }
+          );
+        } catch (_) {}
         mapped.push({ id: storyboardId, video_status: "failed", video_url: null, fail_reason: officialVideoFailure(job, jobId) });
       } else if (["succeeded", "success", "completed", "complete"].includes(state)) {
         const url = String(job && (job.result_text || job.video_url || job.output_url) || "");
@@ -1397,7 +1593,9 @@
   // must be present before a user opens any official-compute dialog.
   addStyle();
   installUserFacingVideoLogLabels();
+  installDefaultVideoPlayer();
   installLightweightVideoProgressFeedback();
+  installMiniMaxPersonalConfigSelector();
   installImageFetchInterceptor();
   remountInitialSupportedSelector();
   window.addEventListener("keydown", (event) => { if (event.key === "Escape" && document.getElementById(MODAL_ID)) closeModal(); });

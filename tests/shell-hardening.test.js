@@ -43,9 +43,9 @@ test("shows a startup status window until the workspace is ready", () => {
   assert.match(main, /closeSplashWindow\(\)/);
 });
 
-test("opens the login route immediately when no account session is stored and polls only stored sessions", () => {
+test("opens the login route without a stored session and refreshes account context in the background", () => {
   const main = fs.readFileSync(path.join(__dirname, "..", "electron", "main.js"), "utf8");
-  assert.match(main, /const LICENSE_REFRESH_INTERVAL_MS = 10 \* 1000/);
+  assert.match(main, /licenseRefreshTimer = setInterval\(\(\) => \{ void refreshContextOnly\(\); \}, 60_000\)/);
   assert.match(main, /licenseClient\.hasSession\(\)/);
   assert.match(main, /createWindow\(hasStoredAccountSession \? "" : activationHash\("not_activated"\)\)/);
 });

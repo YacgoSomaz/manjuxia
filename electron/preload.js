@@ -14,6 +14,7 @@ const electronAPI = {
   getVersionHistory: (limit) => ipcRenderer.invoke("get-version-history", limit),
   openExternal: (url) => ipcRenderer.invoke("open-external", url),
   openLocalFile: (file) => ipcRenderer.invoke("open-local-file", file),
+  openDataVideo: (source) => ipcRenderer.invoke("open-data-video", source),
   openDataDir: (category) => ipcRenderer.invoke("open-data-dir", category),
   openFolder: (folder) => ipcRenderer.invoke("open-folder", folder),
   quitApp: () => ipcRenderer.invoke("quit-app"),
@@ -89,3 +90,20 @@ contextBridge.exposeInMainWorld("wanshan", {
   checkBackend: () => ipcRenderer.invoke("backend:health"),
   openDataDir: () => ipcRenderer.invoke("shell:open-data-dir")
 });
+
+// Chromium keeps native <video> controls inside a closed shadow tree, so page
+// framework click handlers cannot reliably observe its play icon. Intercept
+// the pointer at preload level and hand app-owned local videos to the system
+// default player. This is deliberately limited to the backend's /data/videos
+// route; all other video elements retain normal browser behavior.
+document.addEventListener("pointerdown", (event) => {
+  const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+  const video = path.find((node) => node && String(node.tagName || "").toLowerCase() === "video");
+  if (!video) return;
+  const source = String(video.currentSrc || video.src || video.getAttribute("src") || "").trim();
+  if (!/\/data\/videos\//i.test(source)) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  try { video.pause(); } catch (_) {}
+  ipcRenderer.invoke("open-data-video", source).catch(() => {});
+}, true);

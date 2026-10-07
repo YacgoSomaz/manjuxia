@@ -878,24 +878,10 @@ async def init_db():
         except Exception as e:
             logger.debug(f"主表 failed 误标修正失败(忽略): {e}")
 
-        # 数据清理 v3.60.5 / v3.60.8: 启动时重置 generating/queued,完全不动 done
-        # 原因:旧 session 留下的 generating storyboard,前端 onMounted 会自动 poll-status 查即梦,
-        #      即梦那边老任务仍在跑就会显示"生成中 排队 #N",看起来像应用自己启动了任务
-        # done 保留(已完成的视频不会偷跑,是用户成果)
-        try:
-            cur_reset = await db.execute(
-                "UPDATE storyboards SET video_status = 'pending', "
-                "submit_id = NULL, video_submit_time = NULL "
-                "WHERE video_status IN ('generating', 'queued')"
-            )
-            reset_count = cur_reset.rowcount if hasattr(cur_reset, 'rowcount') else 0
-            if reset_count > 0:
-                logger.info(
-                    f"[启动重置] 已把 {reset_count} 个 generating/queued 分镜重置为 pending"
-                    f"(避免应用启动后自动轮询老即梦任务;done 状态保留)"
-                )
-        except Exception as e:
-            logger.debug(f"启动重置 storyboards 状态失败(忽略): {e}")
+        # 旧版曾在每次启动时把所有 generating/queued 清成 pending。那会把
+        # NewAPI/官方异步视频（可持续几十分钟）的真实任务变成“待生成”，
+        # 用户重新进入视频页后甚至可能重复扣费提交。保留真实状态，轮询器会
+        # 自己按提交时间处理过期任务；不再做破坏性的启动重置。
 
         # v3.61.15: 把历史英文火山方舟错误翻译成中文(一次性,启动迁移)
         # v3.61.13 起新失败会翻译,但 v3.61.12 之前留下的英文残留要补

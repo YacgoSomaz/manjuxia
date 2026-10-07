@@ -47,7 +47,7 @@
               const official = document.createElement("script");
               // Keep Electron's Chromium cache from retaining an older official
               // compute interceptor after a desktop update.
-              official.src = "./official-ai.js?v=20260910-video-status-header";
+              official.src = "./official-ai.js?v=20261007-official-sync";
               document.head.appendChild(official);
             };
             document.head.appendChild(localModels);
@@ -61,6 +61,6 @@
     </script>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app"></div>
   </body>
 </html>

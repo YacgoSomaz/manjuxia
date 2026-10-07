@@ -101,7 +101,7 @@ function normalizeOfficialVideoJobRequest(body) {
   const base = normalizeAiJobRequest({ ...(body || {}), task_type: 'comic_video' });
   const raw = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
   const provider = assertPlainString(raw.video_provider, 'video_provider', 24);
-  if (!['newapi', 'volcengine_ark'].includes(provider)) throw new AiContractError('官方视频模型无效');
+  if (!['newapi', 'volcengine_ark', 'minimax_official'].includes(provider)) throw new AiContractError('官方视频模型无效');
   const urls = (value, field, limit) => {
     if (value === undefined) return [];
     if (!Array.isArray(value) || value.length > limit) throw new AiContractError(`${field}数量无效`);

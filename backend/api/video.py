@@ -44,6 +44,7 @@ PROVIDER_FRIENDLY = {
 }
 PIPPIT_ACCESS_KEY_SETTING = "pippit.access_key"
 MINIMAX_API_KEY_SETTING = "minimax.api_key"
+MINIMAX_CONFIG_ID_SETTING = "minimax.config_id"
 
 
 def _cached_audio_duration_seconds(file_path: str) -> Optional[float]:
@@ -134,17 +135,51 @@ def _env_minimax_api_key() -> str:
 
 
 async def _get_minimax_api_key() -> str:
-    # 部署环境变量优先；桌面端默认读取本机 app_settings。
+    selected = await _selected_minimax_local_config()
+    # 用户在设置中明确选择的个人配置优先。这样可在同一客户端从官方
+    # 积分算力切回自己的 MiniMax 账户，而不受部署时环境变量的影响。
+    if selected and str(selected.get("api_key") or "").strip():
+        return str(selected.get("api_key") or "").strip()
     return _env_minimax_api_key() or (await _get_app_setting(MINIMAX_API_KEY_SETTING)).strip()
 
 
+def _is_native_minimax_config(config: Dict[str, Any]) -> bool:
+    """只暴露直连 MiniMax/Hailuo 配置，排除协议不同的 NewAPI。"""
+    base_url = str(config.get("base_url") or "").strip().lower()
+    model_name = str(config.get("model_name") or "").strip().lower()
+    provider_code = str(config.get("provider_code") or "").strip().lower()
+    if "newapi" in base_url or "120.209.70.196" in base_url or provider_code in {"newapi", "new_api", "taihang"}:
+        return False
+    return "minimaxi.com" in base_url or provider_code in {"minimax", "minimax_h3"} or "minimax-h3" in model_name
+
+
+async def _minimax_local_config_options() -> List[Dict[str, Any]]:
+    from services.llm_service import LLMService
+    configs = await LLMService.get_all("video", local_only=True)
+    return [config for config in configs if _is_native_minimax_config(config)]
+
+
+async def _selected_minimax_local_config() -> Optional[Dict[str, Any]]:
+    raw_id = (await _get_app_setting(MINIMAX_CONFIG_ID_SETTING)).strip()
+    if not raw_id:
+        return None
+    try:
+        config_id = int(raw_id)
+    except (TypeError, ValueError):
+        return None
+    from services.llm_service import LLMService
+    config = await LLMService.get_by_id(config_id, local_only=True)
+    return config if config and _is_native_minimax_config(config) else None
+
+
 async def _minimax_provider_config() -> Dict[str, Any]:
+    selected = await _selected_minimax_local_config()
     api_key = await _get_minimax_api_key()
     return {
         "api_key": api_key,
-        "base_url": "https://api.minimaxi.com",
-        "model_name": "MiniMax-H3",
-        "name": "MiniMax H3",
+        "base_url": str((selected or {}).get("base_url") or "https://api.minimaxi.com").strip(),
+        "model_name": str((selected or {}).get("model_name") or "MiniMax-H3").strip(),
+        "name": str((selected or {}).get("name") or "MiniMax H3").strip(),
     }
 
 
@@ -2482,10 +2517,9 @@ def _newapi_upload_asset(value: str, kind: str) -> Dict[str, str]:
     source = str(value or "").strip()
     if source.startswith(("http://", "https://")):
         return {"url": source, "kind": kind}
-    # DB 中同时存在两种历史格式：/data/images/... 与 data/images/....
-    # 后一种若交给 abspath() 会被解析到后端的当前工作目录；安装/升级后
-    # 工作目录可变，导致 UI 能预览本机媒体但 NewAPI 上传阶段误报“找不到素材”。
-    # 两种 data 路径都必须从用户数据/媒体目录解析，而不是从安装目录解析。
+    # DB 中同时存在 /data/images/... 与 data/images/... 两种历史格式。
+    # 后者不能用当前工作目录解析；安装/升级后会被误指向安装目录，造成
+    # 素材仍可预览却在 NewAPI 视频上传前被误判为不存在。
     path = resolve_db_path(source) if source.startswith(("/data/", "data/")) else os.path.abspath(source)
     if not os.path.isfile(path):
         return {"error": f"找不到{kind}素材文件: {source}", "kind": kind}
@@ -2506,7 +2540,7 @@ async def prepare_newapi_assets(request: NewApiPrepareAssetsRequest):
         # Negative ids are desktop-only official capability markers.  They
         # contain no endpoint/key but use the same signed OSS upload bridge as
         # NewAPI, so raw local paths never leave the desktop process.
-        official_video = int(request.config_id) in {-900004, -900005}
+        official_video = int(request.config_id) in {-900004, -900005, -900007}
         config = await LLMService.get_by_id(request.config_id, local_only=True) if not official_video else None
         if not official_video and (not config or config.get("config_type") != "video"):
             return {"active": False}
@@ -2561,8 +2595,12 @@ class MiniMaxConfigSaveRequest(BaseModel):
     api_key: str = ""
 
 
+class MiniMaxConfigSelectRequest(BaseModel):
+    # None means use the personal key entered directly on the MiniMax page.
+    config_id: Optional[int] = None
+
+
 def _normalize_minimax_resolution(value: Any) -> str:
-    """Preserve the UI choice while supplying H3's historical 2K default."""
     return str(value or "2K").upper()
 
 
@@ -2619,13 +2657,17 @@ async def check_pippit_cli():
 async def get_minimax_config():
     env_key = _env_minimax_api_key()
     local_key = (await _get_app_setting(MINIMAX_API_KEY_SETTING)).strip()
-    active_key = env_key or local_key
+    selected = await _selected_minimax_local_config()
+    selected_key = str((selected or {}).get("api_key") or "").strip()
+    active_key = selected_key or env_key or local_key
     return {
         "success": True,
         "has_api_key": bool(active_key),
         "has_env_api_key": bool(env_key),
         "has_local_api_key": bool(local_key),
-        "api_key_masked": _mask_secret(active_key),
+        "selected_config_id": selected.get("id") if selected else None,
+        "credential_source": "个人配置" if selected_key else ("环境变量" if env_key else "直接输入的个人 Key"),
+        "api_key_masked": "",
         "model": "MiniMax-H3",
         "resolution": "2K",
     }
@@ -2635,6 +2677,7 @@ async def get_minimax_config():
 async def save_minimax_config(req: MiniMaxConfigSaveRequest):
     api_key = (req.api_key or "").strip()
     await _set_app_setting(MINIMAX_API_KEY_SETTING, api_key)
+    await _set_app_setting(MINIMAX_CONFIG_ID_SETTING, "")
     logger.info("[minimax/config] api_key=%s", "configured" if api_key else "cleared")
     active_key = _env_minimax_api_key() or api_key
     return {
@@ -2643,10 +2686,45 @@ async def save_minimax_config(req: MiniMaxConfigSaveRequest):
         "has_api_key": bool(active_key),
         "has_env_api_key": bool(_env_minimax_api_key()),
         "has_local_api_key": bool(api_key),
-        "api_key_masked": _mask_secret(active_key),
+        "api_key_masked": "",
         "model": "MiniMax-H3",
         "resolution": "2K",
     }
+
+
+@router.get("/minimax/config-options")
+async def get_minimax_config_options():
+    selected = await _selected_minimax_local_config()
+    options = await _minimax_local_config_options()
+    return {
+        "success": True,
+        "selected_config_id": selected.get("id") if selected else None,
+        "options": [
+            {
+                "id": config.get("id"),
+                "name": str(config.get("name") or "MiniMax H3"),
+                "model_name": str(config.get("model_name") or "MiniMax-H3"),
+                "base_url": str(config.get("base_url") or ""),
+            }
+            for config in options
+        ],
+    }
+
+
+@router.post("/minimax/select-config")
+async def select_minimax_config(req: MiniMaxConfigSelectRequest):
+    if req.config_id is None:
+        await _set_app_setting(MINIMAX_CONFIG_ID_SETTING, "")
+        return {"success": True, "message": "已切换为直接输入的个人 MiniMax Key", "selected_config_id": None}
+
+    options = await _minimax_local_config_options()
+    selected = next((config for config in options if int(config.get("id") or 0) == req.config_id), None)
+    if not selected:
+        raise HTTPException(status_code=404, detail="未找到可用于 MiniMax H3 的个人视频配置")
+    if not str(selected.get("api_key") or "").strip():
+        raise HTTPException(status_code=400, detail="该个人配置尚未保存 API Key")
+    await _set_app_setting(MINIMAX_CONFIG_ID_SETTING, str(req.config_id))
+    return {"success": True, "message": "已切换到个人 MiniMax 配置", "selected_config_id": req.config_id}
 
 
 @router.post("/minimax/check")
@@ -2661,7 +2739,7 @@ async def check_minimax_config():
         "success": bool(result.get("success")),
         "logged_in": bool(result.get("logged_in")),
         "has_api_key": bool(active_key),
-        "api_key_masked": _mask_secret(active_key),
+        "api_key_masked": "",
         "message": result.get("message") or "",
         "model": "MiniMax-H3",
         "resolution": "2K",
@@ -3147,9 +3225,6 @@ async def minimax_submit(request: MiniMaxSubmitRequest):
 
         final_params = dict(request.params or {})
         final_params["model"] = "MiniMax-H3"
-        # Keep the renderer's selected H3 resolution. The provider performs
-        # the authoritative allow-list validation (768P / 2K) before calling
-        # MiniMax; do not silently force every submission back to 2K here.
         final_params["resolution"] = _normalize_minimax_resolution(final_params.get("resolution"))
         if declared_duration is not None:
             import math

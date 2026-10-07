@@ -23,6 +23,7 @@
       ["custom-image", "自定义 / 中转站图片接口", "自定义图片中转站", "", ""]
     ],
     video: [
+      ["minimax-h3-official", "MiniMax H3 官网", "MiniMax H3 官网", "https://api.minimaxi.com", "MiniMax-H3"],
       ["volcengine-video", "火山方舟视频", "火山视频", "https://ark.cn-beijing.volces.com/api/v3", "ep-请填你的视频接入点ID"],
       ["newapi-video", "New API · MiniMax H3", "New API MiniMax H3", "http://120.209.70.196:8118", "minimax-H3-768p-IR"],
       ["jimeng-local", "即梦网页登录", "即梦视频", "", "seedance-2.0-fast"],

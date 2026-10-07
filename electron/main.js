@@ -27,6 +27,13 @@ for (const stream of [process.stdout, process.stderr]) {
 const APP_NAME = "漫剧虾";
 const DATA_APP_NAME = "ManJuXia";
 const PRODUCT_ID = "comic_shrimp";
+
+// Windows otherwise groups the first startup window under electron.exe until
+// Chromium has finished creating its renderer. Set this before any window is
+// constructed so the splash and main window use our packaged icon immediately.
+if (process.platform === "win32") {
+  app.setAppUserModelId("site.anyq.manjuxia");
+}
 // Packaged clients must not be able to turn the commercial account gate off by
 // editing release_config.json. The account service remains the authoritative
 // verifier; these values only pin the local client to that service.
@@ -904,6 +911,36 @@ ipcMain.handle("open-local-file", async (_event, relativePath) => {
   const target = ensureInside(frontendDir, path.join(frontendDir, String(relativePath || "")));
   const result = await shell.openPath(target);
   return result ? { success: false, error: result, path: target } : { success: true, path: target };
+});
+
+// Video preview URLs served by the local backend should open in the user's
+// system player when Chromium cannot decode their codec. Limit this IPC to
+// the app-owned videos directory; arbitrary paths and remote URLs are never
+// accepted from the renderer.
+ipcMain.handle("open-data-video", async (_event, source) => {
+  try {
+    const raw = String(source || "").trim();
+    let relativePath = raw;
+    if (/^https?:\/\//i.test(raw)) {
+      const url = new URL(raw);
+      if (!["127.0.0.1", "localhost", "::1"].includes(url.hostname)) return { success: false, error: "仅可打开本地视频" };
+      relativePath = decodeURIComponent(url.pathname || "");
+    }
+    relativePath = relativePath.replace(/\\/g, "/").replace(/^\/+/, "").replace(/^data\//i, "");
+    // Project/chapter names can be Chinese. Path traversal remains blocked by
+    // both this segment check and ensureInside below.
+    const segments = relativePath.split("/");
+    if (!relativePath.startsWith("videos/") || segments.some((part) => !part || part === "." || part === ".." || part.includes("\0"))) {
+      return { success: false, error: "视频路径无效" };
+    }
+    const target = ensureInside(dataDir(), path.join(dataDir(), relativePath));
+    if (!fs.existsSync(target)) return { success: false, error: "本地视频不存在" };
+    const safeTarget = ensureRealPathInside(dataDir(), target);
+    const result = await shell.openPath(safeTarget);
+    return result ? { success: false, error: result } : { success: true, path: safeTarget };
+  } catch (error) {
+    return { success: false, error: String(error?.message || error) };
+  }
 });
 
 ipcMain.handle("open-data-dir", async (_event, subdir) => {

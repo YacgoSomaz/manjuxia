@@ -5645,7 +5645,13 @@ class StoryboardService:
             await db.close()
 
     @staticmethod
-    async def update_video_status(storyboard_id: int, video_status: str, video_url: str = None, fail_reason: str = None) -> bool:
+    async def update_video_status(
+        storyboard_id: int,
+        video_status: str,
+        video_url: str = None,
+        fail_reason: str = None,
+        submit_id: str = None,
+    ) -> bool:
         """更新分镜的视频生成状态
 
         fail_reason: 失败时的原因(即梦返回的 fail_reason + guidance),会存到 video_fail_reason 字段
@@ -5663,6 +5669,14 @@ class StoryboardService:
                 await db.execute(
                     "UPDATE storyboards SET video_status = ? WHERE id = ?",
                     (video_status, storyboard_id)
+                )
+            # Official async-video tasks are created outside the normal local
+            # provider submitter. Persist their remote job id so a remount or
+            # desktop restart cannot make a running job look pending.
+            if submit_id is not None:
+                await db.execute(
+                    "UPDATE storyboards SET submit_id = ? WHERE id = ?",
+                    (str(submit_id).strip() or None, storyboard_id),
                 )
             # 失败时写入 fail_reason;成功/生成中清空
             # v3.61.153 codex P2: download_failed 也写 fail_reason,刷新后用户能看到原因

@@ -6,6 +6,7 @@ const {
   getTaskRule,
   reserveAiJob,
   refundAiJob,
+  refundStaleAiJobs,
   settleAiJob,
   cleanupExpiredAiJobs,
   adjustCredits,
@@ -55,6 +56,19 @@ test('官方模型仅从服务器环境读取，公开配置不依赖客户端�
   assert.equal(getTaskRule(makeDb(), 'replay_report').creditCost, 60);
 });
 
+test('官网 MiniMax 视频仅在服务器配置密钥后开放且不会公开密钥', () => {
+  const env = {
+    OFFICIAL_VIDEO_MINIMAX_ENABLED: 'true',
+    OFFICIAL_VIDEO_MINIMAX_KEY: 'secret-minimax-key',
+  };
+  const config = readOfficialAiConfig(env);
+  assert.equal(config.video.providers.some((item) => item.provider === 'minimax_official'), true);
+  const publicConfig = publicOfficialAiConfig(config);
+  assert.equal(publicConfig.models.video.providers.some((item) => item.provider === 'minimax_official'), true);
+  assert.equal(JSON.stringify(publicConfig).includes('secret-minimax-key'), false);
+  assert.equal(readOfficialAiConfig({ OFFICIAL_VIDEO_MINIMAX_ENABLED: 'true' }).video.providers.length, 0);
+});
+
 test('已过期的完成任务会清理结果，运行中的任务不会被误删', () => {
   const db = makeDb();
   const job = { productId: 'replay_shrimp', taskType: 'replay_advisor', idempotencyKey: 'job_20260722_cleanup_1', inputText: '上下文', creditCost: 8 };
@@ -62,6 +76,18 @@ test('已过期的完成任务会清理结果，运行中的任务不会被误�
   settleAiJob(db, reserved.job.id, { text: '建议' }, '2026-07-20T00:01:00.000Z');
   assert.equal(cleanupExpiredAiJobs(db, '2026-07-22T00:00:01.000Z'), 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM ai_jobs').get().count, 0);
+});
+
+test('已取得上游任务编号的官方视频在服务重启后保留待恢复状态', () => {
+  const db = makeDb();
+  const reserved = reserveAiJob(db, 1, {
+    productId: 'comic_shrimp', taskType: 'comic_video',
+    idempotencyKey: 'video_resume_20260722_1', inputText: '测试分镜', creditCost: 8,
+  }, '2026-07-22T00:00:00.000Z');
+  db.prepare('UPDATE ai_jobs SET provider_request_id = ? WHERE id = ?').run('newapi:task-123', reserved.job.id);
+  refundStaleAiJobs(db, '2026-07-22T00:20:00.000Z');
+  assert.equal(db.prepare('SELECT status FROM ai_jobs WHERE id = ?').get(reserved.job.id).status, 'running');
+  assert.equal(db.prepare('SELECT energy_balance FROM users WHERE id = 1').get().energy_balance, 92);
 });
 
 test('后台模型配置以主密钥加密保存，公开状态绝不返回中转地址或密钥', () => {
